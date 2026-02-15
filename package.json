@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:wizard": "node scripts/build-wizard.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri"

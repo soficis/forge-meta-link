@@ -1,44 +1,96 @@
-﻿# ForgeMetaLink
+﻿<div align="center">
+  <h1>ForgeMetaLink</h1>
+  <p><strong> Desktop manager/gallery tool for large AI image libraries.</strong></p>
+  <p>Scan folders, index metadata, search instantly, export sets, and round-trip images to Forge.</p>
+  <img src="public/forge-meta-link.jpg" alt="ForgeMetaLink screenshot" width="900" />
+</div>
 
-ForgeMetaLink is a local-first desktop app for managing large AI image libraries.
-It scans your image folders, extracts generation metadata, builds a fast local index, and helps you search, filter, export, and resend images to Forge/A1111.
+ForgeMetaLink is built with React + TypeScript + Tauri + Rust and stores runtime data locally in SQLite.
 
-The app is built with React + TypeScript + Tauri + Rust, and stores data in local SQLite on your machine.
+## What You Can Do Quickly
 
-## Quick Start
+- Re-find past generations fast: search by prompt phrases, model names, or seed values.
+- Curate large folders: filter with include/exclude tags and generation-type controls.
+- Build clean export packs: batch-select images and export metadata + converted images.
+- Reuse strong prompts/settings: open an image and send tuned payloads back to Forge.
 
-### Prerequisites
+## Quick Setup (End Users First)
 
-- Node.js 20+
-- Rust toolchain (stable)
-- Tauri system prerequisites for your OS: https://v2.tauri.app/start/prerequisites/
+### 1) Install from Releases (fastest)
 
-### Run in development
+Download from: https://github.com/soficis/forge-meta-link/releases
+
+- Windows x64: `forge-meta-link_0.1.0_x64-setup.exe` (or `.msi`)
+- Windows ARM64: `forge-meta-link_0.1.0_arm64-setup.exe` (or `.msi`)
+- Linux x64: `forge-meta-link_0.1.0_amd64.deb` or `forge-meta-link_0.1.0_amd64.AppImage`
+
+### 2) One-click Build Wizard (recommended for Linux/macOS/source builds)
+
+Verified launch commands:
+
+- `npm run build:wizard`
+- `./scripts/build-wizard.sh`
+- `scripts\build-wizard.cmd`
+
+Additional launcher:
+
+- `.\scripts\build-wizard.ps1`
+
+What it does:
+
+- Detects available targets for your environment.
+- Guides target selection interactively.
+- Tracks progress in `.build-wizard/state.json` and resumes after interruption.
+
+Quick non-interactive examples:
+
+- Host-platform default build: `npm run build:wizard -- --targets=host-default --yes`
+- Linux ARM64 local `.deb` build (completely untested): `npm run build:wizard -- --targets=linux-arm64-deb --yes`
+
+Manual Linux ARM64 Docker path (local only, completely untested):
 
 ```bash
-npm ci
-npm run tauri -- dev
+sudo apt update && sudo apt install -y docker.io qemu-user-static
+sudo service docker start
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker buildx create --use --name forgemetalink-arm64 || true
+docker buildx build --platform linux/arm64 -f scripts/Dockerfile.arm64-deb -o type=local,dest=dist-arm64 .
 ```
 
-### Build desktop binaries
+Non-Docker ARM64 summary (advanced):
 
-```bash
-npm ci
-npm run tauri -- build
-```
+- Create an ARM64 sysroot (for example `debootstrap`).
+- Install ARM64 GTK/WebKit/OpenSSL dev packages into that sysroot.
+- Export cross-compile linker + `pkg-config` sysroot variables for `aarch64-unknown-linux-gnu`.
+- Run `npm run tauri -- build --target aarch64-unknown-linux-gnu --bundles deb`.
 
-Build artifacts are generated under `src-tauri/target/release/`.
+### 3) First-Run Workflow (Start Here)
 
-## First-Run Workflow
+1. Click `Scan Folder` and choose your AI image directory.
+2. Wait for `scanning`, `indexing`, and `thumbnails`.
+3. Search by prompt/model/seed and apply filters.
+4. Open an image and export or send to Forge.
 
-1. Launch the app and click `Scan Folder` in the sidebar.
-2. Choose a directory that contains AI-generated images.
-3. Wait for scan progress to complete (`scanning`, `indexing`, then `thumbnails`).
-4. Use the top search bar to find images by prompt text, model, seed, or metadata.
-5. Use sidebar `Tag Filters` for booru-style include/exclude filtering.
-6. Open any image to inspect metadata, prompts, and file details.
-7. Optionally save sidecar tags/notes per image.
-8. Export metadata/images or send images back to Forge.
+### 4) Build from source
+
+- Prereqs: Node.js 20+, Rust stable, Tauri OS prerequisites.
+- Linux deps (Debian/Ubuntu): `sudo apt update && sudo apt install -y libglib2.0-dev libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf`
+- Build: `npm ci && npm run tauri -- build`
+
+### 5) Build only specific bundle targets (compact)
+
+- Linux x64 (`.deb` + `.AppImage`): `npm run tauri -- build --bundles deb,appimage`
+- Windows x64 (`.msi` + setup `.exe`): `npm run tauri -- build --bundles msi,nsis`
+- Windows ARM64 (`.msi` + setup `.exe`): `npm run tauri -- build --target aarch64-pc-windows-msvc --bundles msi,nsis`
+- Linux ARM64 `.deb` (local only, completely untested): `npm run build:wizard -- --targets=linux-arm64-deb --yes`
+- Output dirs: `src-tauri/target/release/bundle/`, `src-tauri/target/aarch64-pc-windows-msvc/release/bundle/`, `dist-arm64/out/`
+
+### Platform Compatibility Status
+
+- Windows: primary platform, most tested.
+- Linux: limited validation across distributions/desktops.
+- macOS: limited validation.
+- ARM64 build outputs (Windows/Linux) are completely untested.
 
 ## Feature Guide
 
@@ -49,7 +101,7 @@ What it supports:
 - Image formats: `png`, `jpg`, `jpeg`, `webp`, `avif`, `gif`, `jxl`
 - Incremental rescans using stored file modified time (`mtime`)
 - PNG metadata chunk parsing (`tEXt`, `zTXt`, `iTXt`) without decoding full pixels
-- Metadata parsing for A1111/Forge text, ComfyUI JSON graphs, and NovelAI-style payloads
+- Metadata parsing for Forge/Forge Neo text, ComfyUI JSON graphs (supported but untested), and NovelAI-style payloads
 - Sidecar `.txt` fallback when embedded metadata is missing
 - Prompt tag extraction including `lora:<name>` and `embedding:<name>`
 - Generation type inference: `txt2img`, `img2img`, `inpaint`, `grid`, `upscale`, `unknown`
@@ -88,7 +140,7 @@ Filtering controls:
 - Generation type dropdown
 - Exact model dropdown
 - LoRA dropdown (from indexed `lora:` tags)
-- Grid filtering includes fallback detection for legacy Forge/A1111 grid folders and filenames
+- Grid filtering includes fallback detection for Forge grid folders and filenames
 - Checkpoint family quick toggles:
   - PonyXL, SDXL, Flux, Z-Image Turbo, SD 1.5, SD 2.1, Chroma, VACE
 - Sort options: newest, oldest, name A-Z, name Z-A, model, generation type
@@ -158,7 +210,7 @@ Usage:
 3. For JPEG/WebP, set quality with slider.
 4. Save the generated ZIP.
 
-### 6. Forge/A1111 Integration
+### 6. Forge
 
 Connection and options:
 
@@ -206,11 +258,11 @@ Output behavior:
 
 - Storage profile toggle (`HDD`/`SSD`) tunes scan threads, DB pool behavior, and thumbnail throughput
 - `Cache All Thumbnails` pre-generates cache entries for the full indexed library
-- Thumbnail pipeline uses JPEG cache format and auto-migrates legacy WebP cache entries
+- Thumbnail pipeline uses JPEG cache format
 
 ## Recommended Forge Workflow
 
-1. Start Forge/A1111 with API mode enabled (`--api`).
+1. Start Forge with API mode enabled (`--api`).
 2. In sidebar `Forge API Settings`, set base URL and optional API key.
 3. Configure output folder (or leave blank for default).
 4. Configure models and LoRA folders, then enable subfolder scanning if needed.
@@ -253,10 +305,50 @@ Additional notes:
 
 ## Optional Runtime Environment Variables
 
-- `FORGE_SCAN_THREADS`
-- `FORGE_IO_THREADS`
-- `FORGE_DB_POOL_SIZE`
-- `FORGE_THUMB_JPEG_QUALITY` (clamped to `40-95`)
+- `FORGE_SCAN_THREADS`:
+  Sets scanner worker thread count used while walking and parsing image files.
+  Use this to reduce CPU pressure on slower systems or increase throughput on faster systems.
+- `FORGE_IO_THREADS`:
+  Sets thumbnail IO/generation thread count.
+  Useful when tuning responsiveness on HDD-heavy libraries versus SSD-heavy libraries.
+- `FORGE_DB_POOL_SIZE`:
+  Sets SQLite connection pool size for backend DB operations.
+  Increase carefully if you do many concurrent operations.
+- `FORGE_THUMB_JPEG_QUALITY`:
+  Sets JPEG quality for generated thumbnails.
+  Value is clamped to `40-95` (`85` default).
+
+How to use (Linux/macOS shell):
+
+```bash
+# one-off run
+FORGE_SCAN_THREADS=6 FORGE_IO_THREADS=8 npm run tauri -- dev
+
+# persistent for current shell session
+export FORGE_DB_POOL_SIZE=12
+export FORGE_THUMB_JPEG_QUALITY=82
+npm run tauri -- dev
+```
+
+How to use (Windows PowerShell):
+
+```powershell
+$env:FORGE_SCAN_THREADS = "6"
+$env:FORGE_IO_THREADS = "8"
+npm run tauri -- dev
+```
+
+## WSL2 Support (Experimental)
+
+WSL2 GUI support is experimental.
+
+- WSLg is required for Linux GUI rendering.
+- Hardware acceleration may not be available on every Windows/driver/WSLg combination.
+- If rendering is blank or unstable, try:
+
+```bash
+WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/forge-meta-link
+```
 
 ## Scripts
 
@@ -264,7 +356,12 @@ Additional notes:
 - `npm run build` - TypeScript + Vite production build
 - `npm run lint` - ESLint
 - `npm run tauri -- dev` - Run desktop app in development
-- `npm run tauri -- build` - Build desktop binaries/installers
+- `npm run tauri -- build` - Build all desktop binaries/installers
+- `npm run build:wizard` - Launch interactive resumable cross-platform build wizard
+- `npm run build:wizard -- --targets=host-default --yes` - One-shot host-platform wizard build
+- `./scripts/build-wizard.sh --targets=linux-arm64-deb --yes` - One-shot Linux ARM64 `.deb` wizard build (local only, untested)
+- `npm run tauri -- build --bundles deb,appimage` - Build Linux `.deb` + `.AppImage`
+- `npm run tauri -- build --bundles msi,nsis` - Build Windows `.msi` + setup `.exe` (run in Windows shell)
 
 ## Project Layout
 
@@ -273,6 +370,17 @@ forge-meta-link/
   src/         React frontend
   src-tauri/   Rust backend + Tauri runtime
 ```
+
+## Estimated System Requirements (Full Hardware Acceleration)
+
+- CPU: 4+ modern cores (8+ recommended for large scans).
+- RAM: 8 GB minimum, 16 GB recommended.
+- GPU: hardware-accelerated WebView-capable GPU/driver stack (DirectX 12 on Windows, Metal on macOS, Vulkan/OpenGL on Linux).
+- VRAM: 2 GB minimum, 4 GB+ recommended for very large image grids/thumbnails.
+- Storage: SSD strongly recommended (HDD works, but scans/thumbnails are slower).
+- Display: 1080p minimum; 1440p+ recommended for dense gallery layouts.
+- Linux desktop: modern Wayland/X11 session with current Mesa/NVIDIA/Intel drivers.
+- WSL2: WSLg required; hardware acceleration depends on Windows GPU driver + WSLg compatibility.
 
 ## Licensing
 

@@ -36,7 +36,7 @@
   --scrollbar-track: rgba(255, 255, 255, 0.03);
 
   /* Layout - compact for desktop */
-  --sidebar-width: 210px;
+  --sidebar-width: clamp(180px, 18vw, 280px);
   --detail-width: 320px;
   --header-height: 40px;
   --radius-sm: 4px;
@@ -82,13 +82,14 @@ body {
 
 /* ==================== SIDEBAR ==================== */
 .sidebar {
-  width: var(--sidebar-width);
-  min-width: var(--sidebar-width);
+  width: min(var(--sidebar-width), 42vw);
+  min-width: min(var(--sidebar-width), 42vw);
   background: var(--bg-secondary);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  transition: width 0.2s ease, min-width 0.2s ease;
 }
 
 .sidebar-header {
@@ -122,7 +123,7 @@ body {
 
 .sidebar-content {
   flex: 1;
-  padding: 8px 10px;
+  padding: clamp(8px, 0.8vw, 12px);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
@@ -238,20 +239,53 @@ body {
 }
 
 .sidebar-section {
-  margin-top: 8px;
-  padding: 6px 8px;
+  margin-top: clamp(6px, 0.7vw, 10px);
+  padding: clamp(6px, 0.65vw, 10px);
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
 }
 
+.sidebar-section-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
 .sidebar-section-title {
-  font-size: 9px;
+  font-size: clamp(9px, 0.65vw, 11px);
   font-weight: 700;
   text-transform: uppercase;
   color: var(--text-secondary);
-  margin-bottom: 4px;
+  margin-bottom: 0;
   letter-spacing: 0.5px;
+  line-height: 1.2;
+}
+
+.sidebar-section-toggle:hover .sidebar-section-title {
+  color: var(--text-primary);
+}
+
+.sidebar-section-chevron {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.sidebar-section-body {
+  margin-top: 6px;
+}
+
+.sidebar-section.minimized .sidebar-section-body {
+  display: none;
 }
 
 .sidebar-input {
@@ -1264,20 +1298,20 @@ body {
   }
 
   :root {
-    --sidebar-width: 180px;
+    --sidebar-width: clamp(168px, 30vw, 220px);
   }
 }
 
 @media (min-width: 1921px) {
   :root {
-    --sidebar-width: 230px;
+    --sidebar-width: clamp(220px, 15vw, 300px);
     --detail-width: 360px;
   }
 }
 
 @media (min-width: 2561px) {
   :root {
-    --sidebar-width: 260px;
+    --sidebar-width: clamp(250px, 14vw, 340px);
     --detail-width: 400px;
     --font-size-base: 13px;
   }
@@ -1288,6 +1322,26 @@ body {
 
   .gallery-row {
     gap: 8px;
+  }
+}
+
+@media (max-height: 820px) {
+  .sidebar-content {
+    padding: 6px 8px;
+  }
+
+  .sidebar-section {
+    margin-top: 6px;
+    padding: 6px;
+  }
+
+  .sidebar-section-body {
+    margin-top: 5px;
+  }
+
+  .sidebar-help {
+    font-size: 8px;
+    line-height: 1.25;
   }
 }
 

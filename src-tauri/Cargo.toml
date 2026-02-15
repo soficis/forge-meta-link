@@ -3,10 +3,19 @@ name = "forge-meta-link"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance AI image metadata manager"
+default-run = "forge-meta-link"
 
 [lib]
 name = "forge_meta_link_lib"
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "forge-meta-link"
+path = "src/main.rs"
+
+[[bin]]
+name = "migrate_thumbnail_cache"
+path = "src/bin/migrate_thumbnail_cache.rs"
 
 [profile.dev]
 # Reduce local artifact size for low-space environments.

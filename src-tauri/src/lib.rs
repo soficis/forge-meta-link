@@ -225,7 +225,7 @@ fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
             continue;
         };
         let ext = ext.to_ascii_lowercase();
-        if ext == "webp" || ext == "jpg" {
+        if ext == "jpg" {
             index.insert(path.to_string_lossy().to_string());
         }
     }

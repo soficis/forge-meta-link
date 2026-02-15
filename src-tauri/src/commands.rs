@@ -833,12 +833,10 @@ pub fn precache_all_thumbnails(
                 .unwrap_or_default();
             for (idx, filepath) in all_filepaths.into_iter().enumerate() {
                 let source = Path::new(&filepath);
-                let (primary_path, _) =
-                    image_processing::get_thumbnail_candidate_paths(source, &cache_dir);
+                let primary_path = image_processing::get_thumbnail_cache_path(source, &cache_dir);
                 let primary_key = primary_path.to_string_lossy().to_string();
 
-                // Skip only if current-format thumbnail exists. Legacy-only entries
-                // should be regenerated to compact storage.
+                // Skip if current-format thumbnail exists.
                 if index_snapshot.contains(&primary_key) {
                     skipped += 1;
                 } else if primary_path.exists() {
@@ -1094,10 +1092,8 @@ pub async fn get_thumbnail_path(
             return Ok(filepath);
         }
 
-        let (primary_path, legacy_path) =
-            image_processing::get_thumbnail_candidate_paths(source, &cache_dir);
+        let primary_path = image_processing::get_thumbnail_cache_path(source, &cache_dir);
         let primary_key = primary_path.to_string_lossy().to_string();
-        let legacy_key = legacy_path.to_string_lossy().to_string();
 
         if let Ok(index) = thumbnail_index.read() {
             if index.contains(&primary_key) {
@@ -1115,46 +1111,6 @@ pub async fn get_thumbnail_path(
             return Ok(primary_key);
         }
 
-        // Legacy thumbnail exists: attempt migration to compact current format.
-        let has_legacy = legacy_path.exists()
-            || thumbnail_index
-                .read()
-                .map(|index| index.contains(&legacy_key))
-                .unwrap_or(false);
-        if has_legacy {
-            match image_processing::ensure_thumbnail(source, &cache_dir, storage_profile) {
-                Ok(generated) => {
-                    let generated_key = generated.to_string_lossy().to_string();
-                    if let Ok(mut index) = thumbnail_index.write() {
-                        index.insert(generated_key.clone());
-                        if generated_key != legacy_key {
-                            index.remove(&legacy_key);
-                        }
-                    }
-                    if let Ok(mut failed) = failed_thumbnail_sources.write() {
-                        failed.remove(&filepath);
-                    }
-                    return Ok(generated_key);
-                }
-                Err(error) => {
-                    log::warn!(
-                        "Legacy thumbnail migration failed for {}: {}",
-                        filepath,
-                        error
-                    );
-                    if legacy_path.exists() {
-                        if let Ok(mut index) = thumbnail_index.write() {
-                            index.insert(legacy_key.clone());
-                        }
-                        if let Ok(mut failed) = failed_thumbnail_sources.write() {
-                            failed.remove(&filepath);
-                        }
-                        return Ok(legacy_key);
-                    }
-                }
-            }
-        }
-
         if let Ok(failed) = failed_thumbnail_sources.read() {
             if failed.contains(&filepath) {
                 return Ok(filepath);
@@ -1166,9 +1122,6 @@ pub async fn get_thumbnail_path(
                 let generated_key = generated.to_string_lossy().to_string();
                 if let Ok(mut index) = thumbnail_index.write() {
                     index.insert(generated_key.clone());
-                    if generated_key != legacy_key {
-                        index.remove(&legacy_key);
-                    }
                 }
                 if let Ok(mut failed) = failed_thumbnail_sources.write() {
                     failed.remove(&filepath);
@@ -1216,19 +1169,14 @@ pub async fn get_thumbnail_paths(
         if let Ok(index) = thumbnail_index.read() {
             for filepath in &filepaths {
                 let source = Path::new(filepath);
-                let (primary_path, legacy_path) =
-                    image_processing::get_thumbnail_candidate_paths(source, &cache_dir);
+                let primary_path = image_processing::get_thumbnail_cache_path(source, &cache_dir);
                 let primary_key = primary_path.to_string_lossy().to_string();
-                let legacy_key = legacy_path.to_string_lossy().to_string();
 
                 if index.contains(&primary_key) {
                     resolved.insert(filepath.clone(), primary_key);
                 } else if primary_path.exists() {
                     discovered_on_disk.push(primary_key.clone());
                     resolved.insert(filepath.clone(), primary_key);
-                } else if index.contains(&legacy_key) || legacy_path.exists() {
-                    // Force regeneration to current compact format when possible.
-                    missing.push(filepath.clone());
                 } else if failed_guard
                     .as_ref()
                     .is_some_and(|failed| failed.contains(filepath))
@@ -1259,16 +1207,9 @@ pub async fn get_thumbnail_paths(
             let mappings =
                 image_processing::resolve_thumbnail_paths(&missing, &cache_dir, storage_profile);
             if let Ok(mut index) = thumbnail_index.write() {
-                for (filepath, thumbnail_path) in &mappings {
-                    if thumbnail_path != filepath {
+                for (source_path, thumbnail_path) in &mappings {
+                    if thumbnail_path != source_path {
                         index.insert(thumbnail_path.clone());
-                        let source = Path::new(filepath);
-                        let (_, legacy_path) =
-                            image_processing::get_thumbnail_candidate_paths(source, &cache_dir);
-                        let legacy_key = legacy_path.to_string_lossy().to_string();
-                        if thumbnail_path != &legacy_key {
-                            index.remove(&legacy_key);
-                        }
                     }
                 }
             }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ImageExportFormat, StorageProfile, TagCount } from "../types/metadata";
 import type {
@@ -84,6 +84,65 @@ const CHECKPOINT_FAMILY_OPTIONS: Array<{ value: string; label: string }> = [
     { value: "vace", label: "VACE" },
 ];
 
+type SidebarSectionId =
+    | "gridSize"
+    | "storageProfile"
+    | "thumbnailCache"
+    | "tagFilters"
+    | "checkpointFamilies"
+    | "topTags"
+    | "exportMetadata"
+    | "exportImages"
+    | "forgeApiSettings";
+
+const SIDEBAR_SECTION_STORAGE_KEY = "sidebarSectionExpanded:v1";
+
+const DEFAULT_SECTION_EXPANDED: Record<SidebarSectionId, boolean> = {
+    gridSize: true,
+    storageProfile: true,
+    thumbnailCache: true,
+    tagFilters: true,
+    checkpointFamilies: true,
+    topTags: true,
+    exportMetadata: true,
+    exportImages: true,
+    forgeApiSettings: true,
+};
+
+interface CollapsibleSidebarSectionProps {
+    id: SidebarSectionId;
+    title: string;
+    isExpanded: boolean;
+    onToggle: (id: SidebarSectionId) => void;
+    children: ReactNode;
+}
+
+function CollapsibleSidebarSection({
+    id,
+    title,
+    isExpanded,
+    onToggle,
+    children,
+}: CollapsibleSidebarSectionProps) {
+    return (
+        <section className={`sidebar-section ${isExpanded ? "expanded" : "minimized"}`}>
+            <button
+                type="button"
+                className="sidebar-section-toggle"
+                onClick={() => onToggle(id)}
+                aria-expanded={isExpanded}
+                aria-controls={`sidebar-section-${id}`}
+            >
+                <h4 className="sidebar-section-title">{title}</h4>
+                <span className="sidebar-section-chevron">{isExpanded ? "▾" : "▸"}</span>
+            </button>
+            <div id={`sidebar-section-${id}`} className="sidebar-section-body" hidden={!isExpanded}>
+                {children}
+            </div>
+        </section>
+    );
+}
+
 export function Sidebar({
     isCollapsed,
     onToggleCollapsed,
@@ -144,6 +203,23 @@ export function Sidebar({
     const [topTagsExpanded, setTopTagsExpanded] = useState(false);
     const [exportFormat, setExportFormat] = useState<ImageExportFormat>("original");
     const [exportQuality, setExportQuality] = useState(85);
+    const [sectionExpanded, setSectionExpanded] = useState<
+        Record<SidebarSectionId, boolean>
+    >(() => {
+        const stored = localStorage.getItem(SIDEBAR_SECTION_STORAGE_KEY);
+        if (!stored) {
+            return DEFAULT_SECTION_EXPANDED;
+        }
+        try {
+            const parsed = JSON.parse(stored) as Partial<Record<SidebarSectionId, boolean>>;
+            return {
+                ...DEFAULT_SECTION_EXPANDED,
+                ...parsed,
+            };
+        } catch {
+            return DEFAULT_SECTION_EXPANDED;
+        }
+    });
 
     const handleSelectFolder = async () => {
         const selected = await open({
@@ -197,6 +273,16 @@ export function Sidebar({
 
     const showQualitySlider = exportFormat === "jpeg" || exportFormat === "webp";
     const displayedTopTags = topTagsExpanded ? topTags : topTags.slice(0, 10);
+    const toggleSection = (sectionId: SidebarSectionId) => {
+        setSectionExpanded((previous) => ({
+            ...previous,
+            [sectionId]: !previous[sectionId],
+        }));
+    };
+
+    useEffect(() => {
+        localStorage.setItem(SIDEBAR_SECTION_STORAGE_KEY, JSON.stringify(sectionExpanded));
+    }, [sectionExpanded]);
 
     return (
         <div className={`sidebar ${isCollapsed ? "collapsed" : ""}`}>
@@ -289,8 +375,12 @@ export function Sidebar({
                     </div>
                 )}
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Grid Size</h4>
+                <CollapsibleSidebarSection
+                    id="gridSize"
+                    title="Grid Size"
+                    isExpanded={sectionExpanded.gridSize}
+                    onToggle={toggleSection}
+                >
                     <div className="grid-slider-row">
                         <input
                             type="range"
@@ -302,10 +392,14 @@ export function Sidebar({
                         />
                         <span className="grid-slider-label">{columnCount} cols</span>
                     </div>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Storage Profile</h4>
+                <CollapsibleSidebarSection
+                    id="storageProfile"
+                    title="Storage Profile"
+                    isExpanded={sectionExpanded.storageProfile}
+                    onToggle={toggleSection}
+                >
                     <div className="profile-toggle-row">
                         <button
                             className={`profile-toggle-button ${
@@ -330,10 +424,14 @@ export function Sidebar({
                         Tunes indexing, thumbnail generation, and caching defaults
                         for your storage type.
                     </p>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Thumbnail Cache</h4>
+                <CollapsibleSidebarSection
+                    id="thumbnailCache"
+                    title="Thumbnail Cache"
+                    isExpanded={sectionExpanded.thumbnailCache}
+                    onToggle={toggleSection}
+                >
                     <button
                         className="sidebar-button"
                         onClick={onPrecacheAllThumbnails}
@@ -387,10 +485,14 @@ export function Sidebar({
                     {thumbnailCacheMessage && (
                         <p className="sidebar-help">{thumbnailCacheMessage}</p>
                     )}
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Tag Filters</h4>
+                <CollapsibleSidebarSection
+                    id="tagFilters"
+                    title="Tag Filters"
+                    isExpanded={sectionExpanded.tagFilters}
+                    onToggle={toggleSection}
+                >
                     <div className="tag-input-group">
                         <input
                             className="sidebar-input"
@@ -429,10 +531,14 @@ export function Sidebar({
                     <p className="sidebar-help">
                         Exclude: {excludeTags.length > 0 ? excludeTags.join(", ") : "none"}
                     </p>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Checkpoint Families</h4>
+                <CollapsibleSidebarSection
+                    id="checkpointFamilies"
+                    title="Checkpoint Families"
+                    isExpanded={sectionExpanded.checkpointFamilies}
+                    onToggle={toggleSection}
+                >
                     <div className="checkpoint-family-toggle-grid">
                         {CHECKPOINT_FAMILY_OPTIONS.map((option) => {
                             const active = checkpointFamilyFilters.includes(
@@ -465,10 +571,14 @@ export function Sidebar({
                     <p className="sidebar-help">
                         Quick toggles for model family filtering (for example PonyXL).
                     </p>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Top Tags</h4>
+                <CollapsibleSidebarSection
+                    id="topTags"
+                    title="Top Tags"
+                    isExpanded={sectionExpanded.topTags}
+                    onToggle={toggleSection}
+                >
                     <div className="tag-suggestions">
                         {displayedTopTags.map((entry, index) => (
                             <button
@@ -487,10 +597,14 @@ export function Sidebar({
                     >
                         {topTagsExpanded ? "Show Top 10" : "Show More"}
                     </button>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Export Metadata</h4>
+                <CollapsibleSidebarSection
+                    id="exportMetadata"
+                    title="Export Metadata"
+                    isExpanded={sectionExpanded.exportMetadata}
+                    onToggle={toggleSection}
+                >
                     <p className="sidebar-help">Selected: {selectedCount}</p>
                     <div className="sidebar-actions">
                         <button
@@ -508,10 +622,14 @@ export function Sidebar({
                             Export CSV
                         </button>
                     </div>
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Export Images</h4>
+                <CollapsibleSidebarSection
+                    id="exportImages"
+                    title="Export Images"
+                    isExpanded={sectionExpanded.exportImages}
+                    onToggle={toggleSection}
+                >
                     <p className="sidebar-help">Selected: {selectedCount}</p>
                     <div className="export-format-row">
                         <select
@@ -553,10 +671,14 @@ export function Sidebar({
                     {operationMessage && (
                         <p className="sidebar-help">{operationMessage}</p>
                     )}
-                </section>
+                </CollapsibleSidebarSection>
 
-                <section className="sidebar-section">
-                    <h4 className="sidebar-section-title">Forge API Settings</h4>
+                <CollapsibleSidebarSection
+                    id="forgeApiSettings"
+                    title="Forge API Settings"
+                    isExpanded={sectionExpanded.forgeApiSettings}
+                    onToggle={toggleSection}
+                >
                     <input
                         className="sidebar-input"
                         value={forgeBaseUrl}
@@ -693,7 +815,7 @@ export function Sidebar({
                     {forgeStatusMessage && (
                         <p className="sidebar-help">{forgeStatusMessage}</p>
                     )}
-                </section>
+                </CollapsibleSidebarSection>
             </div>}
         </div>
     );

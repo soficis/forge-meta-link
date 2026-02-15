@@ -11,8 +11,6 @@ use std::sync::OnceLock;
 
 /// Thumbnails are written as JPEG with tuned quality for compact cache size.
 const THUMB_EXTENSION: &str = "jpg";
-/// Legacy extension kept for compatibility with older cache entries.
-const LEGACY_THUMB_EXTENSION: &str = "webp";
 const THUMB_SIZE: u32 = 400;
 const THUMB_FILTER: FilterType = FilterType::Lanczos3;
 const THUMB_JPEG_QUALITY_DEFAULT: u8 = 85;
@@ -176,41 +174,11 @@ fn generate_single_thumbnail(
         return Ok(thumb_path);
     }
 
-    let legacy_path = cache_dir.join(format!("{}.{}", thumb_name, LEGACY_THUMB_EXTENSION));
-    let has_legacy = legacy_path.exists();
-    if !source.exists() && has_legacy {
-        // Source disappeared but old cache exists; use what we have.
-        return Ok(legacy_path);
-    }
-
     // Open and resize using CatmullRom — visually identical to Lanczos3 at 300px
     // but significantly faster for large batch operations.
     let img = image_decode::open_image(source)?;
     let thumbnail = img.resize(THUMB_SIZE, THUMB_SIZE, THUMB_FILTER);
-
-    if let Err(error) = encode_jpeg_thumbnail(&thumbnail, &thumb_path) {
-        // Fall back to legacy cache if migration failed and old thumbnail exists.
-        if has_legacy {
-            log::warn!(
-                "Failed to convert legacy thumbnail for {}: {}",
-                source.display(),
-                error
-            );
-            return Ok(legacy_path);
-        }
-        return Err(error);
-    }
-
-    // JPEG is now the canonical thumbnail format. Remove old WebP entries.
-    if has_legacy {
-        if let Err(error) = std::fs::remove_file(&legacy_path) {
-            log::debug!(
-                "Failed to remove legacy thumbnail {}: {}",
-                legacy_path.display(),
-                error
-            );
-        }
-    }
+    encode_jpeg_thumbnail(&thumbnail, &thumb_path)?;
 
     Ok(thumb_path)
 }
@@ -251,22 +219,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Returns the expected thumbnail path for a given source image.
-///
-/// Checks for current JPEG cache, otherwise returns the expected JPEG output path.
 pub fn get_thumbnail_path(source: &Path, cache_dir: &Path) -> PathBuf {
-    let (jpg_path, _webp_path) = get_thumbnail_candidate_paths(source, cache_dir);
-    if jpg_path.exists() {
-        return jpg_path;
-    }
-
-    // Return the expected JPEG path (caller should generate if needed)
-    jpg_path
+    get_thumbnail_cache_path(source, cache_dir)
 }
 
-/// Returns both candidate thumbnail cache paths for a source image.
-pub fn get_thumbnail_candidate_paths(source: &Path, cache_dir: &Path) -> (PathBuf, PathBuf) {
+/// Returns the canonical thumbnail cache path for a source image.
+pub fn get_thumbnail_cache_path(source: &Path, cache_dir: &Path) -> PathBuf {
     let thumb_name = hash_path(source);
-    let jpg_path = cache_dir.join(format!("{}.{}", thumb_name, THUMB_EXTENSION));
-    let webp_path = cache_dir.join(format!("{}.{}", thumb_name, LEGACY_THUMB_EXTENSION));
-    (jpg_path, webp_path)
+    cache_dir.join(format!("{}.{}", thumb_name, THUMB_EXTENSION))
 }
