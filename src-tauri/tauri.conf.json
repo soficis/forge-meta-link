@@ -1,0 +1,50 @@
+{
+    "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+    "identifier": "com.forgemetalink.app",
+    "build": {
+        "beforeDevCommand": "npm run dev",
+        "devUrl": "http://localhost:5173",
+        "beforeBuildCommand": "npm run build",
+        "frontendDist": "../dist"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "ForgeMetaLink",
+                "width": 1400,
+                "height": 900,
+                "resizable": true,
+                "fullscreen": false,
+                "minWidth": 900,
+                "minHeight": 600
+            }
+        ],
+        "security": {
+            "assetProtocol": {
+                "enable": true,
+                "scope": [
+                    "$APPDATA/**",
+                    "$HOME/**",
+                    "$RESOURCE/**",
+                    "**/*",
+                    "?:\\**",
+                    "?:/**",
+                    "[A-Z]:\\**",
+                    "[A-Z]:/**"
+                ]
+            },
+            "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+        }
+    },
+    "bundle": {
+        "active": true,
+        "targets": "all",
+        "icon": [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.icns",
+            "icons/icon.ico"
+        ]
+    }
+}

@@ -1,0 +1,19 @@
+{
+    "identifier": "default",
+    "description": "Default capabilities for ForgeMetaLink",
+    "windows": [
+        "main"
+    ],
+    "permissions": [
+        "core:default",
+        "core:window:default",
+        "core:window:allow-start-dragging",
+        "core:event:default",
+        "core:path:default",
+        "dialog:default",
+        "dialog:allow-open",
+        "dialog:allow-save",
+        "shell:default",
+        "shell:allow-open"
+    ]
+}
