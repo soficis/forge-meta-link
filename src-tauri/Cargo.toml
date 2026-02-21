@@ -1,6 +1,6 @@
 [package]
 name = "forge-meta-link"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "High-performance AI image metadata manager"
 default-run = "forge-meta-link"

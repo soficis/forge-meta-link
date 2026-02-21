@@ -33,9 +33,16 @@ const TARGETS = [
         isAvailable: () => true,
     },
     {
-        id: "linux-arm64-deb",
+        id: "linux-x64",
+        label: "Linux x64 (.deb + .AppImage)",
+        description: "Build Linux x64 bundles.",
+        isAvailable: (env) => env.isLinux || env.isWsl,
+    },
+    {
+        id: "linux-arm64",
         label: "Linux ARM64 (.deb via Docker) [Completely Untested]",
-        description: "Build a Linux ARM64 .deb in Docker with QEMU emulation.",
+        description:
+            "Build Linux ARM64 local .deb in Docker with QEMU emulation.",
         isAvailable: (env) => env.isLinux || env.isWsl,
     },
     {
@@ -49,6 +56,18 @@ const TARGETS = [
         label: "Windows ARM64 (.msi + setup.exe) [Completely Untested]",
         description: "Build Windows ARM64 installers (native Windows or WSL bridge).",
         isAvailable: (env) => env.isWindows || env.hasWindowsBridge,
+    },
+    {
+        id: "macos-x64",
+        label: "macOS x64 (.app + .dmg)",
+        description: "Build macOS x64 bundles.",
+        isAvailable: (env) => env.isMac,
+    },
+    {
+        id: "macos-arm64",
+        label: "macOS ARM64 (.app + .dmg)",
+        description: "Build macOS ARM64 bundles.",
+        isAvailable: (env) => env.isMac,
     },
 ];
 
@@ -107,12 +126,18 @@ async function runWizard() {
     for (const targetId of selectedTargets) {
         if (targetId === "host-default") {
             await runHostDefaultBuild();
-        } else if (targetId === "linux-arm64-deb") {
-            await runLinuxArm64DebBuild();
+        } else if (targetId === "linux-x64") {
+            await runLinuxX64Build();
+        } else if (targetId === "linux-arm64") {
+            await runLinuxArm64Build();
         } else if (targetId === "windows-x64") {
             await runWindowsX64Build();
         } else if (targetId === "windows-arm64") {
             await runWindowsArm64Build();
+        } else if (targetId === "macos-x64") {
+            await runMacosX64Build();
+        } else if (targetId === "macos-arm64") {
+            await runMacosArm64Build();
         }
     }
 
@@ -333,11 +358,33 @@ async function resolveSelectedTargets(availableTargets) {
 async function runHostDefaultBuild() {
     const stepId = "host-default:build";
     await runStep(stepId, "Build host platform default bundles", async () => {
-        if (envInfo.isWindows) {
-            await runCommand("npm.cmd", ["run", "tauri", "--", "build"]);
-            return;
-        }
-        await runCommand("npm", ["run", "tauri", "--", "build"]);
+        await runTauriBuild(["build"]);
+    });
+}
+
+async function runLinuxX64Build() {
+    const stepId = "linux-x64:build";
+    await runStep(stepId, "Build Linux x64 bundles", async () => {
+        await runTauriBuild([
+            "build",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--bundles",
+            "deb,appimage",
+        ]);
+
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/x86_64-unknown-linux-gnu/release/bundle",
+        );
+        ensureFilesExist(
+            findFilesByExtension(bundleRoot, ".deb"),
+            "Linux x64 .deb artifact",
+        );
+        ensureFilesExist(
+            findFilesByExtension(bundleRoot, ".AppImage"),
+            "Linux x64 .AppImage artifact",
+        );
     });
 }
 
@@ -361,16 +408,15 @@ async function runWindowsX64Build() {
             );
         }
 
-        ensureFilesExist([
-            path.join(
-                repoRoot,
-                "src-tauri/target/release/bundle/msi/forge-meta-link_0.1.0_x64_en-US.msi",
-            ),
-            path.join(
-                repoRoot,
-                "src-tauri/target/release/bundle/nsis/forge-meta-link_0.1.0_x64-setup.exe",
-            ),
-        ]);
+        const bundleRoot = path.join(repoRoot, "src-tauri/target/release/bundle");
+        ensureFilesExist(
+            findFilesByExtension(path.join(bundleRoot, "msi"), ".msi"),
+            "Windows x64 .msi artifact",
+        );
+        ensureFilesExist(
+            findFilesByExtension(path.join(bundleRoot, "nsis"), ".exe"),
+            "Windows x64 setup .exe artifact",
+        );
     });
 }
 
@@ -402,22 +448,68 @@ async function runWindowsArm64Build() {
             );
         }
 
-        ensureFilesExist([
-            path.join(
-                repoRoot,
-                "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/forge-meta-link_0.1.0_arm64_en-US.msi",
-            ),
-            path.join(
-                repoRoot,
-                "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/forge-meta-link_0.1.0_arm64-setup.exe",
-            ),
-        ]);
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/aarch64-pc-windows-msvc/release/bundle",
+        );
+        ensureFilesExist(
+            findFilesByExtension(path.join(bundleRoot, "msi"), ".msi"),
+            "Windows ARM64 .msi artifact",
+        );
+        ensureFilesExist(
+            findFilesByExtension(path.join(bundleRoot, "nsis"), ".exe"),
+            "Windows ARM64 setup .exe artifact",
+        );
     });
 }
 
-async function runLinuxArm64DebBuild() {
+async function runMacosX64Build() {
+    const stepId = "macos-x64:build";
+    await runStep(stepId, "Build macOS x64 bundles", async () => {
+        await runTauriBuild([
+            "build",
+            "--target",
+            "x86_64-apple-darwin",
+            "--bundles",
+            "app,dmg",
+        ]);
+
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/x86_64-apple-darwin/release/bundle",
+        );
+        ensureFilesExist(
+            findFilesByExtension(bundleRoot, ".dmg"),
+            "macOS x64 .dmg artifact",
+        );
+    });
+}
+
+async function runMacosArm64Build() {
+    const stepId = "macos-arm64:build";
+    await runStep(stepId, "Build macOS ARM64 bundles", async () => {
+        await runTauriBuild([
+            "build",
+            "--target",
+            "aarch64-apple-darwin",
+            "--bundles",
+            "app,dmg",
+        ]);
+
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/aarch64-apple-darwin/release/bundle",
+        );
+        ensureFilesExist(
+            findFilesByExtension(bundleRoot, ".dmg"),
+            "macOS ARM64 .dmg artifact",
+        );
+    });
+}
+
+async function runLinuxArm64Build() {
     await runStep(
-        "linux-arm64-deb:docker-install",
+        "linux-arm64:docker-install",
         "Install Docker dependencies (if missing)",
         async () => {
             if (commandWorks("docker", ["--version"])) {
@@ -455,7 +547,7 @@ async function runLinuxArm64DebBuild() {
     );
 
     await runStep(
-        "linux-arm64-deb:docker-ready",
+        "linux-arm64:docker-ready",
         "Ensure Docker daemon is running",
         async () => {
             if (!commandWorks("docker", ["info"])) {
@@ -478,7 +570,7 @@ async function runLinuxArm64DebBuild() {
     );
 
     await runStep(
-        "linux-arm64-deb:binfmt",
+        "linux-arm64:binfmt",
         "Enable ARM64 binfmt in Docker",
         async () => {
             await runDockerCommand([
@@ -493,7 +585,7 @@ async function runLinuxArm64DebBuild() {
     );
 
     await runStep(
-        "linux-arm64-deb:buildx",
+        "linux-arm64:buildx",
         "Prepare Docker buildx builder",
         async () => {
             await runDockerCommand(["buildx", "create", "--name", "forgemetalink-arm64", "--use"], {
@@ -507,7 +599,7 @@ async function runLinuxArm64DebBuild() {
     );
 
     await runStep(
-        "linux-arm64-deb:build",
+        "linux-arm64:build",
         "Build Linux ARM64 .deb with Docker",
         async () => {
             if (!fs.existsSync(ARM64_DOCKERFILE_PATH)) {
@@ -536,6 +628,14 @@ async function runLinuxArm64DebBuild() {
             }
         },
     );
+}
+
+async function runTauriBuild(tauriArgs) {
+    if (envInfo.isWindows) {
+        await runCommand("npm.cmd", ["run", "tauri", "--", ...tauriArgs]);
+        return;
+    }
+    await runCommand("npm", ["run", "tauri", "--", ...tauriArgs]);
 }
 
 async function runWindowsBuildFromWsl(tauriArgs) {
@@ -618,35 +718,45 @@ function collectArtifactsForTargets(selectedTargets) {
         );
         files.push(...findFilesByPrefix(hostBundleRoot, "forge-meta-link"));
     }
-    if (selectedTargets.includes("windows-x64")) {
-        files.push(
-            path.join(
-                repoRoot,
-                "src-tauri/target/release/bundle/msi/forge-meta-link_0.1.0_x64_en-US.msi",
-            ),
-            path.join(
-                repoRoot,
-                "src-tauri/target/release/bundle/nsis/forge-meta-link_0.1.0_x64-setup.exe",
-            ),
+    if (selectedTargets.includes("linux-x64")) {
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/x86_64-unknown-linux-gnu/release/bundle",
         );
+        files.push(...findFilesByPrefix(bundleRoot, "forge-meta-link"));
+    }
+    if (selectedTargets.includes("windows-x64")) {
+        const bundleRoot = path.join(repoRoot, "src-tauri/target/release/bundle");
+        files.push(...findFilesByPrefix(bundleRoot, "forge-meta-link"));
     }
     if (selectedTargets.includes("windows-arm64")) {
-        files.push(
-            path.join(
-                repoRoot,
-                "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/forge-meta-link_0.1.0_arm64_en-US.msi",
-            ),
-            path.join(
-                repoRoot,
-                "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/forge-meta-link_0.1.0_arm64-setup.exe",
-            ),
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/aarch64-pc-windows-msvc/release/bundle",
         );
+        files.push(...findFilesByPrefix(bundleRoot, "forge-meta-link"));
     }
-    if (selectedTargets.includes("linux-arm64-deb")) {
+    if (selectedTargets.includes("macos-x64")) {
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/x86_64-apple-darwin/release/bundle",
+        );
+        files.push(...findFilesByPrefix(bundleRoot, "forge-meta-link"));
+    }
+    if (selectedTargets.includes("macos-arm64")) {
+        const bundleRoot = path.join(
+            repoRoot,
+            "src-tauri/target/aarch64-apple-darwin/release/bundle",
+        );
+        files.push(...findFilesByPrefix(bundleRoot, "forge-meta-link"));
+    }
+    if (selectedTargets.includes("linux-arm64")) {
         files.push(...findFilesByExtension(ARM64_DIST_PATH, ".deb"));
     }
 
-    return files.filter((filePath) => fs.existsSync(filePath));
+    return Array.from(
+        new Set(files.filter((filePath) => fs.existsSync(filePath))),
+    );
 }
 
 async function runStep(stepId, title, action) {
@@ -736,10 +846,15 @@ async function runCommand(command, args, options = {}) {
     });
 }
 
-function ensureFilesExist(requiredPaths) {
-    const missing = requiredPaths.filter((filePath) => !fs.existsSync(filePath));
+function ensureFilesExist(filePaths, artifactLabel) {
+    if (!Array.isArray(filePaths) || filePaths.length === 0) {
+        throw new Error(`Missing expected artifact: ${artifactLabel}`);
+    }
+    const missing = filePaths.filter((filePath) => !fs.existsSync(filePath));
     if (missing.length > 0) {
-        throw new Error(`Missing expected artifact(s): ${missing.join(", ")}`);
+        throw new Error(
+            `Missing expected artifact(s) for ${artifactLabel}: ${missing.join(", ")}`,
+        );
     }
 }
 
@@ -765,7 +880,7 @@ function printHelp() {
 Usage:
   node scripts/build-wizard.mjs
   node scripts/build-wizard.mjs --targets=host-default --yes
-  node scripts/build-wizard.mjs --targets=linux-arm64-deb --yes
+  node scripts/build-wizard.mjs --targets=linux-arm64 --yes
 
 Options:
   --targets=<comma-list>   Target IDs: ${available}
@@ -777,7 +892,14 @@ Options:
 Examples:
   npm run build:wizard
   npm run build:wizard -- --targets=host-default --yes
-  ./scripts/build-wizard.sh --targets=linux-arm64-deb --yes
-  .\\scripts\\build-wizard.ps1 --targets windows-x64,windows-arm64
+  npm run build:wizard -- --targets=linux-x64,windows-x64 --yes
+  npm run build:wizard -- --targets=macos-arm64 --yes
+  ./scripts/build-wizard.sh --targets=linux-arm64 --yes
+  .\\scripts\\build-wizard.ps1 --targets=windows-x64,windows-arm64
+
+Notes:
+  - Target IDs align with release workflow matrix labels in .github/workflows/release.yml:
+    linux-x64, linux-arm64, windows-x64, windows-arm64, macos-x64, macos-arm64
+  - Local linux-arm64 target currently produces .deb via Docker/QEMU.
 `);
 }
