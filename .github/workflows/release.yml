@@ -125,6 +125,14 @@ jobs:
           INPUT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ steps.release_tag.outputs.value }}
           INPUT_NAME: ${{ steps.release_tag.outputs.value }}
+          INPUT_BODY: |
+            ForgeMetaLink release ${{ steps.release_tag.outputs.value }}
+
+            Automated release created by GitHub Actions.
+            Commit: ${{ github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Build artifacts are uploaded by the next workflow step.
 
       - name: Upload assets to GitHub release
         env:
