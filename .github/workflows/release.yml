@@ -39,7 +39,7 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
             bundles: msi,nsis
           - label: macos-x64
-            runner: macos-13
+            runner: macos-15
             rust_target: x86_64-apple-darwin
             bundles: app,dmg
           - label: macos-arm64
