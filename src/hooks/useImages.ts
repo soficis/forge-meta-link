@@ -7,8 +7,6 @@ import {
 import { useEffect, useState } from "react";
 import {
     filterImagesCursor,
-    getDirectories,
-    getImageTags,
     getModels,
     getTopTags,
     getTotalCount,
@@ -19,7 +17,7 @@ import {
     onScanProgress,
     onScanComplete,
 } from "../services/commands";
-import type { ScanProgress } from "../services/commands";
+import type { ScanProgress, ScanComplete } from "../services/commands";
 import type { GenerationType, SortOption, StorageProfile } from "../types/metadata";
 
 function pageSizeForProfile(profile: StorageProfile): number {
@@ -150,6 +148,7 @@ export function useScanDirectory() {
 export function useScanProgress() {
     const queryClient = useQueryClient();
     const [progress, setProgress] = useState<ScanProgress | null>(null);
+    const [scanResult, setScanResult] = useState<ScanComplete | null>(null);
     const [isScanning, setIsScanning] = useState(false);
 
     useEffect(() => {
@@ -160,18 +159,18 @@ export function useScanProgress() {
             unlistenProgress = await onScanProgress((payload) => {
                 setIsScanning(true);
                 setProgress(payload);
+                setScanResult(null);
             });
 
-            unlistenComplete = await onScanComplete(() => {
+            unlistenComplete = await onScanComplete((result) => {
                 setIsScanning(false);
                 setProgress(null);
+                setScanResult(result);
 
                 // Refresh all data when scan completes
                 queryClient.invalidateQueries({ queryKey: ["images"] });
                 queryClient.invalidateQueries({ queryKey: ["totalCount"] });
                 queryClient.invalidateQueries({ queryKey: ["topTags"] });
-                queryClient.invalidateQueries({ queryKey: ["tagSuggestions"] });
-                queryClient.invalidateQueries({ queryKey: ["directories"] });
                 queryClient.invalidateQueries({ queryKey: ["models"] });
             });
         };
@@ -184,16 +183,7 @@ export function useScanProgress() {
         };
     }, [queryClient]);
 
-    return { progress, isScanning };
-}
-
-/** Hook for tag autocomplete suggestions. */
-export function useTagSuggestions(prefix: string) {
-    return useQuery({
-        queryKey: ["tagSuggestions", prefix],
-        queryFn: () => listTags(prefix.trim() ? prefix : null, 20),
-        staleTime: 30_000,
-    });
+    return { progress, scanResult, isScanning };
 }
 
 /** Hook for LoRA tag options used by search/filter UI. */
@@ -211,24 +201,6 @@ export function useTopTags(limit: number = 20) {
         queryKey: ["topTags", limit],
         queryFn: () => getTopTags(limit),
         staleTime: 30_000,
-    });
-}
-
-/** Hook for fetching tags for a specific image. */
-export function useImageTags(id: number) {
-    return useQuery({
-        queryKey: ["imageTags", id],
-        queryFn: () => getImageTags(id),
-        enabled: id > 0,
-    });
-}
-
-/** Hook for directory grouping. */
-export function useDirectories() {
-    return useQuery({
-        queryKey: ["directories"],
-        queryFn: getDirectories,
-        staleTime: 60_000,
     });
 }
 

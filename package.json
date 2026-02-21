@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:wizard": "node scripts/build-wizard.mjs",
-    "lint": "eslint .",
+    "fmt:check": "cd src-tauri && cargo fmt --all -- --check",
+    "lint": "eslint src/",
+    "clippy": "cd src-tauri && cargo clippy -- -D warnings",
+    "test:rust": "cd src-tauri && cargo test",
+    "typecheck": "tsc -b --noEmit",
     "preview": "vite preview",
     "tauri": "tauri"
   },

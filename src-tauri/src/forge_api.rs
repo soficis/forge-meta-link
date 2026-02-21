@@ -160,21 +160,38 @@ pub async fn list_models(
     list_named_options(base_url, api_key, "sd-models").await
 }
 
-pub fn build_payload_from_image_record(
-    prompt: &str,
-    negative_prompt: &str,
-    steps: Option<&str>,
-    sampler: Option<&str>,
-    scheduler: Option<&str>,
-    cfg_scale: Option<&str>,
-    seed: Option<&str>,
-    width: Option<u32>,
-    height: Option<u32>,
-    model_name: Option<&str>,
-    include_seed: bool,
-    adetailer_face_enabled: bool,
-    adetailer_face_model: Option<&str>,
-) -> ForgePayload {
+pub struct ForgePayloadBuildInput<'a> {
+    pub prompt: &'a str,
+    pub negative_prompt: &'a str,
+    pub steps: Option<&'a str>,
+    pub sampler: Option<&'a str>,
+    pub scheduler: Option<&'a str>,
+    pub cfg_scale: Option<&'a str>,
+    pub seed: Option<&'a str>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub model_name: Option<&'a str>,
+    pub include_seed: bool,
+    pub adetailer_face_enabled: bool,
+    pub adetailer_face_model: Option<&'a str>,
+}
+
+pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> ForgePayload {
+    let ForgePayloadBuildInput {
+        prompt,
+        negative_prompt,
+        steps,
+        sampler,
+        scheduler,
+        cfg_scale,
+        seed,
+        width,
+        height,
+        model_name,
+        include_seed,
+        adetailer_face_enabled,
+        adetailer_face_model,
+    } = input;
     let sampler_name = parse_optional_text(sampler);
     let scheduler = parse_optional_text(scheduler);
     let model_name = parse_optional_text(model_name);
@@ -307,10 +324,8 @@ fn normalize_base_url(base_url: &str) -> String {
             Some(value)
         } else if let Some(value) = normalized.strip_suffix(SDAPI_PREFIX) {
             Some(value)
-        } else if let Some(value) = normalized.strip_suffix("/sdapi") {
-            Some(value)
         } else {
-            None
+            normalized.strip_suffix("/sdapi")
         };
 
         let Some(value) = stripped else {

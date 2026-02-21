@@ -1,5 +1,5 @@
-use crate::StorageProfile;
 use crate::image_decode;
+use crate::StorageProfile;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use rayon::prelude::*;
@@ -11,16 +11,17 @@ use std::sync::OnceLock;
 
 /// Thumbnails are written as JPEG with tuned quality for compact cache size.
 const THUMB_EXTENSION: &str = "jpg";
-const THUMB_SIZE: u32 = 400;
+const THUMB_SIZE: u32 = 640;
 const THUMB_FILTER: FilterType = FilterType::Lanczos3;
-const THUMB_JPEG_QUALITY_DEFAULT: u8 = 85;
+const THUMB_JPEG_QUALITY_DEFAULT: u8 = 90;
+const THUMB_CACHE_VERSION: &str = "thumb-v2-hq";
 const HDD_FRIENDLY_IO_THREADS: usize = 4;
 const SSD_FRIENDLY_IO_THREADS: usize = 12;
 
 fn io_threads(profile: StorageProfile) -> usize {
     if let Ok(raw) = std::env::var("FORGE_IO_THREADS") {
         if let Ok(parsed) = raw.parse::<usize>() {
-            return parsed.max(1).min(32);
+            return parsed.clamp(1, 32);
         }
     }
 
@@ -28,8 +29,8 @@ fn io_threads(profile: StorageProfile) -> usize {
         .map(|count| count.get())
         .unwrap_or(4);
     match profile {
-        StorageProfile::Hdd => cpu_count.min(HDD_FRIENDLY_IO_THREADS).max(2),
-        StorageProfile::Ssd => cpu_count.min(SSD_FRIENDLY_IO_THREADS).max(4),
+        StorageProfile::Hdd => cpu_count.clamp(2, HDD_FRIENDLY_IO_THREADS),
+        StorageProfile::Ssd => cpu_count.clamp(4, SSD_FRIENDLY_IO_THREADS),
     }
 }
 
@@ -174,8 +175,7 @@ fn generate_single_thumbnail(
         return Ok(thumb_path);
     }
 
-    // Open and resize using CatmullRom — visually identical to Lanczos3 at 300px
-    // but significantly faster for large batch operations.
+    // Open and resize using the configured high-quality filter.
     let img = image_decode::open_image(source)?;
     let thumbnail = img.resize(THUMB_SIZE, THUMB_SIZE, THUMB_FILTER);
     encode_jpeg_thumbnail(&thumbnail, &thumb_path)?;
@@ -203,6 +203,7 @@ fn encode_jpeg_thumbnail(
 /// Creates a SHA256 hash of the file path for use as a cache filename.
 fn hash_path(path: &Path) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(THUMB_CACHE_VERSION.as_bytes());
     hasher.update(path.to_string_lossy().as_bytes());
     let result = hasher.finalize();
     hex_encode(&result[..16])

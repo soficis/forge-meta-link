@@ -1,11 +1,19 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ImageExportFormat, StorageProfile, TagCount } from "../types/metadata";
+import type {
+    DeleteHistoryEntry,
+    ImageExportFormat,
+    StorageProfile,
+    TagCount,
+} from "../types/metadata";
+import { directoryExists } from "../services/commands";
 import type {
     ScanProgress,
+    ScanComplete,
     ThumbnailCacheComplete,
     ThumbnailCacheProgress,
 } from "../services/commands";
+import { usePersistedState } from "../hooks/usePersistedState";
 
 interface SidebarProps {
     isCollapsed: boolean;
@@ -13,7 +21,7 @@ interface SidebarProps {
     onScan: (directory: string) => void;
     isScanning: boolean;
     scanProgress: ScanProgress | null;
-    scanResult: { total_files: number; indexed: number; errors: number } | null;
+    scanResult: ScanComplete | null;
     includeTags: string[];
     excludeTags: string[];
     topTags: TagCount[];
@@ -28,6 +36,17 @@ interface SidebarProps {
     selectedCount: number;
     onExportSelected: (format: "json" | "csv") => void;
     onExportAsFiles: (format: ImageExportFormat, quality: number) => void;
+    onMoveSelectedToFolder: () => void;
+    isMovingSelected: boolean;
+    onBulkFavoriteSelected: () => void;
+    onBulkUnfavoriteSelected: () => void;
+    onBulkLockSelected: () => void;
+    onBulkUnlockSelected: () => void;
+    isApplyingSelectionActions: boolean;
+    autoLockFavorites: boolean;
+    onAutoLockFavoritesChange: (value: boolean) => void;
+    recentDeleteHistory: DeleteHistoryEntry[];
+    onClearDeleteHistory: () => void;
     forgeBaseUrl: string;
     forgeApiKey: string;
     onForgeBaseUrlChange: (value: string) => void;
@@ -50,10 +69,8 @@ interface SidebarProps {
     onForgeAdetailerFaceModelChange: (value: string) => void;
     onForgeTestConnection: () => void;
     onForgeSendSelected: () => void;
-    forgeStatusMessage: string | null;
     isTestingForge: boolean;
     isSendingForgeBatch: boolean;
-    operationMessage: string | null;
     columnCount: number;
     onColumnCountChange: (count: number) => void;
     storageProfile: StorageProfile;
@@ -62,7 +79,6 @@ interface SidebarProps {
     isPrecachingThumbnails: boolean;
     thumbnailCacheProgress: ThumbnailCacheProgress | null;
     thumbnailCacheResult: ThumbnailCacheComplete | null;
-    thumbnailCacheMessage: string | null;
 }
 
 const EXPORT_FORMAT_OPTIONS: { value: ImageExportFormat; label: string }[] = [
@@ -93,20 +109,51 @@ type SidebarSectionId =
     | "topTags"
     | "exportMetadata"
     | "exportImages"
+    | "gallerySafety"
     | "forgeApiSettings";
 
-const SIDEBAR_SECTION_STORAGE_KEY = "sidebarSectionExpanded:v1";
+const SIDEBAR_SECTION_STORAGE_KEY = "sidebarSectionExpanded:v2";
 
 const DEFAULT_SECTION_EXPANDED: Record<SidebarSectionId, boolean> = {
     gridSize: true,
-    storageProfile: true,
-    thumbnailCache: true,
+    storageProfile: false,
+    thumbnailCache: false,
     tagFilters: true,
     checkpointFamilies: true,
     topTags: true,
-    exportMetadata: true,
-    exportImages: true,
-    forgeApiSettings: true,
+    exportMetadata: false,
+    exportImages: false,
+    gallerySafety: true,
+    forgeApiSettings: false,
+};
+
+const sidebarSectionExpandedStorage = {
+    serialize: (value: Record<SidebarSectionId, boolean>) =>
+        JSON.stringify(value),
+    deserialize: (
+        raw: string
+    ): Record<SidebarSectionId, boolean> | undefined => {
+        try {
+            const parsed = JSON.parse(raw) as Partial<
+                Record<SidebarSectionId, boolean>
+            >;
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                return undefined;
+            }
+            const next = { ...DEFAULT_SECTION_EXPANDED };
+            for (const sectionId of Object.keys(
+                DEFAULT_SECTION_EXPANDED
+            ) as SidebarSectionId[]) {
+                const value = parsed[sectionId];
+                if (typeof value === "boolean") {
+                    next[sectionId] = value;
+                }
+            }
+            return next;
+        } catch {
+            return undefined;
+        }
+    },
 };
 
 interface CollapsibleSidebarSectionProps {
@@ -136,7 +183,7 @@ function CollapsibleSidebarSection({
                 <h4 className="sidebar-section-title">{title}</h4>
                 <span className="sidebar-section-chevron">{isExpanded ? "▾" : "▸"}</span>
             </button>
-            <div id={`sidebar-section-${id}`} className="sidebar-section-body" hidden={!isExpanded}>
+            <div id={`sidebar-section-${id}`} className="sidebar-section-body">
                 {children}
             </div>
         </section>
@@ -164,6 +211,17 @@ export function Sidebar({
     selectedCount,
     onExportSelected,
     onExportAsFiles,
+    onMoveSelectedToFolder,
+    isMovingSelected,
+    onBulkFavoriteSelected,
+    onBulkUnfavoriteSelected,
+    onBulkLockSelected,
+    onBulkUnlockSelected,
+    isApplyingSelectionActions,
+    autoLockFavorites,
+    onAutoLockFavoritesChange,
+    recentDeleteHistory,
+    onClearDeleteHistory,
     forgeBaseUrl,
     forgeApiKey,
     onForgeBaseUrlChange,
@@ -186,10 +244,8 @@ export function Sidebar({
     onForgeAdetailerFaceModelChange,
     onForgeTestConnection,
     onForgeSendSelected,
-    forgeStatusMessage,
     isTestingForge,
     isSendingForgeBatch,
-    operationMessage,
     columnCount,
     onColumnCountChange,
     storageProfile,
@@ -198,28 +254,34 @@ export function Sidebar({
     isPrecachingThumbnails,
     thumbnailCacheProgress,
     thumbnailCacheResult,
-    thumbnailCacheMessage,
 }: SidebarProps) {
     const [topTagsExpanded, setTopTagsExpanded] = useState(false);
     const [exportFormat, setExportFormat] = useState<ImageExportFormat>("original");
     const [exportQuality, setExportQuality] = useState(85);
-    const [sectionExpanded, setSectionExpanded] = useState<
+    const [scanValidationError, setScanValidationError] = useState<string | null>(null);
+    const [sectionExpanded, setSectionExpanded] = usePersistedState<
         Record<SidebarSectionId, boolean>
-    >(() => {
-        const stored = localStorage.getItem(SIDEBAR_SECTION_STORAGE_KEY);
-        if (!stored) {
-            return DEFAULT_SECTION_EXPANDED;
-        }
+    >(
+        SIDEBAR_SECTION_STORAGE_KEY,
+        DEFAULT_SECTION_EXPANDED,
+        sidebarSectionExpandedStorage
+    );
+
+    const trimmedForgeBaseUrl = forgeBaseUrl.trim();
+    let forgeUrlError: string | null = null;
+    if (trimmedForgeBaseUrl.length === 0) {
+        forgeUrlError = "Forge URL is required (for example http://127.0.0.1:7860).";
+    } else {
         try {
-            const parsed = JSON.parse(stored) as Partial<Record<SidebarSectionId, boolean>>;
-            return {
-                ...DEFAULT_SECTION_EXPANDED,
-                ...parsed,
-            };
+            const parsed = new URL(trimmedForgeBaseUrl);
+            if (!["http:", "https:"].includes(parsed.protocol)) {
+                forgeUrlError = "Forge URL must start with http:// or https://.";
+            }
         } catch {
-            return DEFAULT_SECTION_EXPANDED;
+            forgeUrlError = "Enter a valid Forge URL (for example http://127.0.0.1:7860).";
         }
-    });
+    }
+    const hasValidForgeUrl = forgeUrlError == null;
 
     const handleSelectFolder = async () => {
         const selected = await open({
@@ -228,7 +290,21 @@ export function Sidebar({
             title: "Select image folder to scan",
         });
         if (selected && typeof selected === "string") {
-            onScan(selected);
+            try {
+                const exists = await directoryExists(selected);
+                if (!exists) {
+                    setScanValidationError(
+                        "Selected directory no longer exists. Please choose another folder."
+                    );
+                    return;
+                }
+                setScanValidationError(null);
+                onScan(selected);
+            } catch {
+                setScanValidationError(
+                    "Unable to validate selected directory. Please try again."
+                );
+            }
         }
     };
 
@@ -273,6 +349,12 @@ export function Sidebar({
 
     const showQualitySlider = exportFormat === "jpeg" || exportFormat === "webp";
     const displayedTopTags = topTagsExpanded ? topTags : topTags.slice(0, 10);
+    const pendingDeletes = recentDeleteHistory.filter(
+        (entry) => entry.status === "pending"
+    );
+    const finalizedDeletes = recentDeleteHistory.filter(
+        (entry) => entry.status !== "pending"
+    );
     const toggleSection = (sectionId: SidebarSectionId) => {
         setSectionExpanded((previous) => ({
             ...previous,
@@ -280,15 +362,28 @@ export function Sidebar({
         }));
     };
 
-    useEffect(() => {
-        localStorage.setItem(SIDEBAR_SECTION_STORAGE_KEY, JSON.stringify(sectionExpanded));
-    }, [sectionExpanded]);
+    const formatDeleteTimestamp = (timestamp: number | null): string => {
+        if (timestamp == null) {
+            return "";
+        }
+        return new Date(timestamp).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+        });
+    };
 
     return (
         <div className={`sidebar ${isCollapsed ? "collapsed" : ""}`}>
             <div className="sidebar-header">
                 <div className="sidebar-logo">
-                    <span className="logo-icon">&#x26A1;</span>
+                    <img
+                        src="/forgemetalink-icon.svg"
+                        alt="ForgeMetaLink icon"
+                        className="logo-icon"
+                        width={20}
+                        height={20}
+                    />
                     {!isCollapsed && <span className="logo-text">ForgeMetaLink</span>}
                 </div>
                 <button
@@ -327,6 +422,11 @@ export function Sidebar({
                         </>
                     )}
                 </button>
+                {scanValidationError && (
+                    <p className="input-error" role="alert">
+                        {scanValidationError}
+                    </p>
+                )}
 
                 {isScanning && scanProgress && (
                     <div className="scan-progress-container">
@@ -480,10 +580,6 @@ export function Sidebar({
                             {thumbnailCacheResult.skipped} skipped,{" "}
                             {thumbnailCacheResult.failed} failed.
                         </p>
-                    )}
-
-                    {thumbnailCacheMessage && (
-                        <p className="sidebar-help">{thumbnailCacheMessage}</p>
                     )}
                 </CollapsibleSidebarSection>
 
@@ -668,9 +764,138 @@ export function Sidebar({
                     >
                         Export as ZIP
                     </button>
-                    {operationMessage && (
-                        <p className="sidebar-help">{operationMessage}</p>
-                    )}
+                </CollapsibleSidebarSection>
+
+                <CollapsibleSidebarSection
+                    id="gallerySafety"
+                    title="Gallery Safety"
+                    isExpanded={sectionExpanded.gallerySafety}
+                    onToggle={toggleSection}
+                >
+                    <label className="sidebar-checkbox-row">
+                        <input
+                            type="checkbox"
+                            checked={autoLockFavorites}
+                            onChange={(event) =>
+                                onAutoLockFavoritesChange(event.target.checked)
+                            }
+                        />
+                        Auto-lock favorites
+                    </label>
+                    <p className="sidebar-help">
+                        When enabled, marking an image as favorite also locks it.
+                    </p>
+
+                    <div className="bulk-mark-actions">
+                        <button
+                            className="sidebar-button"
+                            type="button"
+                            onClick={onBulkFavoriteSelected}
+                            disabled={selectedCount === 0 || isApplyingSelectionActions}
+                        >
+                            Favorite Selected
+                        </button>
+                        <button
+                            className="sidebar-button"
+                            type="button"
+                            onClick={onBulkUnfavoriteSelected}
+                            disabled={selectedCount === 0 || isApplyingSelectionActions}
+                        >
+                            Unfavorite Selected
+                        </button>
+                        <button
+                            className="sidebar-button"
+                            type="button"
+                            onClick={onBulkLockSelected}
+                            disabled={selectedCount === 0 || isApplyingSelectionActions}
+                        >
+                            Lock Selected
+                        </button>
+                        <button
+                            className="sidebar-button"
+                            type="button"
+                            onClick={onBulkUnlockSelected}
+                            disabled={selectedCount === 0 || isApplyingSelectionActions}
+                        >
+                            Unlock Selected
+                        </button>
+                    </div>
+                    <p className="sidebar-help">
+                        Apply favorite/lock state to all currently selected images.
+                    </p>
+
+                    <button
+                        className="sidebar-button"
+                        type="button"
+                        onClick={onMoveSelectedToFolder}
+                        disabled={selectedCount === 0 || isApplyingSelectionActions}
+                    >
+                        {isMovingSelected
+                            ? "Moving selected..."
+                            : `Move Selected (${selectedCount})`}
+                    </button>
+                    <p className="sidebar-help">
+                        Move selected images to another folder without deleting.
+                    </p>
+
+                    <div className="recent-delete-panel">
+                        <div className="recent-delete-header">
+                            <h5>Recently deleted</h5>
+                            <button
+                                className="sidebar-button"
+                                type="button"
+                                onClick={onClearDeleteHistory}
+                                disabled={recentDeleteHistory.length === 0}
+                            >
+                                Clear
+                            </button>
+                        </div>
+
+                        <div className="recent-delete-group">
+                            <span className="recent-delete-group-title">Pending</span>
+                            {pendingDeletes.length === 0 ? (
+                                <p className="sidebar-help">No pending deletes.</p>
+                            ) : (
+                                <ul className="recent-delete-list">
+                                    {pendingDeletes.map((entry) => (
+                                        <li key={entry.id} className="recent-delete-item pending">
+                                            <span className="recent-delete-summary">
+                                                {entry.summary}
+                                            </span>
+                                            <span className="recent-delete-meta">
+                                                {formatDeleteTimestamp(entry.createdAt)}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+
+                        <div className="recent-delete-group">
+                            <span className="recent-delete-group-title">Finalized</span>
+                            {finalizedDeletes.length === 0 ? (
+                                <p className="sidebar-help">No finalized deletes yet.</p>
+                            ) : (
+                                <ul className="recent-delete-list">
+                                    {finalizedDeletes.slice(0, 12).map((entry) => (
+                                        <li
+                                            key={entry.id}
+                                            className={`recent-delete-item ${entry.status}`}
+                                        >
+                                            <span className="recent-delete-summary">
+                                                {entry.summary}
+                                            </span>
+                                            <span className="recent-delete-meta">
+                                                {formatDeleteTimestamp(
+                                                    entry.completedAt ?? entry.createdAt
+                                                )}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                    </div>
                 </CollapsibleSidebarSection>
 
                 <CollapsibleSidebarSection
@@ -680,11 +905,17 @@ export function Sidebar({
                     onToggle={toggleSection}
                 >
                     <input
-                        className="sidebar-input"
+                        className={`sidebar-input ${hasValidForgeUrl ? "" : "input-invalid"}`}
                         value={forgeBaseUrl}
                         onChange={(event) => onForgeBaseUrlChange(event.target.value)}
                         placeholder="http://127.0.0.1:7860"
+                        aria-invalid={!hasValidForgeUrl}
                     />
+                    {!hasValidForgeUrl && (
+                        <p className="input-error" role="alert">
+                            {forgeUrlError}
+                        </p>
+                    )}
                     <p className="sidebar-help">
                         Use host root URL (no /sdapi/v1). Forge must be started with --api.
                     </p>
@@ -799,22 +1030,19 @@ export function Sidebar({
                     <button
                         className="sidebar-button"
                         onClick={onForgeTestConnection}
-                        disabled={isTestingForge}
+                        disabled={isTestingForge || !hasValidForgeUrl}
                     >
                         {isTestingForge ? "Testing..." : "Test Connection"}
                     </button>
                     <button
                         className="sidebar-button"
                         onClick={onForgeSendSelected}
-                        disabled={selectedCount === 0 || isSendingForgeBatch}
+                        disabled={selectedCount === 0 || isSendingForgeBatch || !hasValidForgeUrl}
                     >
                         {isSendingForgeBatch
                             ? "Queueing..."
                             : `Send Selected to Forge (${selectedCount})`}
                     </button>
-                    {forgeStatusMessage && (
-                        <p className="sidebar-help">{forgeStatusMessage}</p>
-                    )}
                 </CollapsibleSidebarSection>
             </div>}
         </div>

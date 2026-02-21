@@ -52,12 +52,8 @@ pub fn extract_text_chunks(
         return Err(format!("Not a valid PNG file: {}", path.display()).into());
     }
 
-    loop {
+    while let Ok(length) = reader.read_u32::<BigEndian>() {
         // Read chunk length (4 bytes, big-endian)
-        let length = match reader.read_u32::<BigEndian>() {
-            Ok(len) => len,
-            Err(_) => break, // EOF
-        };
 
         // Read chunk type (4 bytes)
         let mut chunk_type = [0u8; 4];
@@ -354,7 +350,7 @@ pub fn compute_quick_hash(path: &Path, file_size_hint: Option<i64>) -> Option<St
 
     let mut reader = BufReader::with_capacity(PNG_READER_CAPACITY, file);
     let mut hasher = Sha256::new();
-    hasher.update(&size_u64.to_le_bytes());
+    hasher.update(size_u64.to_le_bytes());
 
     let mut head = vec![0u8; sample_len];
     reader.read_exact(&mut head).ok()?;

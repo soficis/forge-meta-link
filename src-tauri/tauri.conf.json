@@ -24,14 +24,16 @@
                 "enable": true,
                 "scope": [
                     "$APPDATA/**",
-                    "$HOME/**",
                     "$RESOURCE/**",
+                    "$HOME/**",
                     "**/*",
                     "?:/**",
-                    "[A-Z]:/**"
+                    "?:\\**",
+                    "[A-Za-z]:/**",
+                    "[A-Za-z]:\\**"
                 ]
             },
-            "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+            "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
         }
     },
     "bundle": {

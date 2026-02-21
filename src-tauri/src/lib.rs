@@ -9,13 +9,14 @@ pub mod sidecar;
 mod commands;
 
 use commands::{
-    export_images, export_images_as_files, filter_images, filter_images_cursor, forge_get_options,
-    forge_send_to_image, forge_send_to_images, forge_test_connection, get_directories,
-    get_display_image_path, get_image_clipboard_payload, get_image_detail, get_image_tags,
-    get_images, get_images_cursor, get_models, get_sidecar_data, get_storage_profile,
-    get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count, list_tags,
-    open_file_location, precache_all_thumbnails, save_sidecar_tags, scan_directory,
-    search_images, search_images_cursor, set_storage_profile,
+    delete_images, directory_exists, export_images, export_images_as_files, filter_images_cursor,
+    forge_get_options, forge_send_to_image, forge_send_to_images, forge_test_connection,
+    get_directories, get_display_image_path, get_forge_api_key, get_image_clipboard_payload,
+    get_image_detail, get_image_tags, get_images_cursor, get_models, get_sidecar_data,
+    get_storage_profile, get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count,
+    list_tags, move_images_to_directory, open_file_location, precache_all_thumbnails,
+    save_sidecar_tags, scan_directory, search_images_cursor, set_forge_api_key, set_image_favorite,
+    set_image_locked, set_images_favorite, set_images_locked, set_storage_profile,
 };
 use database::Database;
 use serde::{Deserialize, Serialize};
@@ -27,18 +28,14 @@ use tauri::async_runtime::Mutex;
 use tauri::Manager;
 
 const STORAGE_PROFILE_FILE: &str = "storage_profile.json";
+const FORGE_API_KEY_FILE: &str = "forge_api_key.json";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageProfile {
+    #[default]
     Hdd,
     Ssd,
-}
-
-impl Default for StorageProfile {
-    fn default() -> Self {
-        Self::Hdd
-    }
 }
 
 /// Shared application state for Tauri commands.
@@ -50,6 +47,8 @@ pub struct AppState {
     pub thumbnail_precache_running: Arc<AtomicBool>,
     pub storage_profile: Arc<RwLock<StorageProfile>>,
     pub storage_profile_path: PathBuf,
+    pub forge_api_key: Arc<RwLock<String>>,
+    pub forge_api_key_path: PathBuf,
     pub forge_send_queue: Arc<Mutex<()>>,
 }
 
@@ -99,19 +98,10 @@ pub fn run() {
             let storage_profile_path = app_data.join(STORAGE_PROFILE_FILE);
             let storage_profile_value = load_storage_profile(&storage_profile_path);
             let storage_profile = Arc::new(RwLock::new(storage_profile_value));
+            let forge_api_key_path = app_data.join(FORGE_API_KEY_FILE);
+            let forge_api_key = Arc::new(RwLock::new(load_forge_api_key(&forge_api_key_path)));
 
             let db_path = app_data.join("ForgeMetaLink.db");
-            let legacy_db_path = app_data.join("forgemetalink.db");
-            if !db_path.exists() && legacy_db_path.exists() {
-                if let Err(error) = std::fs::rename(&legacy_db_path, &db_path) {
-                    log::warn!(
-                        "Failed to migrate legacy DB path {} -> {}: {}",
-                        legacy_db_path.display(),
-                        db_path.display(),
-                        error
-                    );
-                }
-            }
             let cache_dir = app_data.join("thumbnails");
             std::fs::create_dir_all(&cache_dir).ok();
             let thumbnail_index = Arc::new(RwLock::new(build_thumbnail_index(&cache_dir)));
@@ -130,17 +120,16 @@ pub fn run() {
                 thumbnail_precache_running,
                 storage_profile,
                 storage_profile_path,
+                forge_api_key,
+                forge_api_key_path,
                 forge_send_queue,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             scan_directory,
-            get_images,
             get_images_cursor,
-            search_images,
             search_images_cursor,
-            filter_images,
             filter_images_cursor,
             list_tags,
             get_top_tags,
@@ -154,13 +143,22 @@ pub fn run() {
             precache_all_thumbnails,
             get_directories,
             get_models,
+            directory_exists,
             open_file_location,
+            delete_images,
+            move_images_to_directory,
+            set_image_favorite,
+            set_image_locked,
+            set_images_favorite,
+            set_images_locked,
             export_images,
             export_images_as_files,
             forge_test_connection,
             forge_get_options,
             forge_send_to_image,
             forge_send_to_images,
+            get_forge_api_key,
+            set_forge_api_key,
             get_sidecar_data,
             save_sidecar_tags,
             get_storage_profile,
@@ -186,6 +184,22 @@ fn load_storage_profile(path: &Path) -> StorageProfile {
         .unwrap_or_default()
 }
 
+fn load_forge_api_key(path: &Path) -> String {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return String::new(),
+    };
+
+    #[derive(Deserialize)]
+    struct ForgeApiKeyConfig {
+        api_key: String,
+    }
+
+    serde_json::from_str::<ForgeApiKeyConfig>(&content)
+        .map(|config| config.api_key)
+        .unwrap_or_default()
+}
+
 pub(crate) fn persist_storage_profile(path: &Path, profile: StorageProfile) -> Result<(), String> {
     #[derive(Serialize)]
     struct StorageProfileConfig {
@@ -198,6 +212,34 @@ pub(crate) fn persist_storage_profile(path: &Path, profile: StorageProfile) -> R
     std::fs::write(path, payload).map_err(|error| {
         format!(
             "Failed to save storage profile to {}: {}",
+            path.display(),
+            error
+        )
+    })
+}
+
+pub(crate) fn persist_forge_api_key(path: &Path, api_key: &str) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct ForgeApiKeyConfig<'a> {
+        api_key: &'a str,
+    }
+
+    let payload = serde_json::to_string_pretty(&ForgeApiKeyConfig { api_key })
+        .map_err(|error| format!("Failed to serialize Forge API key: {}", error))?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create Forge API key directory {}: {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
+
+    std::fs::write(path, payload).map_err(|error| {
+        format!(
+            "Failed to save Forge API key to {}: {}",
             path.display(),
             error
         )
@@ -237,4 +279,42 @@ fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
     );
 
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_forge_api_key, persist_forge_api_key};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_config_path() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forge_meta_link_forge_api_key_test_{}.json",
+            timestamp
+        ))
+    }
+
+    #[test]
+    fn forge_api_key_round_trip_persists_and_loads() {
+        let path = temp_config_path();
+        let key = "test-api-key-123";
+        persist_forge_api_key(&path, key).expect("persist should succeed");
+        let loaded = load_forge_api_key(&path);
+        assert_eq!(loaded, key);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn forge_api_key_load_defaults_when_file_missing() {
+        let path = temp_config_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let loaded = load_forge_api_key(&path);
+        assert_eq!(loaded, "");
+    }
 }

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
     exportImages,
     exportImagesAsFiles,
     forgeGetOptions,
     forgeSendToImage,
     getDisplayImagePath,
+    getImageClipboardPayload,
     getImageDetail,
     getSidecarData,
     getThumbnailPath,
@@ -20,11 +22,14 @@ import {
     formatBytes,
 } from "../utils/imageClipboard";
 import type {
+    DeleteMode,
     ForgePayloadOverrides,
     GalleryImageRecord,
     ImageExportFormat,
     ImageRecord,
 } from "../types/metadata";
+import { usePersistedState } from "../hooks/usePersistedState";
+import type { ShowToastOptions } from "../hooks/useToast";
 
 interface PhotoViewerProps {
     images: GalleryImageRecord[];
@@ -50,17 +55,30 @@ interface PhotoViewerProps {
     forgeAdetailerFaceEnabled: boolean;
     forgeAdetailerFaceModel: string;
     onSearchBySeed: (seed: string) => void;
+    onDeleteCurrentImage: (image: GalleryImageRecord) => void;
+    isDeletingCurrentImage: boolean;
+    deleteMode: DeleteMode;
+    onToggleFavorite: (image: GalleryImageRecord) => void;
+    onToggleLocked: (image: GalleryImageRecord) => void;
+    onShowToast: (message: string, options?: ShowToastOptions) => void;
 }
 
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
 const ZOOM_STEP = 0.2;
-const FILMSTRIP_RADIUS = 80;
+const FILMSTRIP_ITEM_WIDTH = 76;
+const FILMSTRIP_PREFETCH_OVERSCAN = 20;
 const FILMSTRIP_CHUNK_SIZE = 64;
 const FILMSTRIP_CONCURRENCY = Math.max(
     3,
     Math.min(12, navigator.hardwareConcurrency || 8)
 );
+const FORGE_STEPS_MIN = 1;
+const FORGE_STEPS_MAX = 150;
+const FORGE_CFG_SCALE_MIN = 1;
+const FORGE_CFG_SCALE_MAX = 30;
+const FORGE_LORA_WEIGHT_MIN = 0;
+const FORGE_LORA_WEIGHT_MAX = 2;
 const DEFAULT_SLIDESHOW_INTERVAL = 4000;
 const SLIDESHOW_INTERVAL_OPTIONS = [
     { label: "2s", value: 2000 },
@@ -108,6 +126,10 @@ const RESOLUTION_PRESETS: Record<
 const ADETAILER_FACE_MODELS = ["face_yolov8n.pt", "face_yolov8s.pt"];
 const FORGE_PAYLOAD_PRESETS_STORAGE_KEY = "forgePayloadPresets";
 
+function toAssetSrc(filepath: string): string {
+    return convertFileSrc(filepath.replace(/\\/g, "/"));
+}
+
 interface ForgePayloadPreset {
     forge_overrides: ForgePayloadOverrides;
     send_seed_with_request: boolean;
@@ -117,15 +139,13 @@ interface ForgePayloadPreset {
     lora_weight: string;
 }
 
-function readForgePayloadPresets(): Record<string, ForgePayloadPreset> {
-    const raw = localStorage.getItem(FORGE_PAYLOAD_PRESETS_STORAGE_KEY);
-    if (!raw) {
-        return {};
-    }
+function parseForgePayloadPresets(
+    raw: string
+): Record<string, ForgePayloadPreset> | undefined {
     try {
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            return {};
+            return undefined;
         }
         return Object.entries(parsed).reduce<Record<string, ForgePayloadPreset>>(
             (acc, [name, value]) => {
@@ -165,12 +185,62 @@ function readForgePayloadPresets(): Record<string, ForgePayloadPreset> {
             {}
         );
     } catch {
-        return {};
+        return undefined;
     }
 }
 
+const forgePayloadPresetStorage = {
+    serialize: (value: Record<string, ForgePayloadPreset>) =>
+        JSON.stringify(value),
+    deserialize: parseForgePayloadPresets,
+};
+
+const slideshowIntervalStorage = {
+    serialize: (value: number) => String(value),
+    deserialize: (raw: string): number | undefined => {
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) && parsed >= 1000
+            ? parsed
+            : undefined;
+    },
+};
+
 function clamp(value: number, min: number, max: number): number {
     return Math.max(min, Math.min(max, value));
+}
+
+function validateOptionalInteger(
+    value: string,
+    min: number,
+    max: number,
+    fieldLabel: string
+): string | null {
+    const normalized = value.trim();
+    if (!normalized) {
+        return null;
+    }
+    const parsed = Number(normalized);
+    if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+        return `${fieldLabel} must be an integer from ${min} to ${max}.`;
+    }
+    return null;
+}
+
+function validateOptionalFloat(
+    value: string,
+    min: number,
+    max: number,
+    fieldLabel: string
+): string | null {
+    const normalized = value.trim();
+    if (!normalized) {
+        return null;
+    }
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+        return `${fieldLabel} must be between ${min} and ${max}.`;
+    }
+    return null;
 }
 
 function detectResolutionFamilyFromModelName(modelName: string | null | undefined): ResolutionPresetFamily {
@@ -245,18 +315,25 @@ export function PhotoViewer({
     forgeAdetailerFaceEnabled,
     forgeAdetailerFaceModel,
     onSearchBySeed,
+    onDeleteCurrentImage,
+    isDeletingCurrentImage,
+    deleteMode,
+    onToggleFavorite,
+    onToggleLocked,
+    onShowToast,
 }: PhotoViewerProps) {
     const currentImage = images[currentIndex] ?? null;
     const [currentDetail, setCurrentDetail] = useState<ImageRecord | null>(null);
     const [isDetailLoading, setIsDetailLoading] = useState(false);
 
-    const [statusMessage, setStatusMessage] = useState<string | null>(null);
     const [isSendingToForge, setIsSendingToForge] = useState(false);
     const [isSavingSidecar, setIsSavingSidecar] = useState(false);
 
     const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(null);
     const [displayImagePath, setDisplayImagePath] = useState<string | null>(null);
     const [fullResLoaded, setFullResLoaded] = useState(false);
+    const [fullResError, setFullResError] = useState(false);
+    const [fallbackDataUrl, setFallbackDataUrl] = useState<string | null>(null);
     const [imageContextMenu, setImageContextMenu] = useState<{
         x: number;
         y: number;
@@ -281,9 +358,13 @@ export function PhotoViewer({
     const [forgeSchedulerOptions, setForgeSchedulerOptions] = useState<string[]>([]);
     const [forgeOptionsWarning, setForgeOptionsWarning] = useState<string | null>(null);
     const [isLoadingForgeOptions, setIsLoadingForgeOptions] = useState(false);
-    const [forgePayloadPresets, setForgePayloadPresets] = useState<
+    const [forgePayloadPresets, setForgePayloadPresets] = usePersistedState<
         Record<string, ForgePayloadPreset>
-    >(readForgePayloadPresets);
+    >(
+        FORGE_PAYLOAD_PRESETS_STORAGE_KEY,
+        {},
+        forgePayloadPresetStorage
+    );
     const [selectedForgePreset, setSelectedForgePreset] = useState("");
     const [forgePresetNameInput, setForgePresetNameInput] = useState("");
     const [singleImageExportFormat, setSingleImageExportFormat] =
@@ -294,14 +375,13 @@ export function PhotoViewer({
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isPanning, setIsPanning] = useState(false);
     const [isInfoOpen, setIsInfoOpen] = useState(true);
+    const [infoPanelTab, setInfoPanelTab] = useState<"info" | "forge">("info");
     const [isSlideshow, setIsSlideshow] = useState(false);
-    const [slideshowIntervalMs, setSlideshowIntervalMs] = useState(() => {
-        const raw = localStorage.getItem("viewerSlideshowIntervalMs");
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) && parsed >= 1000
-            ? parsed
-            : DEFAULT_SLIDESHOW_INTERVAL;
-    });
+    const [slideshowIntervalMs, setSlideshowIntervalMs] = usePersistedState(
+        "viewerSlideshowIntervalMs",
+        DEFAULT_SLIDESHOW_INTERVAL,
+        slideshowIntervalStorage
+    );
     const [selectedResolutionFamily, setSelectedResolutionFamily] =
         useState<ResolutionPresetFamily>("pony_sdxl");
     const [isLoraDropdownOpen, setIsLoraDropdownOpen] = useState(false);
@@ -314,6 +394,8 @@ export function PhotoViewer({
     const detailRequestRef = useRef(0);
     const forgeOverridesImageIdRef = useRef<number | null>(null);
     const loraDropdownRef = useRef<HTMLDivElement | null>(null);
+    const filmstripRef = useRef<HTMLDivElement | null>(null);
+    const viewerImageOpenStartRef = useRef<number | null>(null);
 
     const filmstripCacheRef = useRef<Map<string, string>>(new Map());
     const [filmstripThumbPaths, setFilmstripThumbPaths] = useState<Record<string, string>>({});
@@ -377,13 +459,12 @@ export function PhotoViewer({
         };
     }, [isSlideshow, currentIndex, images.length, onNavigate, slideshowIntervalMs]);
 
-    useEffect(() => {
-        localStorage.setItem("viewerSlideshowIntervalMs", String(slideshowIntervalMs));
-    }, [slideshowIntervalMs]);
-
     const fullImageSrc = useMemo(
-        () => (displayImagePath ? convertFileSrc(displayImagePath) : ""),
-        [displayImagePath]
+        () => {
+            if (fallbackDataUrl) return fallbackDataUrl;
+            return displayImagePath ? toAssetSrc(displayImagePath) : "";
+        },
+        [displayImagePath, fallbackDataUrl]
     );
 
     const currentParamEntries = useMemo(() => {
@@ -520,6 +601,57 @@ export function PhotoViewer({
         }
         return Math.max(0, Math.min(2, parsed));
     }, [forgeLoraWeight]);
+
+    const stepsValidationError = useMemo(
+        () =>
+            validateOptionalInteger(
+                forgeOverrides.steps,
+                FORGE_STEPS_MIN,
+                FORGE_STEPS_MAX,
+                "Steps"
+            ),
+        [forgeOverrides.steps]
+    );
+    const cfgScaleValidationError = useMemo(
+        () =>
+            validateOptionalFloat(
+                forgeOverrides.cfg_scale,
+                FORGE_CFG_SCALE_MIN,
+                FORGE_CFG_SCALE_MAX,
+                "CFG Scale"
+            ),
+        [forgeOverrides.cfg_scale]
+    );
+    const loraWeightValidationError = useMemo(
+        () =>
+            validateOptionalFloat(
+                forgeLoraWeight,
+                FORGE_LORA_WEIGHT_MIN,
+                FORGE_LORA_WEIGHT_MAX,
+                "LoRA Weight"
+            ),
+        [forgeLoraWeight]
+    );
+    const hasForgeValidationErrors =
+        stepsValidationError != null ||
+        cfgScaleValidationError != null ||
+        loraWeightValidationError != null;
+    const forgeUrlValidationError = useMemo(() => {
+        const normalized = forgeBaseUrl.trim();
+        if (!normalized) {
+            return "Forge URL is required before sending.";
+        }
+        try {
+            const parsed = new URL(normalized);
+            if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+                return "Forge URL must use http:// or https://.";
+            }
+            return null;
+        } catch {
+            return "Forge URL is invalid. Update it in sidebar settings.";
+        }
+    }, [forgeBaseUrl]);
+    const hasValidForgeUrl = forgeUrlValidationError == null;
 
     const adetailerModelDropdownOptions = useMemo(() => {
         const current = adetailerFaceModelForCurrentRequest.trim();
@@ -737,13 +869,6 @@ export function PhotoViewer({
     }, [zoom]);
 
     useEffect(() => {
-        localStorage.setItem(
-            FORGE_PAYLOAD_PRESETS_STORAGE_KEY,
-            JSON.stringify(forgePayloadPresets)
-        );
-    }, [forgePayloadPresets]);
-
-    useEffect(() => {
         if (!selectedForgePreset) {
             return;
         }
@@ -754,12 +879,38 @@ export function PhotoViewer({
         setSelectedForgePreset("");
     }, [forgePayloadPresets, selectedForgePreset]);
 
-    const filmstripStart = Math.max(0, currentIndex - FILMSTRIP_RADIUS);
-    const filmstripEnd = Math.min(images.length, currentIndex + FILMSTRIP_RADIUS + 1);
-    const filmstripImages = useMemo(
-        () => images.slice(filmstripStart, filmstripEnd),
-        [filmstripEnd, filmstripStart, images]
-    );
+    const filmstripVirtualizer = useVirtualizer({
+        count: images.length,
+        getScrollElement: () => filmstripRef.current,
+        estimateSize: () => FILMSTRIP_ITEM_WIDTH,
+        horizontal: true,
+        overscan: 12,
+    });
+    const filmstripVirtualItems = filmstripVirtualizer.getVirtualItems();
+
+    const filmstripPrefetchFilepaths = useMemo(() => {
+        if (images.length === 0) {
+            return [] as string[];
+        }
+
+        const indexSet = new Set<number>();
+        indexSet.add(currentIndex);
+
+        for (const virtualItem of filmstripVirtualItems) {
+            const start = Math.max(0, virtualItem.index - FILMSTRIP_PREFETCH_OVERSCAN);
+            const end = Math.min(
+                images.length - 1,
+                virtualItem.index + FILMSTRIP_PREFETCH_OVERSCAN
+            );
+            for (let index = start; index <= end; index += 1) {
+                indexSet.add(index);
+            }
+        }
+
+        return Array.from(indexSet)
+            .sort((left, right) => left - right)
+            .map((index) => images[index].filepath);
+    }, [currentIndex, filmstripVirtualItems, images]);
 
     const addSidecarTag = useCallback((rawTag: string) => {
         const normalized = rawTag.trim().toLowerCase();
@@ -840,11 +991,22 @@ export function PhotoViewer({
         [forgeSelectedLoras, onForgeSelectedLorasChange]
     );
 
+    const showViewerToast = useCallback(
+        (
+            message: string,
+            tone: ShowToastOptions["tone"] = "info",
+            durationMs = 2800
+        ) => {
+            onShowToast(message, { tone, durationMs });
+        },
+        [onShowToast]
+    );
+
     const applyForgePayloadPreset = useCallback(
         (name: string) => {
             const preset = forgePayloadPresets[name];
             if (!preset) {
-                setStatusMessage(`Preset not found: ${name}`);
+                showViewerToast(`Preset not found: ${name}`, "warning");
                 return;
             }
             setForgeOverrides({
@@ -858,16 +1020,20 @@ export function PhotoViewer({
             );
             onForgeSelectedLorasChange(preset.lora_tokens ?? []);
             onForgeLoraWeightChange(preset.lora_weight || "1.0");
-            setStatusMessage(`Loaded preset: ${name}`);
-            window.setTimeout(() => setStatusMessage(null), 2400);
+            showViewerToast(`Loaded preset: ${name}`, "success", 2400);
         },
-        [forgePayloadPresets, onForgeLoraWeightChange, onForgeSelectedLorasChange]
+        [
+            forgePayloadPresets,
+            onForgeLoraWeightChange,
+            onForgeSelectedLorasChange,
+            showViewerToast,
+        ]
     );
 
     const saveCurrentAsForgePreset = useCallback(() => {
         const name = forgePresetNameInput.trim();
         if (!name) {
-            setStatusMessage("Enter a preset name");
+            showViewerToast("Enter a preset name.", "warning");
             return;
         }
 
@@ -884,8 +1050,7 @@ export function PhotoViewer({
         setForgePayloadPresets((prev) => ({ ...prev, [name]: preset }));
         setSelectedForgePreset(name);
         setForgePresetNameInput(name);
-        setStatusMessage(`Saved preset: ${name}`);
-        window.setTimeout(() => setStatusMessage(null), 2400);
+        showViewerToast(`Saved preset: ${name}`, "success", 2400);
     }, [
         adetailerFaceModelForCurrentRequest,
         forgeLoraWeight,
@@ -893,13 +1058,15 @@ export function PhotoViewer({
         forgePresetNameInput,
         forgeSelectedLoras,
         sendSeedForCurrentRequest,
+        setForgePayloadPresets,
+        showViewerToast,
         useAdetailerForCurrentRequest,
     ]);
 
     const deleteForgePreset = useCallback(() => {
         const name = selectedForgePreset.trim();
         if (!name) {
-            setStatusMessage("Select a preset to delete");
+            showViewerToast("Select a preset to delete.", "warning");
             return;
         }
 
@@ -909,19 +1076,17 @@ export function PhotoViewer({
             return next;
         });
         setSelectedForgePreset("");
-        setStatusMessage(`Deleted preset: ${name}`);
-        window.setTimeout(() => setStatusMessage(null), 2400);
-    }, [selectedForgePreset]);
+        showViewerToast(`Deleted preset: ${name}`, "success", 2400);
+    }, [selectedForgePreset, setForgePayloadPresets, showViewerToast]);
 
     const copyText = useCallback(async (value: string, successMessage: string) => {
         try {
             await navigator.clipboard.writeText(value);
-            setStatusMessage(successMessage);
-            window.setTimeout(() => setStatusMessage(null), 2400);
+            showViewerToast(successMessage, "success", 2400);
         } catch {
-            setStatusMessage("Clipboard write failed");
+            showViewerToast("Clipboard write failed.", "error");
         }
-    }, []);
+    }, [showViewerToast]);
 
     const openImageContextMenu = useCallback(
         (event: React.MouseEvent<HTMLDivElement>) => {
@@ -942,17 +1107,16 @@ export function PhotoViewer({
         try {
             const result = await copyCompressedImageForDiscord(currentImage.filepath);
             const mimeLabel = result.mime.replace("image/", "").toUpperCase();
-            setStatusMessage(
+            showViewerToast(
                 `Copied ${mimeLabel} ${currentImage.filename} (${result.width}x${result.height}, ${formatBytes(
                     result.bytes
-                )})`
+                )})`,
+                "success"
             );
-            window.setTimeout(() => setStatusMessage(null), 2800);
         } catch (error) {
-            setStatusMessage(`Copy failed: ${String(error)}`);
-            window.setTimeout(() => setStatusMessage(null), 2800);
+            showViewerToast(`Copy failed: ${String(error)}`, "error");
         }
-    }, [currentImage]);
+    }, [currentImage, showViewerToast]);
 
     const copyJpegCurrentImage = useCallback(async () => {
         if (!currentImage) {
@@ -962,34 +1126,66 @@ export function PhotoViewer({
         try {
             const result = await copyJpegImageToClipboard(currentImage.filepath);
             const mimeLabel = result.mime.replace("image/", "").toUpperCase();
-            setStatusMessage(
+            showViewerToast(
                 `Copied ${mimeLabel} ${currentImage.filename} (${result.width}x${result.height}, ${formatBytes(
                     result.bytes
-                )})`
+                )})`,
+                "success"
             );
-            window.setTimeout(() => setStatusMessage(null), 2800);
         } catch (error) {
-            setStatusMessage(`JPEG copy failed: ${String(error)}`);
-            window.setTimeout(() => setStatusMessage(null), 2800);
+            showViewerToast(`JPEG copy failed: ${String(error)}`, "error");
         }
-    }, [currentImage]);
+    }, [currentImage, showViewerToast]);
 
     const handleOpenFileLocation = useCallback(async () => {
         if (!currentImage) return;
         try {
             await openFileLocation(currentImage.filepath);
         } catch (error) {
-            setStatusMessage(`Failed: ${String(error)}`);
+            showViewerToast(`Failed: ${String(error)}`, "error");
         }
-    }, [currentImage]);
+    }, [currentImage, showViewerToast]);
 
     const handleSearchSameSeed = useCallback(() => {
         if (!currentSeed) {
-            setStatusMessage("No seed found for this image");
+            showViewerToast("No seed found for this image.", "warning");
             return;
         }
         onSearchBySeed(currentSeed);
-    }, [currentSeed, onSearchBySeed]);
+    }, [currentSeed, onSearchBySeed, showViewerToast]);
+
+    const handleDeleteCurrentImage = useCallback(() => {
+        if (!currentImage || isDeletingCurrentImage) {
+            return;
+        }
+        if (currentImage.is_locked || currentImage.is_favorite) {
+            showViewerToast(
+                "This image is protected. Unlock or unfavorite it first.",
+                "warning"
+            );
+            return;
+        }
+        onDeleteCurrentImage(currentImage);
+    }, [
+        currentImage,
+        isDeletingCurrentImage,
+        onDeleteCurrentImage,
+        showViewerToast,
+    ]);
+
+    const handleToggleFavorite = useCallback(() => {
+        if (!currentImage || isDeletingCurrentImage) {
+            return;
+        }
+        onToggleFavorite(currentImage);
+    }, [currentImage, isDeletingCurrentImage, onToggleFavorite]);
+
+    const handleToggleLocked = useCallback(() => {
+        if (!currentImage || isDeletingCurrentImage) {
+            return;
+        }
+        onToggleLocked(currentImage);
+    }, [currentImage, isDeletingCurrentImage, onToggleLocked]);
 
     const handleExport = useCallback(
         async (format: "json" | "csv") => {
@@ -1005,13 +1201,12 @@ export function PhotoViewer({
             }
             try {
                 const result = await exportImages([currentImage.id], format, outputPath);
-                setStatusMessage(`Exported to ${result.output_path}`);
-                window.setTimeout(() => setStatusMessage(null), 3000);
+                showViewerToast(`Exported to ${result.output_path}`, "success", 3000);
             } catch (error) {
-                setStatusMessage(`Export failed: ${String(error)}`);
+                showViewerToast(`Export failed: ${String(error)}`, "error");
             }
         },
-        [currentImage]
+        [currentImage, showViewerToast]
     );
 
     const handleExportSingleImage = useCallback(async () => {
@@ -1038,7 +1233,7 @@ export function PhotoViewer({
         }
 
         try {
-            setStatusMessage("Exporting image...");
+            showViewerToast("Exporting image...", "info", 1800);
             const result = await exportImagesAsFiles(
                 [currentImage.id],
                 singleImageExportFormat,
@@ -1047,23 +1242,37 @@ export function PhotoViewer({
                     : singleImageExportQuality,
                 outputPath
             );
-            setStatusMessage(`Exported image to ${result.output_path}`);
-            window.setTimeout(() => setStatusMessage(null), 3200);
+            showViewerToast(`Exported image to ${result.output_path}`, "success", 3200);
         } catch (error) {
-            setStatusMessage(`Image export failed: ${String(error)}`);
+            showViewerToast(`Image export failed: ${String(error)}`, "error");
         }
     }, [
         currentImage,
         singleImageExportFormat,
         singleImageExportQuality,
+        showViewerToast,
     ]);
 
     const handleSendToForge = useCallback(async () => {
         if (!currentImage) {
             return;
         }
+        if (!hasValidForgeUrl) {
+            showViewerToast(
+                forgeUrlValidationError ?? "Forge URL is invalid.",
+                "error"
+            );
+            return;
+        }
+        if (hasForgeValidationErrors) {
+            showViewerToast(
+                "Fix invalid Forge payload fields before sending.",
+                "error"
+            );
+            return;
+        }
+
         setIsSendingToForge(true);
-        setStatusMessage(null);
         try {
             const result = await forgeSendToImage(
                 currentImage.id,
@@ -1079,9 +1288,9 @@ export function PhotoViewer({
                 forgeLoraWeight.trim() ? Number(forgeLoraWeight) : null,
                 forgeOverrides
             );
-            setStatusMessage(result.message);
+            showViewerToast(result.message, result.ok ? "success" : "warning");
         } catch (error) {
-            setStatusMessage(`Forge send failed: ${String(error)}`);
+            showViewerToast(`Forge send failed: ${String(error)}`, "error");
         } finally {
             setIsSendingToForge(false);
         }
@@ -1096,6 +1305,10 @@ export function PhotoViewer({
         useAdetailerForCurrentRequest,
         adetailerFaceModelForCurrentRequest,
         forgeOverrides,
+        forgeUrlValidationError,
+        hasValidForgeUrl,
+        hasForgeValidationErrors,
+        showViewerToast,
     ]);
 
     const handleSaveSidecar = useCallback(async () => {
@@ -1105,14 +1318,13 @@ export function PhotoViewer({
         setIsSavingSidecar(true);
         try {
             await saveSidecarTags(currentImage.filepath, sidecarTags, sidecarNotes || null);
-            setStatusMessage("Sidecar saved");
-            window.setTimeout(() => setStatusMessage(null), 2200);
+            showViewerToast("Sidecar saved.", "success", 2200);
         } catch (error) {
-            setStatusMessage(`Save failed: ${String(error)}`);
+            showViewerToast(`Save failed: ${String(error)}`, "error");
         } finally {
             setIsSavingSidecar(false);
         }
-    }, [currentImage, sidecarNotes, sidecarTags]);
+    }, [currentImage, showViewerToast, sidecarNotes, sidecarTags]);
 
     const handleMouseDown = useCallback(
         (event: React.MouseEvent<HTMLDivElement>) => {
@@ -1183,9 +1395,14 @@ export function PhotoViewer({
         }
         let cancelled = false;
         const filepath = currentImage.filepath;
+        viewerImageOpenStartRef.current = performance.now();
+        console.info(
+            `[perf] viewer-open-start image=${currentImage.id} filepath=${filepath}`
+        );
 
         setFullResLoaded(false);
-        setStatusMessage(null);
+        setFullResError(false);
+        setFallbackDataUrl(null);
         setImageContextMenu(null);
         resetTransform();
 
@@ -1196,9 +1413,14 @@ export function PhotoViewer({
                 if (cancelled) {
                     return;
                 }
-                setThumbnailSrc(convertFileSrc(thumbPath));
+                setThumbnailSrc(toAssetSrc(thumbPath));
             })
-            .catch(() => {});
+            .catch((error) => {
+                console.warn(
+                    `Failed to resolve viewer preview thumbnail for ${filepath}:`,
+                    error
+                );
+            });
         getDisplayImagePath(filepath)
             .then((resolvedPath) => {
                 if (cancelled) {
@@ -1206,10 +1428,14 @@ export function PhotoViewer({
                 }
                 setDisplayImagePath(resolvedPath);
             })
-            .catch(() => {
+            .catch((error) => {
                 if (cancelled) {
                     return;
                 }
+                console.warn(
+                    `Failed to resolve display image path for ${filepath}, falling back to original path:`,
+                    error
+                );
                 setDisplayImagePath(filepath);
             });
 
@@ -1243,14 +1469,21 @@ export function PhotoViewer({
         for (const index of indexes) {
             const preload = new Image();
             preload.decoding = "async";
-            preload.src = convertFileSrc(images[index].filepath);
+            preload.src = toAssetSrc(images[index].filepath);
         }
     }, [currentImage, currentIndex, images]);
 
     useEffect(() => {
+        if (!filmstripRef.current || images.length === 0) {
+            return;
+        }
+
+        filmstripVirtualizer.scrollToIndex(currentIndex, { align: "center" });
+    }, [currentIndex, filmstripVirtualizer, images.length]);
+
+    useEffect(() => {
         let cancelled = false;
-        const missing = filmstripImages
-            .map((image) => image.filepath)
+        const missing = filmstripPrefetchFilepaths
             .filter((filepath) => !filmstripCacheRef.current.has(filepath));
 
         if (missing.length === 0) {
@@ -1307,12 +1540,22 @@ export function PhotoViewer({
         };
 
         const workers = Array.from({ length: workerCount }, () => runWorker());
-        Promise.allSettled(workers).catch(() => {});
+        void Promise.allSettled(workers).then((results) => {
+            if (cancelled) {
+                return;
+            }
+            const rejected = results.filter((result) => result.status === "rejected");
+            if (rejected.length > 0) {
+                console.warn(
+                    `Filmstrip thumbnail workers reported ${rejected.length} rejection(s).`
+                );
+            }
+        });
 
         return () => {
             cancelled = true;
         };
-    }, [filmstripImages]);
+    }, [filmstripPrefetchFilepaths]);
 
     useEffect(() => {
         if (!imageContextMenu) {
@@ -1425,6 +1668,8 @@ export function PhotoViewer({
                             className="viewer-control-button"
                             onClick={handleOpenFileLocation}
                             title="Open file location in explorer"
+                            type="button"
+                            aria-label="Open file location"
                         >
                             Open Location
                         </button>
@@ -1432,6 +1677,8 @@ export function PhotoViewer({
                             className={`viewer-control-button ${isSlideshow ? "active" : ""}`}
                             onClick={toggleSlideshow}
                             title="Toggle slideshow (S)"
+                            type="button"
+                            aria-label={isSlideshow ? "Stop slideshow" : "Start slideshow"}
                         >
                             {isSlideshow ? "Stop" : "Slideshow"}
                         </button>
@@ -1457,10 +1704,17 @@ export function PhotoViewer({
                                     setPan({ x: 0, y: 0 });
                                 }
                             }}
+                            type="button"
+                            aria-label={isInfoOpen ? "Hide info panel" : "Show info panel"}
                         >
                             {isInfoOpen ? "Hide Info" : "Show Info"}
                         </button>
-                        <button className="viewer-control-button danger" onClick={onClose}>
+                        <button
+                            className="viewer-control-button danger"
+                            onClick={onClose}
+                            type="button"
+                            aria-label="Close viewer"
+                        >
                             Close
                         </button>
                     </div>
@@ -1477,23 +1731,42 @@ export function PhotoViewer({
                                 className="viewer-control-button"
                                 onClick={goPrev}
                                 disabled={!canGoPrev}
+                                type="button"
+                                aria-label="Previous image"
                             >
                                 Prev
                             </button>
-                            <button className="viewer-control-button" onClick={zoomOut}>
+                            <button
+                                className="viewer-control-button"
+                                onClick={zoomOut}
+                                type="button"
+                                aria-label="Zoom out"
+                            >
                                 -
                             </button>
                             <span className="viewer-zoom-label">{Math.round(zoom * 100)}%</span>
-                            <button className="viewer-control-button" onClick={zoomIn}>
+                            <button
+                                className="viewer-control-button"
+                                onClick={zoomIn}
+                                type="button"
+                                aria-label="Zoom in"
+                            >
                                 +
                             </button>
-                            <button className="viewer-control-button" onClick={resetTransform}>
+                            <button
+                                className="viewer-control-button"
+                                onClick={resetTransform}
+                                type="button"
+                                aria-label="Reset zoom and pan"
+                            >
                                 Reset
                             </button>
                             <button
                                 className="viewer-control-button"
                                 onClick={goNext}
                                 disabled={!canGoNext}
+                                type="button"
+                                aria-label="Next image"
                             >
                                 Next
                             </button>
@@ -1511,686 +1784,879 @@ export function PhotoViewer({
                                     key={`preview-${currentImage.id}-${thumbnailSrc}`}
                                     src={thumbnailSrc}
                                     alt={currentImage.filename}
-                                    className="photo-viewer-image preview"
+                                    className={`photo-viewer-image ${fullResError ? "main" : "preview"}`}
+                                    style={fullResError ? {
+                                        transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+                                        cursor: zoom > 1 ? (isPanning ? "grabbing" : "grab") : "default",
+                                    } : undefined}
                                 />
                             )}
-                            <img
-                                key={`main-${currentImage.id}-${fullImageSrc}`}
-                                src={fullImageSrc}
-                                alt={currentImage.filename}
-                                className="photo-viewer-image main"
-                                loading="eager"
-                                decoding="async"
-                                onLoad={() => setFullResLoaded(true)}
-                                style={{
-                                    opacity: fullResLoaded ? 1 : 0,
-                                    transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
-                                    cursor: zoom > 1 ? (isPanning ? "grabbing" : "grab") : "default",
-                                }}
-                            />
+                            {!fullResLoaded && !fullResError && (
+                                <div className="photo-viewer-stage-loading">
+                                    <span className="spinner" />
+                                </div>
+                            )}
+                            {fullImageSrc && !fullResError && (
+                                <img
+                                    key={`main-${currentImage.id}-${fullImageSrc}`}
+                                    src={fullImageSrc}
+                                    alt={currentImage.filename}
+                                    className="photo-viewer-image main"
+                                    loading="eager"
+                                    decoding="async"
+                                    onLoad={() => {
+                                        setFullResLoaded(true);
+                                        if (viewerImageOpenStartRef.current != null) {
+                                            const elapsedMs =
+                                                performance.now() -
+                                                viewerImageOpenStartRef.current;
+                                            viewerImageOpenStartRef.current = null;
+                                            console.info(
+                                                `[perf] viewer-first-image image=${currentImage.id} elapsed_ms=${elapsedMs.toFixed(
+                                                    1
+                                                )}`
+                                            );
+                                        }
+                                    }}
+                                    onError={async () => {
+                                        if (fallbackDataUrl) {
+                                            console.warn(
+                                                `Both asset protocol and base64 fallback failed for ${currentImage.filepath}`
+                                            );
+                                            setFullResError(true);
+                                            onShowToast(
+                                                "Could not load full-resolution image. Showing thumbnail preview.",
+                                                { tone: "warning", durationMs: 4200 }
+                                            );
+                                            return;
+                                        }
+                                        console.warn(
+                                            `Asset protocol failed for ${currentImage.filepath}, trying base64 fallback...`
+                                        );
+                                        try {
+                                            const payload = await getImageClipboardPayload(
+                                                currentImage.filepath
+                                            );
+                                            setFallbackDataUrl(
+                                                `data:${payload.mime};base64,${payload.base64}`
+                                            );
+                                        } catch (fallbackError) {
+                                            console.warn(
+                                                "Base64 fallback also failed:",
+                                                fallbackError
+                                            );
+                                            setFullResError(true);
+                                            onShowToast(
+                                                "Could not load full-resolution image. Showing thumbnail preview.",
+                                                { tone: "warning", durationMs: 4200 }
+                                            );
+                                        }
+                                    }}
+                                    style={{
+                                        opacity: fullResLoaded ? 1 : 0,
+                                        transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+                                        cursor: zoom > 1 ? (isPanning ? "grabbing" : "grab") : "default",
+                                    }}
+                                />
+                            )}
                         </div>
 
-                        <div className="photo-viewer-filmstrip">
-                            {filmstripImages.map((image, localIndex) => {
-                                const absoluteIndex = filmstripStart + localIndex;
-                                const thumbPath =
-                                    filmstripThumbPaths[image.filepath] ?? null;
-                                return (
-                                    <button
-                                        key={`filmstrip-${image.id}`}
-                                        className={`photo-viewer-thumb ${
-                                            absoluteIndex === currentIndex ? "active" : ""
-                                        }`}
-                                        onClick={() => onNavigate(absoluteIndex)}
-                                        title={image.filename}
-                                    >
-                                        {thumbPath ? (
-                                            <img
-                                                src={convertFileSrc(thumbPath)}
-                                                alt={image.filename}
-                                                loading="lazy"
-                                                decoding="async"
-                                            />
-                                        ) : (
-                                            <span
-                                                style={{
-                                                    width: "100%",
-                                                    height: "100%",
-                                                    display: "block",
-                                                    background: "var(--bg-tertiary)",
-                                                }}
-                                            />
-                                        )}
-                                    </button>
-                                );
-                            })}
+                        <div
+                            ref={filmstripRef}
+                            className="photo-viewer-filmstrip"
+                            aria-label="Image filmstrip"
+                        >
+                            <div
+                                className="photo-viewer-filmstrip-content"
+                                style={{
+                                    width: `${filmstripVirtualizer.getTotalSize()}px`,
+                                }}
+                            >
+                                {filmstripVirtualItems.map((virtualItem) => {
+                                    const image = images[virtualItem.index];
+                                    if (!image) {
+                                        return null;
+                                    }
+
+                                    const thumbPath =
+                                        filmstripThumbPaths[image.filepath] ?? null;
+                                    return (
+                                        <button
+                                            key={`filmstrip-${image.id}`}
+                                            className={`photo-viewer-thumb photo-viewer-thumb-virtual ${
+                                                virtualItem.index === currentIndex
+                                                    ? "active"
+                                                    : ""
+                                            }`}
+                                            onClick={() => onNavigate(virtualItem.index)}
+                                            title={image.filename}
+                                            type="button"
+                                            aria-label={`Open ${image.filename}`}
+                                            style={{
+                                                width: `${virtualItem.size - 4}px`,
+                                                transform: `translateX(${virtualItem.start}px)`,
+                                            }}
+                                        >
+                                            {thumbPath ? (
+                                                <img
+                                                    src={toAssetSrc(thumbPath)}
+                                                    alt={image.filename}
+                                                    loading="lazy"
+                                                    decoding="async"
+                                                />
+                                            ) : (
+                                                <span className="photo-viewer-thumb-loading">
+                                                    <span className="spinner small" />
+                                                    <span className="photo-viewer-thumb-loading-text">
+                                                        Loading…
+                                                    </span>
+                                                </span>
+                                            )}
+                                        </button>
+                                    );
+                                })}
+                            </div>
                         </div>
                     </section>
 
                     <aside className={`photo-viewer-info-panel ${isInfoOpen ? "open" : "closed"}`}>
                         <div className="photo-viewer-info-scroll">
-                            <div className="photo-viewer-actions">
+                            <div className="photo-viewer-tab-bar">
                                 <button
-                                    className="viewer-action-button"
+                                    type="button"
+                                    className={`photo-viewer-tab ${infoPanelTab === "info" ? "active" : ""}`}
+                                    onClick={() => setInfoPanelTab("info")}
+                                >
+                                    Info
+                                </button>
+                                <button
+                                    type="button"
+                                    className={`photo-viewer-tab ${infoPanelTab === "forge" ? "active" : ""}`}
+                                    onClick={() => setInfoPanelTab("forge")}
+                                >
+                                    Forge
+                                </button>
+                            </div>
+
+                            <div className="photo-viewer-actions-toolbar">
+                                <button
+                                    className="viewer-toolbar-btn"
                                     onClick={() =>
                                         currentDetail &&
                                         copyText(currentDetail.raw_metadata, "Raw metadata copied")
                                     }
                                     disabled={!currentDetail || isDetailLoading}
+                                    title="Copy Metadata"
                                 >
-                                    Copy Metadata
+                                    Meta
                                 </button>
                                 <button
-                                    className="viewer-action-button"
+                                    className="viewer-toolbar-btn"
                                     onClick={() =>
                                         currentDetail &&
                                         copyText(currentDetail.prompt, "Prompt copied")
                                     }
                                     disabled={!currentDetail || isDetailLoading}
+                                    title="Copy Prompt"
                                 >
-                                    Copy Prompt
+                                    Prompt
                                 </button>
                                 <button
-                                    className="viewer-action-button"
-                                    onClick={() => handleExport("json")}
+                                    className="viewer-toolbar-btn"
+                                    onClick={handleOpenFileLocation}
+                                    title="Open file in Explorer"
                                 >
-                                    Export JSON
+                                    Locate
                                 </button>
                                 <button
-                                    className="viewer-action-button"
-                                    onClick={() => handleExport("csv")}
-                                >
-                                    Export CSV
-                                </button>
-                                <button
-                                    className="viewer-action-button"
-                                    onClick={handleSendToForge}
+                                    className="viewer-toolbar-btn danger"
+                                    onClick={handleDeleteCurrentImage}
                                     disabled={
-                                        isSendingToForge ||
-                                        !forgeBaseUrl.trim() ||
-                                        isDetailLoading ||
-                                        !currentDetail
+                                        isDeletingCurrentImage ||
+                                        Boolean(
+                                            currentImage?.is_locked || currentImage?.is_favorite
+                                        )
+                                    }
+                                    title={
+                                        currentImage?.is_locked || currentImage?.is_favorite
+                                            ? "Protected image: unlock or unfavorite first"
+                                            : deleteMode === "trash"
+                                              ? "Move this image to Trash"
+                                              : "Permanently delete this image"
                                     }
                                 >
-                                    {isSendingToForge ? "Sending..." : "Send to Forge"}
+                                    {isDeletingCurrentImage
+                                        ? "Deleting..."
+                                        : deleteMode === "trash"
+                                          ? "Trash"
+                                          : "Delete"}
                                 </button>
                                 <button
-                                    className="viewer-action-button"
-                                    onClick={handleOpenFileLocation}
-                                >
-                                    Open Location
-                                </button>
-                                <button
-                                    className="viewer-action-button"
+                                    className="viewer-toolbar-btn"
                                     onClick={handleSearchSameSeed}
-                                    disabled={!currentSeed}
+                                    disabled={!currentSeed || isDeletingCurrentImage}
+                                    title="Find Same Seed"
                                 >
-                                    Find Same Seed
+                                    Seed
                                 </button>
                             </div>
 
-                            <section className="photo-viewer-section">
-                                <h4>Export Image</h4>
-                                <div className="viewer-form-grid">
-                                    <select
-                                        className="viewer-input"
-                                        value={singleImageExportFormat}
-                                        onChange={(event) =>
-                                            setSingleImageExportFormat(
-                                                event.target.value as ImageExportFormat
-                                            )
-                                        }
-                                    >
-                                        {SINGLE_IMAGE_EXPORT_OPTIONS.map((option) => (
-                                            <option key={option.value} value={option.value}>
-                                                {option.label}
-                                            </option>
-                                        ))}
-                                    </select>
-                                    <button
-                                        className="viewer-action-button"
-                                        onClick={handleExportSingleImage}
-                                    >
-                                        Export Image ZIP
-                                    </button>
-                                </div>
-                                {showSingleImageExportQuality && (
-                                    <div className="export-quality-row">
-                                        <span className="export-quality-label">Quality</span>
-                                        <input
-                                            type="range"
-                                            className="export-quality-slider"
-                                            min={10}
-                                            max={100}
-                                            step={5}
-                                            value={singleImageExportQuality}
-                                            onChange={(event) =>
-                                                setSingleImageExportQuality(
-                                                    Number(event.target.value)
-                                                )
-                                            }
-                                        />
-                                        <span className="export-quality-value">
-                                            {singleImageExportQuality}
-                                        </span>
-                                    </div>
-                                )}
-                            </section>
-
-                            {statusMessage && (
-                                <div className="photo-viewer-note">{statusMessage}</div>
-                            )}
-                            {isDetailLoading && (
-                                <div className="photo-viewer-note">Loading metadata...</div>
-                            )}
-
-                            <section className="photo-viewer-section">
-                                <h4>Forge Payload</h4>
-                                {isLoadingForgeOptions && (
-                                    <div className="photo-viewer-note">Loading Forge options...</div>
-                                )}
-                                {forgeOptionsWarning && (
-                                    <div className="photo-viewer-note">{forgeOptionsWarning}</div>
-                                )}
-                                <div className="viewer-form-label">Preset Manager</div>
-                                <select
-                                    className="viewer-input"
-                                    value={selectedForgePreset}
-                                    onChange={(event) =>
-                                        setSelectedForgePreset(event.target.value)
+                            <div className="photo-viewer-actions-toolbar">
+                                <button
+                                    className={`viewer-toolbar-btn ${
+                                        currentImage?.is_favorite ? "active" : ""
+                                    }`}
+                                    onClick={handleToggleFavorite}
+                                    disabled={!currentImage || isDeletingCurrentImage}
+                                    title={
+                                        currentImage?.is_favorite
+                                            ? "Remove favorite protection"
+                                            : "Mark as favorite (protected from delete)"
                                     }
                                 >
-                                    <option value="">Select preset</option>
-                                    {forgePresetNames.map((name) => (
-                                        <option key={name} value={name}>
-                                            {name}
-                                        </option>
-                                    ))}
-                                </select>
-                                <div className="viewer-form-grid">
-                                    <input
-                                        className="viewer-input"
-                                        value={forgePresetNameInput}
-                                        onChange={(event) =>
-                                            setForgePresetNameInput(event.target.value)
-                                        }
-                                        placeholder="Preset name"
-                                    />
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={saveCurrentAsForgePreset}
-                                        type="button"
-                                    >
-                                        Save
-                                    </button>
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={() => {
-                                            if (!selectedForgePreset) {
-                                                setStatusMessage("Select a preset to load");
-                                                return;
-                                            }
-                                            applyForgePayloadPreset(selectedForgePreset);
-                                        }}
-                                        type="button"
-                                    >
-                                        Load
-                                    </button>
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={deleteForgePreset}
-                                        type="button"
-                                    >
-                                        Delete
-                                    </button>
+                                    {currentImage?.is_favorite ? "★ Favorited" : "☆ Favorite"}
+                                </button>
+                                <button
+                                    className={`viewer-toolbar-btn ${
+                                        currentImage?.is_locked ? "active" : ""
+                                    }`}
+                                    onClick={handleToggleLocked}
+                                    disabled={!currentImage || isDeletingCurrentImage}
+                                    title={
+                                        currentImage?.is_locked
+                                            ? "Unlock deletion protection"
+                                            : "Lock image against deletion"
+                                    }
+                                >
+                                    {currentImage?.is_locked ? "🔒 Locked" : "🔓 Lock"}
+                                </button>
+                            </div>
+
+                            {isDetailLoading && (
+                                <div className="photo-viewer-note photo-viewer-loading-note">
+                                    <span className="spinner" />
+                                    Loading metadata...
                                 </div>
-                                <div className="viewer-form-label">Models Folder</div>
-                                <div className="viewer-form-grid">
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeModelsPath}
-                                        onChange={(event) =>
-                                            onForgeModelsPathChange(event.target.value)
-                                        }
-                                        placeholder="Select Forge models folder"
-                                    />
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={handleSelectForgeModelsFolder}
-                                        type="button"
-                                    >
-                                        Browse
-                                    </button>
-                                </div>
-                                <label className="viewer-toggle-row">
-                                    <input
-                                        type="checkbox"
-                                        checked={forgeModelsScanSubfolders}
-                                        onChange={(event) =>
-                                            onForgeModelsScanSubfoldersChange(
-                                                event.target.checked
-                                            )
-                                        }
-                                    />
-                                    Scan model subfolders
-                                </label>
-                                <div className="viewer-form-label">LoRA Folder</div>
-                                <div className="viewer-form-grid">
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeLoraPath}
-                                        onChange={(event) =>
-                                            onForgeLoraPathChange(event.target.value)
-                                        }
-                                        placeholder="Select Forge LoRA folder"
-                                    />
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={handleSelectForgeLoraFolder}
-                                        type="button"
-                                    >
-                                        Browse
-                                    </button>
-                                </div>
-                                <label className="viewer-toggle-row">
-                                    <input
-                                        type="checkbox"
-                                        checked={forgeLoraScanSubfolders}
-                                        onChange={(event) =>
-                                            onForgeLoraScanSubfoldersChange(
-                                                event.target.checked
-                                            )
-                                        }
-                                    />
-                                    Scan LoRA subfolders
-                                </label>
-                                <div className="viewer-form-label">
-                                    LoRA Multi-Select
-                                </div>
-                                <div className="viewer-multiselect" ref={loraDropdownRef}>
-                                    <button
-                                        type="button"
-                                        className="viewer-control-button viewer-multiselect-trigger"
-                                        onClick={() =>
-                                            setIsLoraDropdownOpen((previous) => !previous)
-                                        }
-                                    >
-                                        {forgeSelectedLoras.length > 0
-                                            ? `${forgeSelectedLoras.length} selected`
-                                            : "Select LoRAs"}
-                                    </button>
-                                    {isLoraDropdownOpen && (
-                                        <div className="viewer-multiselect-menu">
+                            )}
+
+                            {infoPanelTab === "info" && (
+                                <>
+                                    {currentDetail?.prompt && (
+                                        <section className="photo-viewer-section">
+                                            <h4>Prompt</h4>
+                                            <p>{currentDetail.prompt}</p>
+                                        </section>
+                                    )}
+
+                                    {currentDetail?.negative_prompt && (
+                                        <section className="photo-viewer-section">
+                                            <h4>Negative Prompt</h4>
+                                            <p>{currentDetail.negative_prompt}</p>
+                                        </section>
+                                    )}
+
+                                    {currentParamEntries.length > 0 && (
+                                        <section className="photo-viewer-section">
+                                            <h4>Parameters</h4>
+                                            <div className="viewer-key-value-grid">
+                                                {currentParamEntries.map(([key, value]) => (
+                                                    <div key={key} className="viewer-key-value-row">
+                                                        <span>{key}</span>
+                                                        <strong>{value}</strong>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </section>
+                                    )}
+
+                                    <section className="photo-viewer-section">
+                                        <h4>File</h4>
+                                        <div className="viewer-key-value-grid">
+                                            <div className="viewer-key-value-row">
+                                                <span>Filename</span>
+                                                <strong>{currentImage.filename}</strong>
+                                            </div>
+                                            <div className="viewer-key-value-row">
+                                                <span>Directory</span>
+                                                <strong>{currentImage.directory}</strong>
+                                            </div>
+                                            <div className="viewer-key-value-row">
+                                                <span>Path</span>
+                                                <strong className="viewer-path">{currentImage.filepath}</strong>
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    <section className="photo-viewer-section">
+                                        <h4>Sidecar</h4>
+                                        <div className="viewer-tag-input-row">
                                             <input
                                                 className="viewer-input"
-                                                placeholder="Filter LoRAs..."
-                                                value={loraSearch}
-                                                onChange={(event) =>
-                                                    setLoraSearch(event.target.value)
-                                                }
+                                                value={tagInput}
+                                                placeholder="Add sidecar tag"
+                                                onChange={(event) => setTagInput(event.target.value)}
+                                                onKeyDown={(event) => {
+                                                    if (event.key === "Enter") {
+                                                        event.preventDefault();
+                                                        addSidecarTag(tagInput);
+                                                    }
+                                                }}
                                             />
-                                            <div className="viewer-multiselect-list">
-                                                {filteredLoraOptions.map((lora) => (
-                                                    <label
-                                                        key={lora}
-                                                        className="viewer-multiselect-option"
-                                                    >
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={forgeSelectedLoras.includes(
-                                                                lora
-                                                            )}
-                                                            onChange={() =>
-                                                                toggleLoraSelection(lora)
-                                                            }
-                                                        />
-                                                        <span>{lora}</span>
-                                                    </label>
-                                                ))}
-                                                {filteredLoraOptions.length === 0 && (
-                                                    <div className="photo-viewer-note">
-                                                        No LoRAs match filter
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                                {forgeSelectedLoras.length > 0 && (
-                                    <div className="viewer-tag-chip-list">
-                                        {forgeSelectedLoras.map((lora) => (
                                             <button
-                                                key={lora}
-                                                className="viewer-tag-chip"
-                                                onClick={() => removeSelectedLora(lora)}
-                                                title="Remove LoRA"
+                                                className="viewer-control-button"
+                                                onClick={() => addSidecarTag(tagInput)}
+                                            >
+                                                Add
+                                            </button>
+                                        </div>
+                                        <div className="viewer-tag-chip-list">
+                                            {sidecarTags.map((tag) => (
+                                                <button
+                                                    key={`sidecar-tag-${tag}`}
+                                                    className="viewer-tag-chip"
+                                                    onClick={() => removeSidecarTag(tag)}
+                                                    title="Remove tag"
+                                                >
+                                                    {tag}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <textarea
+                                            className="viewer-textarea"
+                                            value={sidecarNotes}
+                                            onChange={(event) => setSidecarNotes(event.target.value)}
+                                            placeholder="Notes..."
+                                            rows={4}
+                                        />
+                                        <button
+                                            className="viewer-action-button primary"
+                                            onClick={handleSaveSidecar}
+                                            disabled={isSavingSidecar}
+                                        >
+                                            {isSavingSidecar ? "Saving..." : "Save Sidecar"}
+                                        </button>
+                                    </section>
+
+                                    <section className="photo-viewer-section">
+                                        <h4>Export</h4>
+                                        <div className="viewer-form-grid">
+                                            <select
+                                                className="viewer-input"
+                                                value={singleImageExportFormat}
+                                                onChange={(event) =>
+                                                    setSingleImageExportFormat(
+                                                        event.target.value as ImageExportFormat
+                                                    )
+                                                }
+                                            >
+                                                {SINGLE_IMAGE_EXPORT_OPTIONS.map((option) => (
+                                                    <option key={option.value} value={option.value}>
+                                                        {option.label}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                className="viewer-action-button"
+                                                onClick={handleExportSingleImage}
+                                            >
+                                                Export ZIP
+                                            </button>
+                                        </div>
+                                        {showSingleImageExportQuality && (
+                                            <div className="export-quality-row">
+                                                <span className="export-quality-label">Quality</span>
+                                                <input
+                                                    type="range"
+                                                    className="export-quality-slider"
+                                                    min={10}
+                                                    max={100}
+                                                    step={5}
+                                                    value={singleImageExportQuality}
+                                                    onChange={(event) =>
+                                                        setSingleImageExportQuality(
+                                                            Number(event.target.value)
+                                                        )
+                                                    }
+                                                />
+                                                <span className="export-quality-value">
+                                                    {singleImageExportQuality}
+                                                </span>
+                                            </div>
+                                        )}
+                                        <div className="viewer-form-grid" style={{ marginTop: 4 }}>
+                                            <button
+                                                className="viewer-action-button"
+                                                onClick={() => handleExport("json")}
+                                            >
+                                                Export JSON
+                                            </button>
+                                            <button
+                                                className="viewer-action-button"
+                                                onClick={() => handleExport("csv")}
+                                            >
+                                                Export CSV
+                                            </button>
+                                        </div>
+                                    </section>
+                                </>
+                            )}
+
+                            {infoPanelTab === "forge" && (
+                                <>
+                                    <section className="photo-viewer-section">
+                                        <h4>Forge Payload</h4>
+                                        {!hasValidForgeUrl && (
+                                            <div className="input-error" role="alert">
+                                                {forgeUrlValidationError}
+                                            </div>
+                                        )}
+                                        {isLoadingForgeOptions && (
+                                            <div className="photo-viewer-note">Loading Forge options...</div>
+                                        )}
+                                        {forgeOptionsWarning && (
+                                            <div className="photo-viewer-note">{forgeOptionsWarning}</div>
+                                        )}
+                                        <div className="viewer-form-label">Preset Manager</div>
+                                        <select
+                                            className="viewer-input"
+                                            value={selectedForgePreset}
+                                            onChange={(event) =>
+                                                setSelectedForgePreset(event.target.value)
+                                            }
+                                        >
+                                            <option value="">Select preset</option>
+                                            {forgePresetNames.map((name) => (
+                                                <option key={name} value={name}>
+                                                    {name}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <div className="viewer-form-grid">
+                                            <input
+                                                className="viewer-input"
+                                                value={forgePresetNameInput}
+                                                onChange={(event) =>
+                                                    setForgePresetNameInput(event.target.value)
+                                                }
+                                                placeholder="Preset name"
+                                            />
+                                            <button
+                                                className="viewer-control-button"
+                                                onClick={saveCurrentAsForgePreset}
                                                 type="button"
                                             >
-                                                {lora}
+                                                Save
                                             </button>
-                                        ))}
-                                    </div>
-                                )}
-                                <div className="viewer-form-label">LoRA Weight</div>
-                                <div className="viewer-form-grid">
-                                    <input
-                                        className="viewer-input"
-                                        type="range"
-                                        min={0}
-                                        max={2}
-                                        step={0.05}
-                                        value={loraWeightSliderValue}
-                                        onChange={(event) =>
-                                            onForgeLoraWeightChange(
-                                                Number(event.target.value).toFixed(2)
-                                            )
-                                        }
-                                    />
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeLoraWeight}
-                                        onChange={(event) =>
-                                            onForgeLoraWeightChange(event.target.value)
-                                        }
-                                        placeholder="1.00"
-                                    />
-                                </div>
-                                <div className="viewer-form-label">Prompt</div>
-                                <textarea
-                                    className="viewer-textarea"
-                                    value={forgeOverrides.prompt}
-                                    onChange={(event) =>
-                                        updateForgeOverride("prompt", event.target.value)
-                                    }
-                                    placeholder="Prompt"
-                                    rows={4}
-                                />
-                                <div className="viewer-form-label">Negative Prompt</div>
-                                <textarea
-                                    className="viewer-textarea"
-                                    value={forgeOverrides.negative_prompt}
-                                    onChange={(event) =>
-                                        updateForgeOverride(
-                                            "negative_prompt",
-                                            event.target.value
-                                        )
-                                    }
-                                    placeholder="Negative prompt"
-                                    rows={3}
-                                />
-                                <label className="viewer-toggle-row">
-                                    <input
-                                        type="checkbox"
-                                        checked={sendSeedForCurrentRequest}
-                                        onChange={(event) =>
-                                            setSendSeedForCurrentRequest(event.target.checked)
-                                        }
-                                    />
-                                    Send seed with request
-                                </label>
-                                <label className="viewer-toggle-row">
-                                    <input
-                                        type="checkbox"
-                                        checked={useAdetailerForCurrentRequest}
-                                        onChange={(event) =>
-                                            setUseAdetailerForCurrentRequest(
-                                                event.target.checked
-                                            )
-                                        }
-                                    />
-                                    Enable ADetailer face fix
-                                </label>
-                                <select
-                                    className="viewer-input"
-                                    value={adetailerFaceModelForCurrentRequest}
-                                    onChange={(event) =>
-                                        setAdetailerFaceModelForCurrentRequest(
-                                            event.target.value
-                                        )
-                                    }
-                                    disabled={!useAdetailerForCurrentRequest}
-                                >
-                                    {adetailerModelDropdownOptions.map((model) => (
-                                        <option key={model} value={model}>
-                                            {model}
-                                        </option>
-                                    ))}
-                                </select>
-                                <div className="viewer-form-label">Resolution Preset Family</div>
-                                <select
-                                    className="viewer-input"
-                                    value={selectedResolutionFamily}
-                                    onChange={(event) =>
-                                        setSelectedResolutionFamily(
-                                            event.target.value as ResolutionPresetFamily
-                                        )
-                                    }
-                                >
-                                    <option value="pony_sdxl">PonyXL / SDXL</option>
-                                    <option value="flux">Flux</option>
-                                    <option value="zimage_turbo">Z-Image Turbo</option>
-                                </select>
-                                <div className="sidebar-help">
-                                    Detected family: {detectedModelFamily} | functionality:{" "}
-                                    {detectedFunctionality}
-                                </div>
-                                <div className="viewer-form-label">Resolution Presets</div>
-                                <select
-                                    className="viewer-input"
-                                    value={selectedResolutionPreset}
-                                    onChange={(event) =>
-                                        handleResolutionPresetChange(event.target.value)
-                                    }
-                                >
-                                    <option value="custom">Custom</option>
-                                    {RESOLUTION_PRESETS[selectedResolutionFamily].map((option) => (
-                                        <option
-                                            key={`${option.width}x${option.height}`}
-                                            value={`${option.width}x${option.height}`}
-                                        >
-                                            {option.label}
-                                        </option>
-                                    ))}
-                                </select>
-                                <div className="viewer-form-grid">
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeOverrides.steps}
-                                        onChange={(event) =>
-                                            updateForgeOverride("steps", event.target.value)
-                                        }
-                                        placeholder="Steps"
-                                    />
-                                    <select
-                                        className="viewer-input"
-                                        value={forgeOverrides.sampler_name}
-                                        onChange={(event) =>
-                                            updateForgeOverride(
-                                                "sampler_name",
-                                                event.target.value
-                                            )
-                                        }
-                                    >
-                                        <option value="">Sampler (auto/default)</option>
-                                        {samplerDropdownOptions.map((sampler) => (
-                                            <option key={sampler} value={sampler}>
-                                                {sampler}
-                                            </option>
-                                        ))}
-                                    </select>
-                                    <select
-                                        className="viewer-input"
-                                        value={forgeOverrides.scheduler}
-                                        onChange={(event) =>
-                                            updateForgeOverride("scheduler", event.target.value)
-                                        }
-                                    >
-                                        <option value="">Scheduler (auto/default)</option>
-                                        {schedulerDropdownOptions.map((scheduler) => (
-                                            <option key={scheduler} value={scheduler}>
-                                                {scheduler}
-                                            </option>
-                                        ))}
-                                    </select>
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeOverrides.cfg_scale}
-                                        onChange={(event) =>
-                                            updateForgeOverride("cfg_scale", event.target.value)
-                                        }
-                                        placeholder="CFG Scale"
-                                    />
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeOverrides.seed}
-                                        onChange={(event) =>
-                                            updateForgeOverride("seed", event.target.value)
-                                        }
-                                        placeholder="Seed"
-                                        disabled={!sendSeedForCurrentRequest}
-                                    />
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeOverrides.width}
-                                        onChange={(event) =>
-                                            updateForgeOverride("width", event.target.value)
-                                        }
-                                        placeholder="Width"
-                                    />
-                                    <input
-                                        className="viewer-input"
-                                        value={forgeOverrides.height}
-                                        onChange={(event) =>
-                                            updateForgeOverride("height", event.target.value)
-                                        }
-                                        placeholder="Height"
-                                    />
-                                </div>
-                                <select
-                                    className="viewer-input"
-                                    value={
-                                        familyCompatibleModelOptions.includes(
-                                            forgeOverrides.model_name
-                                        )
-                                            ? forgeOverrides.model_name
-                                            : ""
-                                    }
-                                    onChange={(event) =>
-                                        updateForgeOverride("model_name", event.target.value)
-                                    }
-                                >
-                                    <option value="">Model checkpoint (none/default)</option>
-                                    {familyCompatibleModelOptions.map((model) => (
-                                        <option key={model} value={model}>
-                                            {model}
-                                        </option>
-                                    ))}
-                                </select>
-                                {forgeOverrides.model_name &&
-                                    !familyCompatibleModelOptions.includes(
-                                        forgeOverrides.model_name
-                                    ) && (
-                                        <div className="photo-viewer-note">
-                                            Current image model is not in detected checkpoint scan.
+                                            <button
+                                                className="viewer-control-button"
+                                                onClick={() => {
+                                                    if (!selectedForgePreset) {
+                                                        showViewerToast(
+                                                            "Select a preset to load.",
+                                                            "warning"
+                                                        );
+                                                        return;
+                                                    }
+                                                    applyForgePayloadPreset(selectedForgePreset);
+                                                }}
+                                                type="button"
+                                            >
+                                                Load
+                                            </button>
+                                            <button
+                                                className="viewer-control-button"
+                                                onClick={deleteForgePreset}
+                                                type="button"
+                                            >
+                                                Delete
+                                            </button>
                                         </div>
-                                    )}
-                            </section>
-
-                            <section className="photo-viewer-section">
-                                <h4>Sidecar</h4>
-                                <div className="viewer-tag-input-row">
-                                    <input
-                                        className="viewer-input"
-                                        value={tagInput}
-                                        placeholder="Add sidecar tag"
-                                        onChange={(event) => setTagInput(event.target.value)}
-                                        onKeyDown={(event) => {
-                                            if (event.key === "Enter") {
-                                                event.preventDefault();
-                                                addSidecarTag(tagInput);
-                                            }
-                                        }}
-                                    />
-                                    <button
-                                        className="viewer-control-button"
-                                        onClick={() => addSidecarTag(tagInput)}
-                                    >
-                                        Add
-                                    </button>
-                                </div>
-                                <div className="viewer-tag-chip-list">
-                                    {sidecarTags.map((tag) => (
-                                        <button
-                                            key={`sidecar-tag-${tag}`}
-                                            className="viewer-tag-chip"
-                                            onClick={() => removeSidecarTag(tag)}
-                                            title="Remove tag"
-                                        >
-                                            {tag}
-                                        </button>
-                                    ))}
-                                </div>
-                                <textarea
-                                    className="viewer-textarea"
-                                    value={sidecarNotes}
-                                    onChange={(event) => setSidecarNotes(event.target.value)}
-                                    placeholder="Notes..."
-                                    rows={4}
-                                />
-                                <button
-                                    className="viewer-action-button primary"
-                                    onClick={handleSaveSidecar}
-                                    disabled={isSavingSidecar}
-                                >
-                                    {isSavingSidecar ? "Saving..." : "Save Sidecar"}
-                                </button>
-                            </section>
-
-                            {currentDetail?.prompt && (
-                                <section className="photo-viewer-section">
-                                    <h4>Prompt</h4>
-                                    <p>{currentDetail.prompt}</p>
-                                </section>
-                            )}
-
-                            {currentDetail?.negative_prompt && (
-                                <section className="photo-viewer-section">
-                                    <h4>Negative Prompt</h4>
-                                    <p>{currentDetail.negative_prompt}</p>
-                                </section>
-                            )}
-
-                            {currentParamEntries.length > 0 && (
-                                <section className="photo-viewer-section">
-                                    <h4>Parameters</h4>
-                                    <div className="viewer-key-value-grid">
-                                        {currentParamEntries.map(([key, value]) => (
-                                            <div key={key} className="viewer-key-value-row">
-                                                <span>{key}</span>
-                                                <strong>{value}</strong>
+                                        <div className="viewer-form-label">Models Folder</div>
+                                        <div className="viewer-form-grid">
+                                            <input
+                                                className="viewer-input"
+                                                value={forgeModelsPath}
+                                                onChange={(event) =>
+                                                    onForgeModelsPathChange(event.target.value)
+                                                }
+                                                placeholder="Select Forge models folder"
+                                            />
+                                            <button
+                                                className="viewer-control-button"
+                                                onClick={handleSelectForgeModelsFolder}
+                                                type="button"
+                                            >
+                                                Browse
+                                            </button>
+                                        </div>
+                                        <label className="viewer-toggle-row">
+                                            <input
+                                                type="checkbox"
+                                                checked={forgeModelsScanSubfolders}
+                                                onChange={(event) =>
+                                                    onForgeModelsScanSubfoldersChange(
+                                                        event.target.checked
+                                                    )
+                                                }
+                                            />
+                                            Scan model subfolders
+                                        </label>
+                                        <div className="viewer-form-label">LoRA Folder</div>
+                                        <div className="viewer-form-grid">
+                                            <input
+                                                className="viewer-input"
+                                                value={forgeLoraPath}
+                                                onChange={(event) =>
+                                                    onForgeLoraPathChange(event.target.value)
+                                                }
+                                                placeholder="Select Forge LoRA folder"
+                                            />
+                                            <button
+                                                className="viewer-control-button"
+                                                onClick={handleSelectForgeLoraFolder}
+                                                type="button"
+                                            >
+                                                Browse
+                                            </button>
+                                        </div>
+                                        <label className="viewer-toggle-row">
+                                            <input
+                                                type="checkbox"
+                                                checked={forgeLoraScanSubfolders}
+                                                onChange={(event) =>
+                                                    onForgeLoraScanSubfoldersChange(
+                                                        event.target.checked
+                                                    )
+                                                }
+                                            />
+                                            Scan LoRA subfolders
+                                        </label>
+                                        <div className="viewer-form-label">
+                                            LoRA Multi-Select
+                                        </div>
+                                        <div className="viewer-multiselect" ref={loraDropdownRef}>
+                                            <button
+                                                type="button"
+                                                className="viewer-control-button viewer-multiselect-trigger"
+                                                onClick={() =>
+                                                    setIsLoraDropdownOpen((previous) => !previous)
+                                                }
+                                            >
+                                                {forgeSelectedLoras.length > 0
+                                                    ? `${forgeSelectedLoras.length} selected`
+                                                    : "Select LoRAs"}
+                                            </button>
+                                            {isLoraDropdownOpen && (
+                                                <div className="viewer-multiselect-menu">
+                                                    <input
+                                                        className="viewer-input"
+                                                        placeholder="Filter LoRAs..."
+                                                        value={loraSearch}
+                                                        onChange={(event) =>
+                                                            setLoraSearch(event.target.value)
+                                                        }
+                                                    />
+                                                    <div className="viewer-multiselect-list">
+                                                        {filteredLoraOptions.map((lora) => (
+                                                            <label
+                                                                key={lora}
+                                                                className="viewer-multiselect-option"
+                                                            >
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={forgeSelectedLoras.includes(
+                                                                        lora
+                                                                    )}
+                                                                    onChange={() =>
+                                                                        toggleLoraSelection(lora)
+                                                                    }
+                                                                />
+                                                                <span>{lora}</span>
+                                                            </label>
+                                                        ))}
+                                                        {filteredLoraOptions.length === 0 && (
+                                                            <div className="photo-viewer-note">
+                                                                No LoRAs match filter
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {forgeSelectedLoras.length > 0 && (
+                                            <div className="viewer-tag-chip-list">
+                                                {forgeSelectedLoras.map((lora) => (
+                                                    <button
+                                                        key={lora}
+                                                        className="viewer-tag-chip"
+                                                        onClick={() => removeSelectedLora(lora)}
+                                                        title="Remove LoRA"
+                                                        type="button"
+                                                    >
+                                                        {lora}
+                                                    </button>
+                                                ))}
                                             </div>
-                                        ))}
-                                    </div>
-                                </section>
+                                        )}
+                                        <div className="viewer-form-label">LoRA Weight</div>
+                                        <div className="viewer-form-grid">
+                                            <input
+                                                className="viewer-input"
+                                                type="range"
+                                                min={0}
+                                                max={2}
+                                                step={0.05}
+                                                value={loraWeightSliderValue}
+                                                onChange={(event) =>
+                                                    onForgeLoraWeightChange(
+                                                        Number(event.target.value).toFixed(2)
+                                                    )
+                                                }
+                                            />
+                                            <input
+                                                className={`viewer-input ${
+                                                    loraWeightValidationError ? "input-invalid" : ""
+                                                }`}
+                                                value={forgeLoraWeight}
+                                                onChange={(event) =>
+                                                    onForgeLoraWeightChange(event.target.value)
+                                                }
+                                                placeholder="1.00"
+                                                aria-invalid={loraWeightValidationError != null}
+                                            />
+                                        </div>
+                                        {loraWeightValidationError && (
+                                            <div className="input-error" role="alert">
+                                                {loraWeightValidationError}
+                                            </div>
+                                        )}
+                                        <div className="viewer-form-label">Prompt</div>
+                                        <textarea
+                                            className="viewer-textarea"
+                                            value={forgeOverrides.prompt}
+                                            onChange={(event) =>
+                                                updateForgeOverride("prompt", event.target.value)
+                                            }
+                                            placeholder="Prompt"
+                                            rows={4}
+                                        />
+                                        <div className="viewer-form-label">Negative Prompt</div>
+                                        <textarea
+                                            className="viewer-textarea"
+                                            value={forgeOverrides.negative_prompt}
+                                            onChange={(event) =>
+                                                updateForgeOverride(
+                                                    "negative_prompt",
+                                                    event.target.value
+                                                )
+                                            }
+                                            placeholder="Negative prompt"
+                                            rows={3}
+                                        />
+                                        <label className="viewer-toggle-row">
+                                            <input
+                                                type="checkbox"
+                                                checked={sendSeedForCurrentRequest}
+                                                onChange={(event) =>
+                                                    setSendSeedForCurrentRequest(event.target.checked)
+                                                }
+                                            />
+                                            Send seed with request
+                                        </label>
+                                        <label className="viewer-toggle-row">
+                                            <input
+                                                type="checkbox"
+                                                checked={useAdetailerForCurrentRequest}
+                                                onChange={(event) =>
+                                                    setUseAdetailerForCurrentRequest(
+                                                        event.target.checked
+                                                    )
+                                                }
+                                            />
+                                            Enable ADetailer face fix
+                                        </label>
+                                        <select
+                                            className="viewer-input"
+                                            value={adetailerFaceModelForCurrentRequest}
+                                            onChange={(event) =>
+                                                setAdetailerFaceModelForCurrentRequest(
+                                                    event.target.value
+                                                )
+                                            }
+                                            disabled={!useAdetailerForCurrentRequest}
+                                        >
+                                            {adetailerModelDropdownOptions.map((model) => (
+                                                <option key={model} value={model}>
+                                                    {model}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <div className="viewer-form-label">Resolution Preset Family</div>
+                                        <select
+                                            className="viewer-input"
+                                            value={selectedResolutionFamily}
+                                            onChange={(event) =>
+                                                setSelectedResolutionFamily(
+                                                    event.target.value as ResolutionPresetFamily
+                                                )
+                                            }
+                                        >
+                                            <option value="pony_sdxl">PonyXL / SDXL</option>
+                                            <option value="flux">Flux</option>
+                                            <option value="zimage_turbo">Z-Image Turbo</option>
+                                        </select>
+                                        <div className="sidebar-help">
+                                            Detected family: {detectedModelFamily} | functionality:{" "}
+                                            {detectedFunctionality}
+                                        </div>
+                                        <div className="viewer-form-label">Resolution Presets</div>
+                                        <select
+                                            className="viewer-input"
+                                            value={selectedResolutionPreset}
+                                            onChange={(event) =>
+                                                handleResolutionPresetChange(event.target.value)
+                                            }
+                                        >
+                                            <option value="custom">Custom</option>
+                                            {RESOLUTION_PRESETS[selectedResolutionFamily].map((option) => (
+                                                <option
+                                                    key={`${option.width}x${option.height}`}
+                                                    value={`${option.width}x${option.height}`}
+                                                >
+                                                    {option.label}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <div className="viewer-form-grid">
+                                            <input
+                                                className={`viewer-input ${
+                                                    stepsValidationError ? "input-invalid" : ""
+                                                }`}
+                                                value={forgeOverrides.steps}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("steps", event.target.value)
+                                                }
+                                                placeholder="Steps"
+                                                aria-invalid={stepsValidationError != null}
+                                            />
+                                            <select
+                                                className="viewer-input"
+                                                value={forgeOverrides.sampler_name}
+                                                onChange={(event) =>
+                                                    updateForgeOverride(
+                                                        "sampler_name",
+                                                        event.target.value
+                                                    )
+                                                }
+                                            >
+                                                <option value="">Sampler (auto/default)</option>
+                                                {samplerDropdownOptions.map((sampler) => (
+                                                    <option key={sampler} value={sampler}>
+                                                        {sampler}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <select
+                                                className="viewer-input"
+                                                value={forgeOverrides.scheduler}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("scheduler", event.target.value)
+                                                }
+                                            >
+                                                <option value="">Scheduler (auto/default)</option>
+                                                {schedulerDropdownOptions.map((scheduler) => (
+                                                    <option key={scheduler} value={scheduler}>
+                                                        {scheduler}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <input
+                                                className={`viewer-input ${
+                                                    cfgScaleValidationError ? "input-invalid" : ""
+                                                }`}
+                                                value={forgeOverrides.cfg_scale}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("cfg_scale", event.target.value)
+                                                }
+                                                placeholder="CFG Scale"
+                                                aria-invalid={cfgScaleValidationError != null}
+                                            />
+                                            <input
+                                                className="viewer-input"
+                                                value={forgeOverrides.seed}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("seed", event.target.value)
+                                                }
+                                                placeholder="Seed"
+                                                disabled={!sendSeedForCurrentRequest}
+                                            />
+                                            <input
+                                                className="viewer-input"
+                                                value={forgeOverrides.width}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("width", event.target.value)
+                                                }
+                                                placeholder="Width"
+                                            />
+                                            <input
+                                                className="viewer-input"
+                                                value={forgeOverrides.height}
+                                                onChange={(event) =>
+                                                    updateForgeOverride("height", event.target.value)
+                                                }
+                                                placeholder="Height"
+                                            />
+                                        </div>
+                                        {(stepsValidationError || cfgScaleValidationError) && (
+                                            <div className="input-error" role="alert">
+                                                {stepsValidationError ?? cfgScaleValidationError}
+                                            </div>
+                                        )}
+                                        <select
+                                            className="viewer-input"
+                                            value={
+                                                familyCompatibleModelOptions.includes(
+                                                    forgeOverrides.model_name
+                                                )
+                                                    ? forgeOverrides.model_name
+                                                    : ""
+                                            }
+                                            onChange={(event) =>
+                                                updateForgeOverride("model_name", event.target.value)
+                                            }
+                                        >
+                                            <option value="">Model checkpoint (none/default)</option>
+                                            {familyCompatibleModelOptions.map((model) => (
+                                                <option key={model} value={model}>
+                                                    {model}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        {forgeOverrides.model_name &&
+                                            !familyCompatibleModelOptions.includes(
+                                                forgeOverrides.model_name
+                                            ) && (
+                                                <div className="photo-viewer-note">
+                                                    Current image model is not in detected checkpoint scan.
+                                                </div>
+                                            )}
+                                        <button
+                                            className="viewer-action-button primary"
+                                            onClick={handleSendToForge}
+                                            disabled={
+                                                isSendingToForge ||
+                                                !hasValidForgeUrl ||
+                                                hasForgeValidationErrors ||
+                                                isDetailLoading ||
+                                                !currentDetail
+                                            }
+                                            style={{ marginTop: 6 }}
+                                        >
+                                            {isSendingToForge ? "Sending..." : "Send to Forge"}
+                                        </button>
+                                    </section>
+                                </>
                             )}
-
-                            <section className="photo-viewer-section">
-                                <h4>File</h4>
-                                <div className="viewer-key-value-grid">
-                                    <div className="viewer-key-value-row">
-                                        <span>Filename</span>
-                                        <strong>{currentImage.filename}</strong>
-                                    </div>
-                                    <div className="viewer-key-value-row">
-                                        <span>Directory</span>
-                                        <strong>{currentImage.directory}</strong>
-                                    </div>
-                                    <div className="viewer-key-value-row">
-                                        <span>Path</span>
-                                        <strong className="viewer-path">{currentImage.filepath}</strong>
-                                    </div>
-                                </div>
-                            </section>
                         </div>
                     </aside>
                 </div>

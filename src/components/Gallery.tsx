@@ -1,4 +1,5 @@
 import {
+    memo,
     useState,
     useRef,
     useCallback,
@@ -16,6 +17,7 @@ import {
     copyCompressedImageForDiscord,
     formatBytes,
 } from "../utils/imageClipboard";
+import type { ShowToastOptions } from "../hooks/useToast";
 
 interface GalleryProps {
     images: GalleryImageRecord[];
@@ -25,11 +27,18 @@ interface GalleryProps {
     onToggleSelected: (imageId: number) => void;
     onSelectAll: () => void;
     onClearSelection: () => void;
+    onDeleteSelected: () => void;
+    isDeletingSelected: boolean;
     onLoadMore: () => void;
     hasMore: boolean;
     isFetchingNextPage: boolean;
     columnCount: number;
     storageProfile: StorageProfile;
+    onShowToast: (message: string, options?: ShowToastOptions) => void;
+    emptyState: {
+        title: string;
+        message: string;
+    };
 }
 
 function profileThumbnailSettings(storageProfile: StorageProfile) {
@@ -70,6 +79,22 @@ function upsertThumbnailCache(
     }
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) {
+        return false;
+    }
+    const tagName = target.tagName.toLowerCase();
+    return (
+        tagName === "input" ||
+        tagName === "textarea" ||
+        target.isContentEditable
+    );
+}
+
+function toAssetSrc(filepath: string): string {
+    return convertFileSrc(filepath.replace(/\\/g, "/"));
+}
+
 export function Gallery({
     images,
     onSelect,
@@ -78,25 +103,27 @@ export function Gallery({
     onToggleSelected,
     onSelectAll,
     onClearSelection,
+    onDeleteSelected,
+    isDeletingSelected,
     onLoadMore,
     hasMore,
     isFetchingNextPage,
     columnCount,
     storageProfile,
+    onShowToast,
+    emptyState,
 }: GalleryProps) {
     const parentRef = useRef<HTMLDivElement>(null);
     const thumbnailCacheRef = useRef<Map<string, string>>(new Map());
     const thumbnailInFlightRef = useRef<Set<string>>(new Set());
     const scrollRafRef = useRef<number | null>(null);
     const thumbFlushRafRef = useRef<number | null>(null);
-    const contextToastTimeoutRef = useRef<number | null>(null);
     const [, setThumbnailVersion] = useState(0);
     const [contextMenu, setContextMenu] = useState<{
         x: number;
         y: number;
         image: GalleryImageRecord;
     } | null>(null);
-    const [contextToast, setContextToast] = useState<string | null>(null);
     const thumbnailSettings = useMemo(
         () => profileThumbnailSettings(storageProfile),
         [storageProfile]
@@ -163,6 +190,10 @@ export function Gallery({
 
     useEffect(() => {
         const handleKey = (event: KeyboardEvent) => {
+            if (isTypingTarget(event.target)) {
+                return;
+            }
+
             if ((event.ctrlKey || event.metaKey) && event.key === "a") {
                 event.preventDefault();
                 onSelectAll();
@@ -172,21 +203,29 @@ export function Gallery({
             if (event.key === "Escape" && selectedIds.size > 0) {
                 event.preventDefault();
                 onClearSelection();
+                return;
+            }
+
+            if (
+                (event.key === "Delete" || event.key === "Backspace") &&
+                selectedIds.size > 0
+            ) {
+                event.preventDefault();
+                if (!isDeletingSelected) {
+                    onDeleteSelected();
+                }
             }
         };
 
         window.addEventListener("keydown", handleKey);
         return () => window.removeEventListener("keydown", handleKey);
-    }, [onSelectAll, onClearSelection, selectedIds.size]);
-
-    useEffect(() => {
-        return () => {
-            if (contextToastTimeoutRef.current != null) {
-                window.clearTimeout(contextToastTimeoutRef.current);
-                contextToastTimeoutRef.current = null;
-            }
-        };
-    }, []);
+    }, [
+        onClearSelection,
+        onDeleteSelected,
+        onSelectAll,
+        isDeletingSelected,
+        selectedIds,
+    ]);
 
     const thumbnailTargets = useMemo(() => {
         if (images.length === 0 || rowCount === 0 || virtualItems.length === 0) {
@@ -302,7 +341,17 @@ export function Gallery({
         };
 
         const workers = Array.from({ length: workerCount }, () => resolveChunk());
-        Promise.allSettled(workers).catch(() => {});
+        void Promise.allSettled(workers).then((results) => {
+            if (cancelled) {
+                return;
+            }
+            const rejected = results.filter((result) => result.status === "rejected");
+            if (rejected.length > 0) {
+                console.warn(
+                    `Thumbnail batch workers reported ${rejected.length} rejection(s).`
+                );
+            }
+        });
 
         return () => {
             cancelled = true;
@@ -313,17 +362,6 @@ export function Gallery({
         thumbnailSettings.concurrency,
         thumbnailTargets,
     ]);
-
-    const pushContextToast = useCallback((message: string) => {
-        setContextToast(message);
-        if (contextToastTimeoutRef.current != null) {
-            window.clearTimeout(contextToastTimeoutRef.current);
-        }
-        contextToastTimeoutRef.current = window.setTimeout(() => {
-            setContextToast(null);
-            contextToastTimeoutRef.current = null;
-        }, 2600);
-    }, []);
 
     const openContextMenu = useCallback(
         (event: ReactMouseEvent<HTMLDivElement>, image: GalleryImageRecord) => {
@@ -346,15 +384,16 @@ export function Gallery({
         try {
             const result = await copyCompressedImageForDiscord(target.filepath);
             const mimeLabel = result.mime.replace("image/", "").toUpperCase();
-            pushContextToast(
+            onShowToast(
                 `Copied ${mimeLabel} ${target.filename} (${result.width}x${result.height}, ${formatBytes(
                     result.bytes
-                )})`
+                )})`,
+                { tone: "success" }
             );
         } catch (error) {
-            pushContextToast(`Copy failed: ${String(error)}`);
+            onShowToast(`Copy failed: ${String(error)}`, { tone: "error" });
         }
-    }, [contextMenu, pushContextToast]);
+    }, [contextMenu, onShowToast]);
 
     const handleContextCopyJpeg = useCallback(async () => {
         if (!contextMenu) {
@@ -365,15 +404,16 @@ export function Gallery({
         try {
             const result = await copyJpegImageToClipboard(target.filepath);
             const mimeLabel = result.mime.replace("image/", "").toUpperCase();
-            pushContextToast(
+            onShowToast(
                 `Copied ${mimeLabel} ${target.filename} (${result.width}x${result.height}, ${formatBytes(
                     result.bytes
-                )})`
+                )})`,
+                { tone: "success" }
             );
         } catch (error) {
-            pushContextToast(`JPEG copy failed: ${String(error)}`);
+            onShowToast(`JPEG copy failed: ${String(error)}`, { tone: "error" });
         }
-    }, [contextMenu, pushContextToast]);
+    }, [contextMenu, onShowToast]);
 
     useEffect(() => {
         if (!contextMenu) {
@@ -425,14 +465,21 @@ export function Gallery({
                         <path d="M3 7v10c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V9c0-1.1-.9-2-2-2h-6l-2-2H5c-1.1 0-2 .9-2 2z" />
                     </svg>
                 </div>
-                <h3>No images loaded</h3>
-                <p>Select a folder to scan for AI-generated images</p>
+                <h3>{emptyState.title}</h3>
+                <p>{emptyState.message}</p>
             </div>
         );
     }
 
     return (
-        <div ref={parentRef} className="gallery-container">
+        <div
+            ref={parentRef}
+            className="gallery-container"
+            role="grid"
+            aria-label="Image gallery"
+            aria-rowcount={rowCount}
+            aria-colcount={columnCount}
+        >
             <div
                 style={{
                     height: `${virtualizer.getTotalSize()}px`,
@@ -449,6 +496,7 @@ export function Gallery({
                         <div
                             key={virtualRow.key}
                             className="gallery-row"
+                            role="row"
                             style={{
                                 position: "absolute",
                                 top: 0,
@@ -492,7 +540,7 @@ export function Gallery({
                                                 onToggleSelected(image.id)
                                             }
                                             isSelected={image.id === selectedId}
-                                            onClick={() => onSelect(image)}
+                                            onOpen={() => onSelect(image)}
                                             onContextMenu={(event) =>
                                                 openContextMenu(event, image)
                                             }
@@ -529,38 +577,54 @@ export function Gallery({
                     </button>
                 </div>
             )}
-            {contextToast && <div className="image-context-toast">{contextToast}</div>}
         </div>
     );
 }
 
-function GalleryItem({
-    image,
-    thumbnailPath,
-    isChecked,
-    onToggleChecked,
-    isSelected,
-    onClick,
-    onContextMenu,
-}: {
+interface GalleryItemProps {
     image: GalleryImageRecord;
     thumbnailPath: string | null;
     isChecked: boolean;
     onToggleChecked: () => void;
     isSelected: boolean;
-    onClick: () => void;
+    onOpen: () => void;
     onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
-}) {
+}
+
+const GalleryItem = memo(function GalleryItem({
+    image,
+    thumbnailPath,
+    isChecked,
+    onToggleChecked,
+    isSelected,
+    onOpen,
+    onContextMenu,
+}: GalleryItemProps) {
     const [loaded, setLoaded] = useState(false);
-    const imgSrc = thumbnailPath ? convertFileSrc(thumbnailPath) : null;
+    const imgSrc = thumbnailPath ? toAssetSrc(thumbnailPath) : null;
+    const thumbnailLoading = !imgSrc || !loaded;
 
     return (
         <div
             className={`gallery-item ${isSelected ? "selected" : ""} ${
                 isChecked ? "checked" : ""
             }`}
-            onClick={onClick}
+            onClick={onOpen}
             onContextMenu={onContextMenu}
+            role="gridcell"
+            aria-selected={isSelected}
+            tabIndex={0}
+            onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                    event.preventDefault();
+                    onOpen();
+                    return;
+                }
+                if (event.key === " ") {
+                    event.preventDefault();
+                    onToggleChecked();
+                }
+            }}
         >
             <label
                 className="gallery-item-checkbox"
@@ -573,8 +637,28 @@ function GalleryItem({
                     aria-label={`Select ${image.filename}`}
                 />
             </label>
+            {(image.is_favorite || image.is_locked) && (
+                <div className="gallery-item-badges" aria-hidden="true">
+                    {image.is_favorite && (
+                        <span className="gallery-item-badge favorite" title="Favorite">
+                            ★
+                        </span>
+                    )}
+                    {image.is_locked && (
+                        <span className="gallery-item-badge locked" title="Locked">
+                            🔒
+                        </span>
+                    )}
+                </div>
+            )}
             <div className="gallery-item-image-wrapper">
-                {!loaded && imgSrc && <div className="gallery-item-skeleton" />}
+                {thumbnailLoading && <div className="gallery-item-skeleton" />}
+                {thumbnailLoading && (
+                    <div className="gallery-thumb-loading-indicator" aria-hidden="true">
+                        <span className="spinner small" />
+                        <span className="gallery-thumb-loading-text">Loading thumbnail…</span>
+                    </div>
+                )}
                 {!imgSrc && (
                     <div
                         style={{
@@ -611,4 +695,4 @@ function GalleryItem({
             </div>
         </div>
     );
-}
+});

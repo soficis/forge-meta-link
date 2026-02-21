@@ -39,6 +39,8 @@ personal/
 scratch/
 datasets/
 2025-09-21/
+SteveJobs.md
+*.local.md
 
 # Logs and temp files
 logs/
@@ -79,3 +81,8 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 Desktop.ini
+codex_agents.md
+codex_roadmap.md
+docs/performance-and-scale.md
+docs/release-checklist.md
+docs/smoke-tests.md

@@ -156,6 +156,13 @@ Gallery:
 - Virtualized infinite scroll for large libraries
 - Grid density slider (`3` to `14` columns)
 - Multi-select checkboxes
+- Bulk move selected images to another folder (organize without deleting)
+- Bulk favorite/unfavorite and lock/unlock actions for selected images
+- Delete safety flow:
+  - Move to Recycle Bin/Trash mode or permanent delete mode
+  - Undo delete grace window
+  - Lock/Favorite protection against accidental deletion
+- Sidebar `Gallery Safety` panel with auto-lock favorites toggle and recently deleted activity
 - Right-click context menu (gallery and viewer):
   - `Compress + Copy for Discord`
   - `Copy JPEG to Clipboard`
@@ -278,6 +285,7 @@ Output behavior:
 
 - `Ctrl+A` / `Cmd+A`: Select all loaded images
 - `Esc`: Clear current selection
+- `Delete` / `Backspace`: Remove one selected image from multi-selection
 
 ### Viewer
 
@@ -354,7 +362,10 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/forge-meta-link
 
 - `npm run dev` - Vite frontend dev server
 - `npm run build` - TypeScript + Vite production build
+- `npm run fmt:check` - Rust formatting check (`cargo fmt --check`)
 - `npm run lint` - ESLint
+- `npm run test:rust` - Rust test suite (`cargo test`)
+- `npm run clippy` - Rust lint gate (`cargo clippy -D warnings`)
 - `npm run tauri -- dev` - Run desktop app in development
 - `npm run tauri -- build` - Build all desktop binaries/installers
 - `npm run build:wizard` - Launch interactive resumable cross-platform build wizard
@@ -362,6 +373,12 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/forge-meta-link
 - `./scripts/build-wizard.sh --targets=linux-arm64-deb --yes` - One-shot Linux ARM64 `.deb` wizard build (local only, untested)
 - `npm run tauri -- build --bundles deb,appimage` - Build Linux `.deb` + `.AppImage`
 - `npm run tauri -- build --bundles msi,nsis` - Build Windows `.msi` + setup `.exe` (run in Windows shell)
+
+## Release Docs
+
+- `docs/performance-and-scale.md` - Phase 9 instrumentation, query-plan notes, benchmark snapshot
+- `docs/smoke-tests.md` - manual package verification checklist
+- `docs/release-checklist.md` - repeatable release process
 
 ## Project Layout
 

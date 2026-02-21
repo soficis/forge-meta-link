@@ -36,8 +36,8 @@ fn db_pool_size(profile: StorageProfile) -> u32 {
         .map(|count| count.get() as u32)
         .unwrap_or(4);
     match profile {
-        StorageProfile::Hdd => cpu_count.min(HDD_FRIENDLY_DB_POOL_SIZE).max(2),
-        StorageProfile::Ssd => cpu_count.min(SSD_FRIENDLY_DB_POOL_SIZE).max(4),
+        StorageProfile::Hdd => cpu_count.clamp(2, HDD_FRIENDLY_DB_POOL_SIZE),
+        StorageProfile::Ssd => cpu_count.clamp(4, SSD_FRIENDLY_DB_POOL_SIZE),
     }
 }
 
@@ -67,6 +67,8 @@ pub struct GalleryImageRecord {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub model_name: Option<String>,
+    pub is_favorite: bool,
+    pub is_locked: bool,
 }
 
 /// Full row used by detail/export workflows.
@@ -87,6 +89,8 @@ pub struct ImageRecord {
     pub model_hash: Option<String>,
     pub model_name: Option<String>,
     pub raw_metadata: String,
+    pub is_favorite: bool,
+    pub is_locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +104,30 @@ pub struct TagCount {
 pub struct CursorPage {
     pub items: Vec<GalleryImageRecord>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CursorQueryOptions<'a> {
+    pub cursor: Option<&'a str>,
+    pub limit: u32,
+    pub sort_by: Option<&'a str>,
+    pub generation_types: Option<&'a [String]>,
+    pub model_filter: Option<&'a str>,
+    pub model_family_filters: Option<&'a [String]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchCursorParams<'a> {
+    pub query: &'a str,
+    pub options: CursorQueryOptions<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FilterCursorParams<'a> {
+    pub query: Option<&'a str>,
+    pub include_tags: &'a [String],
+    pub exclude_tags: &'a [String],
+    pub options: CursorQueryOptions<'a>,
 }
 
 /// Directory entry with image count for grouping.
@@ -279,12 +307,8 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_images_directory ON images(directory);",
         )?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);")?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_image_tags_tag_id ON image_tags(tag_id);",
-        )?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_images_model_name ON images(model_name);",
-        )?;
+        conn.execute_batch("DROP INDEX IF EXISTS idx_image_tags_tag_id;")?;
+        conn.execute_batch("DROP INDEX IF EXISTS idx_images_model_name;")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_images_filename ON images(filename);")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_images_file_mtime ON images(file_mtime);",
@@ -295,8 +319,15 @@ impl Database {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_images_quick_hash ON images(quick_hash);",
         )?;
+        conn.execute_batch("DROP INDEX IF EXISTS idx_images_generation_type;")?;
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_images_generation_type ON images(generation_type);",
+            "CREATE INDEX IF NOT EXISTS idx_image_tags_tag_id_image_id ON image_tags(tag_id, image_id);",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_images_model_name_nocase_id ON images(model_name COLLATE NOCASE, id DESC);",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_images_generation_type_id ON images(generation_type, id DESC);",
         )?;
 
         Ok(())
@@ -316,6 +347,8 @@ impl Database {
             ("file_size", "INTEGER"),
             ("quick_hash", "TEXT"),
             ("generation_type", "TEXT"),
+            ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
+            ("is_locked", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if existing_columns.contains(name) {
                 continue;
@@ -362,1397 +395,11 @@ impl Database {
         }
         Ok(())
     }
-
-    // ────────────────────────────── Bulk Operations ──────────────────────────────
-
-    /// Fetches all stored file mtimes in a single query for fast lookup.
-    /// Returns a HashMap<filepath, mtime> enabling O(1) changed-file detection.
-    pub fn get_all_file_mtimes(&self) -> SqlResult<HashMap<String, i64>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt =
-            conn.prepare("SELECT filepath, file_mtime FROM images WHERE file_mtime IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut map = HashMap::new();
-        for row in rows {
-            let (path, mtime) = row?;
-            map.insert(path, mtime);
-        }
-        Ok(map)
-    }
-
-    /// Batch upsert images and their tags in a single transaction.
-    /// Dramatically faster than individual upserts (10-50x for large libraries)
-    /// because SQLite only syncs to disk once at commit time.
-    pub fn bulk_upsert_with_tags(&self, records: &[BulkRecord]) -> SqlResult<usize> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        let mut conn = self.pool.get().map_err(pool_error)?;
-        let tx = conn.transaction()?;
-        let mut count = 0usize;
-        {
-            let mut upsert_image_stmt = tx.prepare_cached(
-                "INSERT INTO images
-                    (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
-                     schedule_type, cfg_scale, seed, width, height, model_hash, model_name,
-                     generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
-                 ON CONFLICT(filepath) DO UPDATE SET
-                     filename=excluded.filename,
-                     directory=excluded.directory,
-                     prompt=excluded.prompt,
-                     negative_prompt=excluded.negative_prompt,
-                     steps=excluded.steps,
-                     sampler=excluded.sampler,
-                     schedule_type=excluded.schedule_type,
-                     cfg_scale=excluded.cfg_scale,
-                     seed=excluded.seed,
-                     width=excluded.width,
-                     height=excluded.height,
-                     model_hash=excluded.model_hash,
-                     model_name=excluded.model_name,
-                     generation_type=excluded.generation_type,
-                     raw_metadata=excluded.raw_metadata,
-                     extra_params=excluded.extra_params,
-                     file_mtime=excluded.file_mtime,
-                     file_size=excluded.file_size,
-                     quick_hash=excluded.quick_hash
-                 RETURNING id",
-            )?;
-            let mut delete_image_tags_stmt =
-                tx.prepare_cached("DELETE FROM image_tags WHERE image_id = ?1")?;
-            let mut upsert_tag_stmt = tx.prepare_cached(
-                "INSERT INTO tags(tag) VALUES (?1)
-                 ON CONFLICT(tag) DO UPDATE SET tag=excluded.tag
-                 RETURNING id",
-            )?;
-            let mut insert_image_tag_stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
-            )?;
-            let mut tag_id_cache: HashMap<String, i64> = HashMap::with_capacity(4096);
-
-            for record in records {
-                let extra = serde_json::to_string(&record.params.extra_params).unwrap_or_default();
-                let generation_type = record
-                    .params
-                    .generation_type
-                    .clone()
-                    .unwrap_or_else(|| infer_generation_type(&record.params.raw_metadata));
-
-                let id: i64 = upsert_image_stmt.query_row(
-                    params![
-                        record.filepath,
-                        record.filename,
-                        record.directory,
-                        record.params.prompt,
-                        record.params.negative_prompt,
-                        record.params.steps,
-                        record.params.sampler,
-                        record.params.schedule_type,
-                        record.params.cfg_scale,
-                        record.params.seed,
-                        record.params.width,
-                        record.params.height,
-                        record.params.model_hash,
-                        record.params.model_name,
-                        generation_type,
-                        record.params.raw_metadata,
-                        extra,
-                        record.file_mtime,
-                        record.file_size,
-                        record.quick_hash,
-                    ],
-                    |row| row.get::<_, i64>(0),
-                )?;
-
-                // Replace tags within the same transaction
-                delete_image_tags_stmt.execute(params![id])?;
-                let mut seen_tags: HashSet<String> = HashSet::with_capacity(record.tags.len());
-
-                for tag in &record.tags {
-                    let normalized = tag.trim().to_ascii_lowercase();
-                    if normalized.is_empty() || !seen_tags.insert(normalized.clone()) {
-                        continue;
-                    }
-
-                    let tag_id = if let Some(existing) = tag_id_cache.get(&normalized) {
-                        *existing
-                    } else {
-                        let created_or_existing: i64 = upsert_tag_stmt
-                            .query_row(params![normalized.as_str()], |row| row.get::<_, i64>(0))?;
-                        tag_id_cache.insert(normalized, created_or_existing);
-                        created_or_existing
-                    };
-
-                    insert_image_tag_stmt.execute(params![id, tag_id])?;
-                }
-
-                count += 1;
-            }
-        }
-
-        tx.commit()?;
-        Ok(count)
-    }
-
-    // ────────────────────────────── Writes ──────────────────────────────
-
-    /// Inserts or updates an image and returns its stable row id.
-    pub fn upsert_image(
-        &self,
-        filepath: &str,
-        filename: &str,
-        directory: &str,
-        params: &GenerationParams,
-        file_mtime: Option<i64>,
-    ) -> SqlResult<i64> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let extra = serde_json::to_string(&params.extra_params).unwrap_or_default();
-        let generation_type = params
-            .generation_type
-            .clone()
-            .unwrap_or_else(|| infer_generation_type(&params.raw_metadata));
-
-        conn.query_row(
-            "INSERT INTO images
-                (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
-                 schedule_type, cfg_scale, seed, width, height, model_hash, model_name,
-                 generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
-             ON CONFLICT(filepath) DO UPDATE SET
-                 filename=excluded.filename,
-                 directory=excluded.directory,
-                 prompt=excluded.prompt,
-                 negative_prompt=excluded.negative_prompt,
-                 steps=excluded.steps,
-                 sampler=excluded.sampler,
-                 schedule_type=excluded.schedule_type,
-                 cfg_scale=excluded.cfg_scale,
-                 seed=excluded.seed,
-                 width=excluded.width,
-                 height=excluded.height,
-                 model_hash=excluded.model_hash,
-                 model_name=excluded.model_name,
-                 generation_type=excluded.generation_type,
-                 raw_metadata=excluded.raw_metadata,
-                 extra_params=excluded.extra_params,
-                 file_mtime=excluded.file_mtime,
-                 file_size=excluded.file_size,
-                 quick_hash=excluded.quick_hash
-             RETURNING id",
-            params![
-                filepath,
-                filename,
-                directory,
-                params.prompt,
-                params.negative_prompt,
-                params.steps,
-                params.sampler,
-                params.schedule_type,
-                params.cfg_scale,
-                params.seed,
-                params.width,
-                params.height,
-                params.model_hash,
-                params.model_name,
-                generation_type,
-                params.raw_metadata,
-                extra,
-                file_mtime,
-                Option::<i64>::None,
-                Option::<String>::None,
-            ],
-            |row| row.get::<_, i64>(0),
-        )
-    }
-
-    /// Replaces image tags atomically.
-    pub fn replace_image_tags(&self, image_id: i64, tags: &[String]) -> SqlResult<()> {
-        let mut conn = self.pool.get().map_err(pool_error)?;
-        let tx = conn.transaction()?;
-        {
-            let mut delete_stmt =
-                tx.prepare_cached("DELETE FROM image_tags WHERE image_id = ?1")?;
-            let mut upsert_tag_stmt = tx.prepare_cached(
-                "INSERT INTO tags(tag) VALUES (?1)
-                 ON CONFLICT(tag) DO UPDATE SET tag=excluded.tag
-                 RETURNING id",
-            )?;
-            let mut insert_stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
-            )?;
-
-            delete_stmt.execute(params![image_id])?;
-            let mut seen_tags: HashSet<String> = HashSet::with_capacity(tags.len());
-
-            for tag in tags {
-                let normalized_tag = tag.trim().to_ascii_lowercase();
-                if normalized_tag.is_empty() || !seen_tags.insert(normalized_tag.clone()) {
-                    continue;
-                }
-
-                let tag_id: i64 = upsert_tag_stmt
-                    .query_row(params![normalized_tag.as_str()], |row| row.get::<_, i64>(0))?;
-
-                insert_stmt.execute(params![image_id, tag_id])?;
-            }
-        }
-
-        tx.commit()?;
-        Ok(())
-    }
-
-    // ────────────────────────────── Reads ──────────────────────────────
-
-    /// Returns stored mtime for a filepath (unix seconds), if present.
-    pub fn get_file_mtime(&self, filepath: &str) -> SqlResult<Option<i64>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare("SELECT file_mtime FROM images WHERE filepath = ?1 LIMIT 1")?;
-        let result = stmt.query_row(params![filepath], |row: &Row<'_>| {
-            row.get::<_, Option<i64>>(0)
-        });
-        match result {
-            Ok(mtime) => Ok(mtime),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Returns image id for a filepath if it exists.
-    pub fn get_image_id_by_filepath(&self, filepath: &str) -> SqlResult<Option<i64>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare("SELECT id FROM images WHERE filepath = ?1 LIMIT 1")?;
-        match stmt.query_row(params![filepath], |row: &Row<'_>| row.get::<_, i64>(0)) {
-            Ok(id) => Ok(Some(id)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Full-text search: tries porter (ranked) first, falls back to trigram (infix).
-    pub fn search(&self, query: &str, limit: u32, offset: u32) -> SqlResult<Vec<ImageRecord>> {
-        let porter_results = self.query_images(Some(query), &[], &[], limit, offset)?;
-        if !porter_results.is_empty() {
-            return Ok(porter_results);
-        }
-        // Porter returned nothing -- try infix/substring via trigram.
-        self.search_trigram(query, limit, offset)
-    }
-
-    /// Trigram-based infix substring search (fallback).
-    fn search_trigram(&self, query: &str, limit: u32, offset: u32) -> SqlResult<Vec<ImageRecord>> {
-        self.query_images_trigram(query, &[], &[], limit, offset)
-    }
-
-    /// Filter images by optional query and tag include/exclude sets.
-    pub fn filter_images(
-        &self,
-        query: Option<&str>,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        limit: u32,
-        offset: u32,
-    ) -> SqlResult<Vec<ImageRecord>> {
-        self.query_images(query, include_tags, exclude_tags, limit, offset)
-    }
-
-    /// Gets all images with pagination for the gallery view.
-    pub fn get_all_images(&self, limit: u32, offset: u32) -> SqlResult<Vec<ImageRecord>> {
-        self.query_images(None, &[], &[], limit, offset)
-    }
-
-    // ────────────────────── Cursor-based pagination ──────────────────────
-
-    /// Gets images using keyset (cursor) pagination -- O(1) at any depth.
-    /// Supports optional sort_by field for different orderings.
-    pub fn get_images_cursor(
-        &self,
-        cursor: Option<&str>,
-        limit: u32,
-        sort_by: Option<&str>,
-        generation_types: Option<&[String]>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
-        let normalized_generation_types = normalize_generation_types(generation_types);
-        let normalized_model_family_filters =
-            normalize_model_family_filters(model_family_filters);
-        let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-        let cursor_id = cursor_value
-            .as_ref()
-            .and_then(|value| value.get("id")?.as_i64());
-        let cursor_sort = cursor_value.as_ref().and_then(|value| {
-            value
-                .get("sort")
-                .and_then(serde_json::Value::as_str)
-                .map(|sort_value| sort_value.to_string())
-        });
-
-        let mut sql = if sort.field == "id" {
-            String::from(
-                "SELECT id, filepath, filename, directory, seed, width, height, model_name
-                 FROM images
-                 WHERE 1=1",
-            )
-        } else {
-            format!(
-                "SELECT id, filepath, filename, directory, seed, width, height, model_name, {} AS sort_value
-                 FROM images
-                 WHERE 1=1",
-                sort.sort_expr()
-            )
-        };
-        let mut par = Vec::<Value>::new();
-        append_generation_type_filter(&mut sql, &mut par, &normalized_generation_types);
-        append_model_filter(&mut sql, &mut par, model_filter, None);
-        append_model_family_filter(&mut sql, &mut par, &normalized_model_family_filters, None);
-
-        if let Some(cid) = cursor_id {
-            if sort.field == "id" {
-                sql.push_str(&format!(" AND id {} ?", sort.cursor_op()));
-                par.push(Value::Integer(cid));
-            } else if let Some(sort_value) = cursor_sort {
-                let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
-                sql.push_str(&format!(
-                    " AND ({} {} ? OR ({} = ? AND id {} ?))",
-                    sort_expr, op, sort_expr, op
-                ));
-                par.push(Value::Text(sort_value.clone()));
-                par.push(Value::Text(sort_value));
-                par.push(Value::Integer(cid));
-            } else {
-                sql.push_str(&format!(" AND id {} ?", sort.cursor_op()));
-                par.push(Value::Integer(cid));
-            }
-        }
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        par.push(Value::Integer(limit as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let mut items = Vec::new();
-        let next_cursor = if sort.field == "id" {
-            let rows = stmt.query_map(params_from_iter(par), gallery_image_record_from_row)?;
-            for row in rows {
-                items.push(row?);
-            }
-            items
-                .last()
-                .map(|last| serde_json::json!({"id": last.id}).to_string())
-        } else {
-            let rows = stmt.query_map(params_from_iter(par), |row| {
-                Ok((
-                    gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })?;
-            let mut last_cursor = None::<(i64, String)>;
-            for row in rows {
-                let (record, sort_value) = row?;
-                last_cursor = Some((record.id, sort_value));
-                items.push(record);
-            }
-            last_cursor.map(|(id, sort_value)| {
-                serde_json::json!({"id": id, "sort": sort_value}).to_string()
-            })
-        };
-
-        Ok(CursorPage { items, next_cursor })
-    }
-
-    /// Cursor-based search: tries porter first, falls back to trigram.
-    pub fn search_cursor(
-        &self,
-        query: &str,
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let porter = self.search_cursor_porter(
-            query,
-            cursor,
-            limit,
-            generation_types,
-            sort_by,
-            model_filter,
-            model_family_filters,
-        )?;
-        if !porter.items.is_empty() {
-            return Ok(porter);
-        }
-        self.search_cursor_trigram(
-            query,
-            cursor,
-            limit,
-            generation_types,
-            sort_by,
-            model_filter,
-            model_family_filters,
-        )
-    }
-
-    fn search_cursor_porter(
-        &self,
-        query: &str,
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let conn = self.pool.get().map_err(pool_error)?;
-
-        let sanitized = sanitize_fts_query(query);
-        if sanitized.is_empty() {
-            return Ok(CursorPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
-        let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
-        let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-        let cursor_id = cursor_value
-            .as_ref()
-            .and_then(|value| value.get("id")?.as_i64());
-        let cursor_sort = cursor_value.as_ref().and_then(|value| {
-            value
-                .get("sort")
-                .and_then(serde_json::Value::as_str)
-                .map(|sort_value| sort_value.to_string())
-        });
-        let normalized_generation_types = normalize_generation_types(generation_types);
-        let normalized_model_family_filters =
-            normalize_model_family_filters(model_family_filters);
-        let mut params_vec = vec![Value::Text(sanitized)];
-        let mut sql = if sort.field == "id" {
-            String::from(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name
-                 FROM images
-                 JOIN images_fts ON images.id = images_fts.rowid
-                 WHERE images_fts MATCH ?",
-            )
-        } else {
-            format!(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, {} AS sort_value
-                 FROM images
-                 JOIN images_fts ON images.id = images_fts.rowid
-                 WHERE images_fts MATCH ?",
-                sort.sort_expr()
-            )
-        };
-        append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
-        append_model_filter(&mut sql, &mut params_vec, model_filter, Some("images"));
-        append_model_family_filter(
-            &mut sql,
-            &mut params_vec,
-            &normalized_model_family_filters,
-            Some("images"),
-        );
-
-        if let Some(cid) = cursor_id {
-            if sort.field == "id" {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            } else if let Some(sort_value) = cursor_sort {
-                let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
-                sql.push_str(&format!(
-                    " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
-                    sort_expr, op, sort_expr, op
-                ));
-                params_vec.push(Value::Text(sort_value.clone()));
-                params_vec.push(Value::Text(sort_value));
-                params_vec.push(Value::Integer(cid));
-            } else {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            }
-        }
-
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        if sort.field == "id" {
-            let rows =
-                stmt.query_map(params_from_iter(params_vec), gallery_image_record_from_row)?;
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-            let next_cursor = items
-                .last()
-                .map(|last| serde_json::json!({"id": last.id}).to_string());
-            Ok(CursorPage { items, next_cursor })
-        } else {
-            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-                Ok((
-                    gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })?;
-
-            let mut items = Vec::new();
-            let mut last_cursor = None::<(i64, String)>;
-            for row in rows {
-                let (record, sort_value) = row?;
-                last_cursor = Some((record.id, sort_value));
-                items.push(record);
-            }
-
-            let next_cursor = last_cursor.map(|(id, sort_value)| {
-                serde_json::json!({"id": id, "sort": sort_value}).to_string()
-            });
-
-            Ok(CursorPage { items, next_cursor })
-        }
-    }
-
-    fn search_cursor_trigram(
-        &self,
-        query: &str,
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let conn = self.pool.get().map_err(pool_error)?;
-
-        let sanitized = query.trim();
-        if sanitized.is_empty() || !contains_search_token(sanitized) {
-            return Ok(CursorPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
-        let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
-        let match_expr = format!("\"{}\"", sanitized.replace('"', "\"\""));
-        let normalized_generation_types = normalize_generation_types(generation_types);
-        let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-        let cursor_id = cursor_value
-            .as_ref()
-            .and_then(|value| value.get("id")?.as_i64());
-        let cursor_sort = cursor_value.as_ref().and_then(|value| {
-            value
-                .get("sort")
-                .and_then(serde_json::Value::as_str)
-                .map(|sort_value| sort_value.to_string())
-        });
-        let normalized_model_family_filters =
-            normalize_model_family_filters(model_family_filters);
-
-        let mut sql = if sort.field == "id" {
-            String::from(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name
-                 FROM images
-                 JOIN images_fts_tri ON images.id = images_fts_tri.rowid
-                 WHERE images_fts_tri MATCH ?",
-            )
-        } else {
-            format!(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, {} AS sort_value
-                 FROM images
-                 JOIN images_fts_tri ON images.id = images_fts_tri.rowid
-                 WHERE images_fts_tri MATCH ?",
-                sort.sort_expr()
-            )
-        };
-        let mut params_vec = vec![Value::Text(match_expr)];
-        append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
-        append_model_filter(&mut sql, &mut params_vec, model_filter, Some("images"));
-        append_model_family_filter(
-            &mut sql,
-            &mut params_vec,
-            &normalized_model_family_filters,
-            Some("images"),
-        );
-        if let Some(cid) = cursor_id {
-            if sort.field == "id" {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            } else if let Some(sort_value) = cursor_sort {
-                let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
-                sql.push_str(&format!(
-                    " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
-                    sort_expr, op, sort_expr, op
-                ));
-                params_vec.push(Value::Text(sort_value.clone()));
-                params_vec.push(Value::Text(sort_value));
-                params_vec.push(Value::Integer(cid));
-            } else {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            }
-        }
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        if sort.field == "id" {
-            let rows =
-                stmt.query_map(params_from_iter(params_vec), gallery_image_record_from_row)?;
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-            let next_cursor = items
-                .last()
-                .map(|last| serde_json::json!({"id": last.id}).to_string());
-            Ok(CursorPage { items, next_cursor })
-        } else {
-            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-                Ok((
-                    gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })?;
-            let mut items = Vec::new();
-            let mut last_cursor = None::<(i64, String)>;
-            for row in rows {
-                let (record, sort_value) = row?;
-                last_cursor = Some((record.id, sort_value));
-                items.push(record);
-            }
-            let next_cursor = last_cursor.map(|(id, sort_value)| {
-                serde_json::json!({"id": id, "sort": sort_value}).to_string()
-            });
-            Ok(CursorPage { items, next_cursor })
-        }
-    }
-
-    /// Cursor-based filtering with tag include/exclude sets.
-    pub fn filter_images_cursor(
-        &self,
-        query: Option<&str>,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let porter = self.filter_images_cursor_porter(
-            query,
-            include_tags,
-            exclude_tags,
-            cursor,
-            limit,
-            generation_types,
-            sort_by,
-            model_filter,
-            model_family_filters,
-        )?;
-        if !porter.items.is_empty() {
-            return Ok(porter);
-        }
-
-        let Some(query) = query else {
-            return Ok(porter);
-        };
-        if query.trim().is_empty() {
-            return Ok(porter);
-        }
-
-        self.filter_images_cursor_trigram(
-            query,
-            include_tags,
-            exclude_tags,
-            cursor,
-            limit,
-            generation_types,
-            sort_by,
-            model_filter,
-            model_family_filters,
-        )
-    }
-
-    fn filter_images_cursor_porter(
-        &self,
-        query: Option<&str>,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
-        let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-        let cursor_id = cursor_value
-            .as_ref()
-            .and_then(|value| value.get("id")?.as_i64());
-        let cursor_sort = cursor_value.as_ref().and_then(|value| {
-            value
-                .get("sort")
-                .and_then(serde_json::Value::as_str)
-                .map(|sort_value| sort_value.to_string())
-        });
-        let normalized_generation_types = normalize_generation_types(generation_types);
-        let normalized_model_family_filters =
-            normalize_model_family_filters(model_family_filters);
-
-        let mut sql = if sort.field == "id" {
-            String::from(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name
-                 FROM images
-                 LEFT JOIN images_fts ON images.id = images_fts.rowid",
-            )
-        } else {
-            format!(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, {} AS sort_value
-                 FROM images
-                 LEFT JOIN images_fts ON images.id = images_fts.rowid",
-                sort.sort_expr()
-            )
-        };
-        let mut params_vec = Vec::<Value>::new();
-
-        let mut has_fts = false;
-        if let Some(q) = query {
-            let sanitized = sanitize_fts_query(q);
-            if sanitized.is_empty() {
-                return Ok(CursorPage {
-                    items: Vec::new(),
-                    next_cursor: None,
-                });
-            }
-            sql.push_str(" WHERE images_fts MATCH ?");
-            params_vec.push(Value::Text(sanitized));
-            has_fts = true;
-        } else {
-            sql.push_str(" WHERE 1=1");
-        }
-
-        append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
-        append_model_filter(&mut sql, &mut params_vec, model_filter, Some("images"));
-        append_model_family_filter(
-            &mut sql,
-            &mut params_vec,
-            &normalized_model_family_filters,
-            Some("images"),
-        );
-
-        for tag in include_tags {
-            sql.push_str(
-                " AND EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
-                )",
-            );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        for tag in exclude_tags {
-            sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
-                )",
-            );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        if let Some(cid) = cursor_id {
-            if sort.field == "id" {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            } else if let Some(sort_value) = cursor_sort {
-                let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
-                sql.push_str(&format!(
-                    " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
-                    sort_expr, op, sort_expr, op
-                ));
-                params_vec.push(Value::Text(sort_value.clone()));
-                params_vec.push(Value::Text(sort_value));
-                params_vec.push(Value::Integer(cid));
-            } else {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            }
-        }
-
-        let _ = has_fts;
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        if sort.field == "id" {
-            let rows =
-                stmt.query_map(params_from_iter(params_vec), gallery_image_record_from_row)?;
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-            let next_cursor = items
-                .last()
-                .map(|last| serde_json::json!({"id": last.id}).to_string());
-            Ok(CursorPage { items, next_cursor })
-        } else {
-            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-                Ok((
-                    gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })?;
-            let mut items = Vec::new();
-            let mut last_cursor = None::<(i64, String)>;
-            for row in rows {
-                let (record, sort_value) = row?;
-                last_cursor = Some((record.id, sort_value));
-                items.push(record);
-            }
-            let next_cursor = last_cursor.map(|(id, sort_value)| {
-                serde_json::json!({"id": id, "sort": sort_value}).to_string()
-            });
-            Ok(CursorPage { items, next_cursor })
-        }
-    }
-
-    fn filter_images_cursor_trigram(
-        &self,
-        query: &str,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        cursor: Option<&str>,
-        limit: u32,
-        generation_types: Option<&[String]>,
-        sort_by: Option<&str>,
-        model_filter: Option<&str>,
-        model_family_filters: Option<&[String]>,
-    ) -> SqlResult<CursorPage> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let sanitized = query.trim();
-        if sanitized.is_empty() || !contains_search_token(sanitized) {
-            return Ok(CursorPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
-        let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
-        let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-        let cursor_id = cursor_value
-            .as_ref()
-            .and_then(|value| value.get("id")?.as_i64());
-        let cursor_sort = cursor_value.as_ref().and_then(|value| {
-            value
-                .get("sort")
-                .and_then(serde_json::Value::as_str)
-                .map(|sort_value| sort_value.to_string())
-        });
-        let normalized_generation_types = normalize_generation_types(generation_types);
-        let normalized_model_family_filters =
-            normalize_model_family_filters(model_family_filters);
-
-        let mut sql = if sort.field == "id" {
-            String::from(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name
-                 FROM images
-                 JOIN images_fts_tri ON images.id = images_fts_tri.rowid
-                 WHERE images_fts_tri MATCH ?",
-            )
-        } else {
-            format!(
-                "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, {} AS sort_value
-                 FROM images
-                 JOIN images_fts_tri ON images.id = images_fts_tri.rowid
-                 WHERE images_fts_tri MATCH ?",
-                sort.sort_expr()
-            )
-        };
-        let mut params_vec = vec![Value::Text(format!(
-            "\"{}\"",
-            sanitized.replace('"', "\"\"")
-        ))];
-
-        append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
-        append_model_filter(&mut sql, &mut params_vec, model_filter, Some("images"));
-        append_model_family_filter(
-            &mut sql,
-            &mut params_vec,
-            &normalized_model_family_filters,
-            Some("images"),
-        );
-
-        if let Some(cid) = cursor_id {
-            if sort.field == "id" {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            } else if let Some(sort_value) = cursor_sort {
-                let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
-                sql.push_str(&format!(
-                    " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
-                    sort_expr, op, sort_expr, op
-                ));
-                params_vec.push(Value::Text(sort_value.clone()));
-                params_vec.push(Value::Text(sort_value));
-                params_vec.push(Value::Integer(cid));
-            } else {
-                sql.push_str(&format!(" AND images.id {} ?", sort.cursor_op()));
-                params_vec.push(Value::Integer(cid));
-            }
-        }
-
-        for tag in include_tags {
-            sql.push_str(
-                " AND EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
-                )",
-            );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        for tag in exclude_tags {
-            sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
-                )",
-            );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        if sort.field == "id" {
-            let rows =
-                stmt.query_map(params_from_iter(params_vec), gallery_image_record_from_row)?;
-            let mut items = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-            let next_cursor = items
-                .last()
-                .map(|last| serde_json::json!({"id": last.id}).to_string());
-            Ok(CursorPage { items, next_cursor })
-        } else {
-            let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-                Ok((
-                    gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })?;
-            let mut items = Vec::new();
-            let mut last_cursor = None::<(i64, String)>;
-            for row in rows {
-                let (record, sort_value) = row?;
-                last_cursor = Some((record.id, sort_value));
-                items.push(record);
-            }
-            let next_cursor = last_cursor.map(|(id, sort_value)| {
-                serde_json::json!({"id": id, "sort": sort_value}).to_string()
-            });
-            Ok(CursorPage { items, next_cursor })
-        }
-    }
-
-    // ────────────────────────── Tag queries ──────────────────────────
-
-    /// Lists tags for autocomplete.
-    pub fn list_tags(&self, prefix: Option<&str>, limit: u32) -> SqlResult<Vec<String>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut tags: Vec<String> = Vec::new();
-
-        if let Some(prefix) = prefix {
-            let mut stmt = conn.prepare(
-                "SELECT tag FROM tags
-                 WHERE tag LIKE ?1
-                 ORDER BY tag ASC
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                params![format!("{}%", prefix.trim().to_ascii_lowercase()), limit],
-                |row: &Row<'_>| row.get::<_, String>(0),
-            )?;
-            for row in rows {
-                tags.push(row?);
-            }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT tag FROM tags
-                 ORDER BY tag ASC
-                 LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit], |row: &Row<'_>| row.get::<_, String>(0))?;
-            for row in rows {
-                tags.push(row?);
-            }
-        }
-
-        Ok(tags)
-    }
-
-    /// Returns most common tags for quick filtering.
-    pub fn get_top_tags(&self, limit: u32) -> SqlResult<Vec<TagCount>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT tags.tag, COUNT(*) as usage_count
-             FROM tags
-             JOIN image_tags ON image_tags.tag_id = tags.id
-             GROUP BY tags.id, tags.tag
-             ORDER BY usage_count DESC, tags.tag ASC
-             LIMIT ?1",
-        )?;
-
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(TagCount {
-                tag: row.get::<_, String>(0)?,
-                count: row.get::<_, u32>(1)?,
-            })
-        })?;
-
-        let mut tags: Vec<TagCount> = Vec::new();
-        for row in rows {
-            tags.push(row?);
-        }
-        Ok(tags)
-    }
-
-    /// Returns tags attached to a specific image.
-    pub fn get_tags_for_image(&self, image_id: i64) -> SqlResult<Vec<String>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT tags.tag
-             FROM image_tags
-             JOIN tags ON tags.id = image_tags.tag_id
-             WHERE image_tags.image_id = ?1
-             ORDER BY tags.tag ASC",
-        )?;
-        let rows = stmt.query_map(params![image_id], |row: &Row<'_>| row.get::<_, String>(0))?;
-
-        let mut tags: Vec<String> = Vec::new();
-        for row in rows {
-            tags.push(row?);
-        }
-        Ok(tags)
-    }
-
-    // ────────────────────── Group-by queries ──────────────────────
-
-    /// Returns unique directories with image counts for group-by view.
-    pub fn get_unique_directories(&self) -> SqlResult<Vec<DirectoryEntry>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT directory, COUNT(*) as cnt
-             FROM images
-             GROUP BY directory
-             ORDER BY cnt DESC, directory ASC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(DirectoryEntry {
-                directory: row.get::<_, String>(0)?,
-                count: row.get::<_, u32>(1)?,
-            })
-        })?;
-
-        let mut dirs = Vec::new();
-        for row in rows {
-            dirs.push(row?);
-        }
-        Ok(dirs)
-    }
-
-    /// Returns unique model names with image counts for group-by view.
-    pub fn get_unique_models(&self) -> SqlResult<Vec<ModelEntry>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT COALESCE(model_name, 'Unknown') as model, COUNT(*) as cnt
-             FROM images
-             GROUP BY model
-             ORDER BY cnt DESC, model ASC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(ModelEntry {
-                model_name: row.get::<_, String>(0)?,
-                count: row.get::<_, u32>(1)?,
-            })
-        })?;
-
-        let mut models = Vec::new();
-        for row in rows {
-            models.push(row?);
-        }
-        Ok(models)
-    }
-
-    // ────────────────────────── By-id queries ──────────────────────────
-
-    /// Fetches records by explicit ids (used by export).
-    pub fn get_images_by_ids(&self, ids: &[i64]) -> SqlResult<Vec<ImageRecord>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.pool.get().map_err(pool_error)?;
-        let placeholders = vec!["?"; ids.len()].join(", ");
-        let sql = format!(
-            "SELECT id, filepath, filename, directory, prompt, negative_prompt,
-                    steps, sampler, cfg_scale, seed, width, height,
-                    model_hash, model_name, raw_metadata
-             FROM images
-             WHERE id IN ({})
-             ORDER BY id DESC",
-            placeholders
-        );
-
-        let params: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), image_record_from_row)?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    /// Returns total indexed image count.
-    pub fn get_total_count(&self) -> SqlResult<u32> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        conn.query_row("SELECT COUNT(*) FROM images", [], |row| {
-            row.get::<_, u32>(0)
-        })
-    }
-
-    /// Returns all indexed source image paths ordered newest-first.
-    pub fn get_all_image_filepaths_desc(&self) -> SqlResult<Vec<String>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare("SELECT filepath FROM images ORDER BY id DESC")?;
-        let rows = stmt.query_map([], |row: &Row<'_>| row.get::<_, String>(0))?;
-
-        let mut filepaths = Vec::new();
-        for row in rows {
-            filepaths.push(row?);
-        }
-        Ok(filepaths)
-    }
-
-    /// Returns a single image by id.
-    pub fn get_image_by_id(&self, id: i64) -> SqlResult<Option<ImageRecord>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, filepath, filename, directory, prompt, negative_prompt,
-                    steps, sampler, cfg_scale, seed, width, height,
-                    model_hash, model_name, raw_metadata
-             FROM images
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
-
-        let mut rows = stmt.query_map(params![id], image_record_from_row)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            _ => Ok(None),
-        }
-    }
-
-    // ────────────────────── Offset-based (legacy) ──────────────────────
-
-    fn query_images(
-        &self,
-        query: Option<&str>,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        limit: u32,
-        offset: u32,
-    ) -> SqlResult<Vec<ImageRecord>> {
-        let porter_results =
-            self.query_images_porter(query, include_tags, exclude_tags, limit, offset)?;
-        if !porter_results.is_empty() {
-            return Ok(porter_results);
-        }
-
-        let Some(query) = query else {
-            return Ok(porter_results);
-        };
-        if query.trim().is_empty() {
-            return Ok(porter_results);
-        }
-
-        self.query_images_trigram(query, include_tags, exclude_tags, limit, offset)
-    }
-
-    fn query_images_porter(
-        &self,
-        query: Option<&str>,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        limit: u32,
-        offset: u32,
-    ) -> SqlResult<Vec<ImageRecord>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let mut sql = String::from(
-            "SELECT images.id, images.filepath, images.filename, images.directory,
-                    images.prompt, images.negative_prompt, images.steps, images.sampler,
-                    images.cfg_scale, images.seed, images.width, images.height,
-                    images.model_hash, images.model_name, images.raw_metadata
-             FROM images",
-        );
-        let mut params = Vec::<Value>::new();
-
-        let mut has_fts = false;
-        if let Some(query) = query {
-            let sanitized = sanitize_fts_query(query);
-            if sanitized.is_empty() {
-                return Ok(Vec::new());
-            }
-            sql.push_str(" JOIN images_fts ON images.id = images_fts.rowid");
-            sql.push_str(" WHERE images_fts MATCH ?");
-            params.push(Value::Text(sanitized));
-            has_fts = true;
-        } else {
-            sql.push_str(" WHERE 1=1");
-        }
-
-        for tag in include_tags {
-            sql.push_str(
-                " AND EXISTS (
-                    SELECT 1
-                    FROM image_tags it
-                    JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id
-                      AND t.tag = ?
-                )",
-            );
-            params.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        for tag in exclude_tags {
-            sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1
-                    FROM image_tags it
-                    JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id
-                      AND t.tag = ?
-                )",
-            );
-            params.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        if has_fts {
-            sql.push_str(" ORDER BY images_fts.rank");
-        } else {
-            sql.push_str(" ORDER BY images.id DESC");
-        }
-
-        sql.push_str(" LIMIT ? OFFSET ?");
-        params.push(Value::Integer(limit as i64));
-        params.push(Value::Integer(offset as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), image_record_from_row)?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    fn query_images_trigram(
-        &self,
-        query: &str,
-        include_tags: &[String],
-        exclude_tags: &[String],
-        limit: u32,
-        offset: u32,
-    ) -> SqlResult<Vec<ImageRecord>> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let sanitized = query.trim();
-        if sanitized.is_empty() || !contains_search_token(sanitized) {
-            return Ok(Vec::new());
-        }
-
-        let mut sql = String::from(
-            "SELECT images.id, images.filepath, images.filename, images.directory,
-                    images.prompt, images.negative_prompt, images.steps, images.sampler,
-                    images.cfg_scale, images.seed, images.width, images.height,
-                    images.model_hash, images.model_name, images.raw_metadata
-             FROM images
-             JOIN images_fts_tri ON images.id = images_fts_tri.rowid
-             WHERE images_fts_tri MATCH ?",
-        );
-        let mut params = vec![Value::Text(format!(
-            "\"{}\"",
-            sanitized.replace('"', "\"\"")
-        ))];
-
-        for tag in include_tags {
-            sql.push_str(
-                " AND EXISTS (
-                    SELECT 1
-                    FROM image_tags it
-                    JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id
-                      AND t.tag = ?
-                )",
-            );
-            params.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        for tag in exclude_tags {
-            sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1
-                    FROM image_tags it
-                    JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id
-                      AND t.tag = ?
-                )",
-            );
-            params.push(Value::Text(tag.trim().to_ascii_lowercase()));
-        }
-
-        sql.push_str(" ORDER BY images.id DESC LIMIT ? OFFSET ?");
-        params.push(Value::Integer(limit as i64));
-        params.push(Value::Integer(offset as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), image_record_from_row)?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
 }
+
+mod bulk_operations;
+mod cursor_queries;
+mod read_queries;
 
 // ────────────────────── Sort configuration ──────────────────────
 
@@ -1835,6 +482,8 @@ fn image_record_from_row(row: &Row<'_>) -> SqlResult<ImageRecord> {
         model_hash: row.get(12)?,
         model_name: row.get(13)?,
         raw_metadata: row.get(14)?,
+        is_favorite: row.get(15)?,
+        is_locked: row.get(16)?,
     })
 }
 
@@ -1848,6 +497,8 @@ fn gallery_image_record_from_row(row: &Row<'_>) -> SqlResult<GalleryImageRecord>
         width: row.get(5)?,
         height: row.get(6)?,
         model_name: row.get(7)?,
+        is_favorite: row.get(8)?,
+        is_locked: row.get(9)?,
     })
 }
 
@@ -1942,33 +593,24 @@ fn append_model_filter(
     let Some(raw_model_filter) = model_filter else {
         return;
     };
-    let normalized = raw_model_filter.trim().to_ascii_lowercase();
+    let normalized = raw_model_filter.trim();
     if normalized.is_empty() {
         return;
     }
 
     if let Some(prefix) = table_prefix {
-        sql.push_str(&format!(" AND LOWER({}.model_name) = ?", prefix));
+        sql.push_str(&format!(" AND {}.model_name = ? COLLATE NOCASE", prefix));
     } else {
-        sql.push_str(" AND LOWER(model_name) = ?");
+        sql.push_str(" AND model_name = ? COLLATE NOCASE");
     }
-    params.push(Value::Text(normalized));
+    params.push(Value::Text(normalized.to_string()));
 }
 
-const FAMILY_PATTERNS_PONYXL: &[&str] = &[
-    "%ponyxl%",
-    "%pony xl%",
-    "%pony diffusion%",
-    "%pony%",
-];
+const FAMILY_PATTERNS_PONYXL: &[&str] = &["%ponyxl%", "%pony xl%", "%pony diffusion%", "%pony%"];
 const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%"];
 const FAMILY_PATTERNS_FLUX: &[&str] = &["%flux%"];
-const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] = &[
-    "%z-image turbo%",
-    "%zimage turbo%",
-    "%z-image%",
-    "%zimage%",
-];
+const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] =
+    &["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"];
 const FAMILY_PATTERNS_SD15: &[&str] = &["%sd1.5%", "%sd15%", "%stable diffusion 1.5%"];
 const FAMILY_PATTERNS_SD21: &[&str] = &["%sd2.1%", "%sd21%", "%stable diffusion 2.1%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
@@ -2195,9 +837,21 @@ mod tests {
         insert_with_prompt(&db, "a.png", "cat hero portrait", &["cat", "hero"]);
         insert_with_prompt(&db, "b.png", "cat landscape", &["cat", "landscape"]);
 
-        let results = db.search("cat hero", 10, 0).expect("search failed");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].filepath, "a.png");
+        let page = db
+            .search_cursor(SearchCursorParams {
+                query: "cat hero",
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 10,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .expect("search failed");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].filepath, "a.png");
     }
 
     #[test]
@@ -2209,12 +863,24 @@ mod tests {
 
         let include = vec!["cat".to_string()];
         let exclude = vec!["landscape".to_string()];
-        let results = db
-            .filter_images(None, &include, &exclude, 10, 0)
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: None,
+                include_tags: &include,
+                exclude_tags: &exclude,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 10,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
             .expect("filter failed");
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].filepath, "a.png");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].filepath, "a.png");
     }
 
     #[test]
@@ -2244,11 +910,21 @@ mod tests {
         insert_with_prompt(&db, "a.png", "concatenation is fun", &[]);
         insert_with_prompt(&db, "b.png", "hello world", &[]);
 
-        let results = db
-            .search_trigram("cat", 10, 0)
+        let page = db
+            .search_cursor(SearchCursorParams {
+                query: "cat",
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 10,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
             .expect("trigram search failed");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].filepath, "a.png");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].filepath, "a.png");
     }
 
     #[test]
@@ -2259,12 +935,24 @@ mod tests {
         insert_with_prompt(&db, "b.png", "landscape painting", &["landscape"]);
 
         let include = vec!["portrait".to_string()];
-        let results = db
-            .filter_images(Some("ump"), &include, &[], 10, 0)
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: Some("ump"),
+                include_tags: &include,
+                exclude_tags: &[],
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 10,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
             .expect("filter failed");
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].filepath, "a.png");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].filepath, "a.png");
     }
 
     #[test]
@@ -2369,5 +1057,78 @@ mod tests {
         assert_eq!(mtimes.len(), 2);
         assert_eq!(mtimes.get("a.png"), Some(&1));
         assert_eq!(mtimes.get("b.png"), Some(&1));
+    }
+
+    fn explain_details(
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("failed to prepare explain query");
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("failed to execute explain query");
+
+        let mut details = Vec::new();
+        for row in rows {
+            details.push(row.expect("failed to decode explain row"));
+        }
+        details
+    }
+
+    #[test]
+    fn test_hot_query_plans_use_expected_indexes() {
+        let db = Database::new(Path::new(":memory:"), StorageProfile::Hdd)
+            .expect("failed to create in-memory db");
+        insert_with_prompt(&db, "a.png", "cat hero portrait", &["cat", "hero"]);
+        insert_with_prompt(&db, "b.png", "cat landscape", &["cat", "landscape"]);
+
+        let conn = db.pool.get().expect("failed to get db connection");
+
+        let generation_plan = explain_details(
+            &conn,
+            "SELECT id FROM images WHERE generation_type = ?1 ORDER BY id DESC LIMIT 20",
+            &[&"unknown"],
+        );
+        println!("generation_plan={generation_plan:?}");
+        assert!(
+            generation_plan
+                .iter()
+                .any(|detail| detail.contains("idx_images_generation_type_id")),
+            "expected generation_type query to use idx_images_generation_type_id, got {generation_plan:?}"
+        );
+
+        let model_plan = explain_details(
+            &conn,
+            "SELECT id FROM images WHERE model_name = ?1 COLLATE NOCASE ORDER BY id DESC LIMIT 20",
+            &[&"unknown"],
+        );
+        println!("model_plan={model_plan:?}");
+        assert!(
+            model_plan
+                .iter()
+                .any(|detail| detail.contains("idx_images_model_name_nocase_id")),
+            "expected model_name query to use idx_images_model_name_nocase_id, got {model_plan:?}"
+        );
+
+        let top_tags_plan = explain_details(
+            &conn,
+            "SELECT tags.tag, COUNT(*) as usage_count
+             FROM tags
+             JOIN image_tags ON image_tags.tag_id = tags.id
+             GROUP BY tags.id, tags.tag
+             ORDER BY usage_count DESC, tags.tag ASC
+             LIMIT 50",
+            &[],
+        );
+        println!("top_tags_plan={top_tags_plan:?}");
+        assert!(
+            top_tags_plan
+                .iter()
+                .any(|detail| detail.contains("idx_image_tags_tag_id_image_id")),
+            "expected top-tags query to use idx_image_tags_tag_id_image_id, got {top_tags_plan:?}"
+        );
     }
 }

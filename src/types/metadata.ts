@@ -9,6 +9,8 @@ export interface GalleryImageRecord {
     width: number | null;
     height: number | null;
     model_name: string | null;
+    is_favorite: boolean;
+    is_locked: boolean;
 }
 
 export interface ImageRecord extends GalleryImageRecord {
@@ -42,6 +44,53 @@ export interface FileExportResult {
     exported_count: number;
     output_path: string;
     total_bytes: number;
+}
+
+export interface DeleteImagesResult {
+    requested: number;
+    removed_from_db: number;
+    deleted_ids: number[];
+    deleted_files: number;
+    missing_files: number;
+    failed_files: number;
+    deleted_sidecars: number;
+    deleted_thumbnails: number;
+    blocked_protected: number;
+    blocked_protected_ids: number[];
+    failed_paths: string[];
+}
+
+export type DeleteMode = "trash" | "permanent";
+
+export interface MovedImageRecord {
+    id: number;
+    filepath: string;
+    filename: string;
+    directory: string;
+}
+
+export interface MoveImagesResult {
+    requested: number;
+    moved_files: number;
+    updated_in_db: number;
+    moved_ids: number[];
+    moved_items: MovedImageRecord[];
+    skipped_missing: number;
+    skipped_same_directory: number;
+    failed: number;
+    failed_paths: string[];
+}
+
+export type DeleteHistoryStatus = "pending" | "finalized" | "undone" | "failed";
+
+export interface DeleteHistoryEntry {
+    id: number;
+    mode: DeleteMode;
+    count: number;
+    status: DeleteHistoryStatus;
+    summary: string;
+    createdAt: number;
+    completedAt: number | null;
 }
 
 export type ImageExportFormat = "original" | "png" | "jpeg" | "webp" | "jxl";
@@ -125,11 +174,6 @@ export interface ForgePayloadOverrides {
     width: string;
     height: string;
     model_name: string;
-}
-
-export interface DirectoryEntry {
-    directory: string;
-    count: number;
 }
 
 export interface ModelEntry {

@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useState, useMemo, useRef } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { Gallery } from "./components/Gallery";
 import { PhotoViewer } from "./components/PhotoViewer";
 import { SearchBar } from "./components/SearchBar";
 import { Sidebar } from "./components/Sidebar";
+import { ToastHost } from "./components/ToastHost";
+import { useAppSettings } from "./hooks/useAppSettings";
+import { useForgeSettings } from "./hooks/useForgeSettings";
+import { useToast, type ShowToastOptions } from "./hooks/useToast";
 import {
     useImages,
     useLoraTags,
@@ -15,21 +19,27 @@ import {
     useTotalCount,
 } from "./hooks/useImages";
 import {
+    deleteImages,
     exportImages,
     exportImagesAsFiles,
     forgeSendToImages,
     forgeTestConnection,
     getStorageProfile,
+    moveImagesToDirectory,
     onThumbnailCacheComplete,
     onThumbnailCacheProgress,
     precacheAllThumbnails,
+    setImageFavorite,
+    setImageLocked,
+    setImagesFavorite,
+    setImagesLocked,
     setStorageProfile,
 } from "./services/commands";
 import type {
-    GenerationType,
+    DeleteMode,
+    DeleteHistoryEntry,
     GalleryImageRecord,
     ImageExportFormat,
-    SortOption,
     StorageProfile,
 } from "./types/metadata";
 
@@ -41,6 +51,8 @@ const queryClient = new QueryClient({
         },
     },
 });
+
+const DELETE_UNDO_WINDOW_MS = 6000;
 
 function parseBooruTagFilter(input: string): {
     include: string[];
@@ -139,119 +151,53 @@ function buildJpegPreferredViewerState(images: GalleryImageRecord[]): {
     };
 }
 
+interface PendingDeleteOperation {
+    activityId: number;
+    ids: number[];
+    removedItems: Array<{ image: GalleryImageRecord; index: number }>;
+    selectedBefore: number[];
+    selectedImageIdBefore: number | null;
+    mode: DeleteMode;
+    timerId: number;
+}
+
 function AppContent() {
     const [searchQuery, setSearchQuery] = useState("");
     const [selectedImageId, setSelectedImageId] = useState<number | null>(null);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
-    const [scanResult, setScanResult] = useState<{
-        total_files: number;
-        indexed: number;
-        errors: number;
-    } | null>(null);
     const [includeTags, setIncludeTags] = useState<string[]>([]);
     const [excludeTags, setExcludeTags] = useState<string[]>([]);
     const [booruTagFilterInput, setBooruTagFilterInput] = useState("");
-    const [exportMessage, setExportMessage] = useState<string | null>(null);
-    const [forgeStatusMessage, setForgeStatusMessage] = useState<string | null>(null);
     const [isTestingForge, setIsTestingForge] = useState(false);
-    const [sortBy, setSortBy] = useState<SortOption>("newest");
-    const [generationTypeFilter, setGenerationTypeFilter] = useState<
-        GenerationType | "all"
-    >("all");
-    const [columnCount, setColumnCount] = useState(
-        () => Number(localStorage.getItem("columnCount")) || 6
-    );
-    const [forgeBaseUrl, setForgeBaseUrl] = useState(
-        () => localStorage.getItem("forgeBaseUrl") ?? "http://127.0.0.1:7860"
-    );
-    const [forgeApiKey, setForgeApiKey] = useState(
-        () => localStorage.getItem("forgeApiKey") ?? ""
-    );
-    const [forgeOutputDir, setForgeOutputDir] = useState(
-        () => {
-            const saved = localStorage.getItem("forgeOutputDir");
-            if (!saved) {
-                return "";
-            }
-            const normalized = saved.trim().toLowerCase().replace(/\\/g, "/");
-            if (normalized === "upscaled" || normalized === "./upscaled") {
-                return "";
-            }
-            return saved;
-        }
-    );
-    const [forgeModelsPath, setForgeModelsPath] = useState(
-        () => localStorage.getItem("forgeModelsPath") ?? ""
-    );
-    const [forgeModelsScanSubfolders, setForgeModelsScanSubfolders] = useState(
-        () => {
-            const raw = localStorage.getItem("forgeModelsScanSubfolders");
-            return raw == null ? true : raw === "true";
-        }
-    );
-    const [forgeLoraPath, setForgeLoraPath] = useState(
-        () => localStorage.getItem("forgeLoraPath") ?? ""
-    );
-    const [forgeLoraScanSubfolders, setForgeLoraScanSubfolders] = useState(() => {
-        const raw = localStorage.getItem("forgeLoraScanSubfolders");
-        return raw == null ? true : raw === "true";
-    });
-    const [forgeSelectedLoras, setForgeSelectedLoras] = useState<string[]>(() => {
-        const raw = localStorage.getItem("forgeSelectedLoras");
-        if (!raw) {
-            return [];
-        }
-        try {
-            const parsed = JSON.parse(raw);
-            return Array.isArray(parsed)
-                ? parsed.filter((value): value is string => typeof value === "string")
-                : [];
-        } catch {
-            return [];
-        }
-    });
-    const [forgeLoraWeight, setForgeLoraWeight] = useState(
-        () => localStorage.getItem("forgeLoraWeight") ?? "1.0"
-    );
-    const [forgeIncludeSeed, setForgeIncludeSeed] = useState(() => {
-        const raw = localStorage.getItem("forgeIncludeSeed");
-        return raw == null ? true : raw === "true";
-    });
-    const [forgeAdetailerFaceEnabled, setForgeAdetailerFaceEnabled] = useState(() => {
-        const raw = localStorage.getItem("forgeAdetailerFaceEnabled");
-        return raw == null ? false : raw === "true";
-    });
-    const [forgeAdetailerFaceModel, setForgeAdetailerFaceModel] = useState(
-        () => localStorage.getItem("forgeAdetailerFaceModel") ?? "face_yolov8n.pt"
-    );
     const [isSendingForgeBatch, setIsSendingForgeBatch] = useState(false);
-    const [selectedModelFilter, setSelectedModelFilter] = useState("");
-    const [selectedLoraFilter, setSelectedLoraFilter] = useState("");
-    const [selectedCheckpointFamilies, setSelectedCheckpointFamilies] = useState<string[]>(
-        () => {
-            const raw = localStorage.getItem("selectedCheckpointFamilies");
-            if (!raw) {
-                return [];
-            }
-            try {
-                const parsed = JSON.parse(raw);
-                return Array.isArray(parsed)
-                    ? parsed.filter(
-                          (value): value is string =>
-                              typeof value === "string" && value.trim().length > 0
-                      )
-                    : [];
-            } catch {
-                return [];
-            }
-        }
-    );
-    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
-        const raw = localStorage.getItem("isSidebarCollapsed");
-        return raw == null ? false : raw === "true";
-    });
+    const [isDeletingImages, setIsDeletingImages] = useState(false);
+    const [isMovingImages, setIsMovingImages] = useState(false);
+    const [isUpdatingSelectionMarks, setIsUpdatingSelectionMarks] = useState(false);
     const [storageProfile, setStorageProfileState] =
         useState<StorageProfile>("hdd");
+    const { toast, showToast, clearToast } = useToast();
+
+    const forge = useForgeSettings();
+    const {
+        columnCount,
+        setColumnCount,
+        isSidebarCollapsed,
+        setIsSidebarCollapsed,
+        sortBy,
+        setSortBy,
+        generationTypeFilter,
+        setGenerationTypeFilter,
+        selectedModelFilter,
+        setSelectedModelFilter,
+        selectedLoraFilter,
+        setSelectedLoraFilter,
+        selectedCheckpointFamilies,
+        setSelectedCheckpointFamilies,
+        deleteMode,
+        setDeleteMode,
+        autoLockFavorites,
+        setAutoLockFavorites,
+    } = useAppSettings();
     const [isPrecachingThumbnails, setIsPrecachingThumbnails] = useState(false);
     const [thumbnailCacheProgress, setThumbnailCacheProgress] = useState<{
         current: number;
@@ -267,9 +213,66 @@ function AppContent() {
         skipped: number;
         failed: number;
     } | null>(null);
-    const [thumbnailCacheMessage, setThumbnailCacheMessage] = useState<string | null>(
-        null
+    const pendingDeleteRef = useRef<PendingDeleteOperation | null>(null);
+    const [deleteHistory, setDeleteHistory] = useState<DeleteHistoryEntry[]>([]);
+    const deleteHistoryIdRef = useRef(0);
+
+    const pushToast = useCallback(
+        (message: string, options?: ShowToastOptions) => {
+            showToast(message, options);
+        },
+        [showToast]
     );
+
+    const appendDeleteHistory = useCallback(
+        (mode: DeleteMode, count: number, summary: string): number => {
+            deleteHistoryIdRef.current += 1;
+            const id = deleteHistoryIdRef.current;
+            setDeleteHistory((previous) =>
+                [
+                    {
+                        id,
+                        mode,
+                        count,
+                        status: "pending" as const,
+                        summary,
+                        createdAt: Date.now(),
+                        completedAt: null,
+                    },
+                    ...previous,
+                ].slice(0, 40)
+            );
+            return id;
+        },
+        []
+    );
+
+    const updateDeleteHistory = useCallback(
+        (
+            id: number,
+            status: DeleteHistoryEntry["status"],
+            summary: string
+        ) => {
+            setDeleteHistory((previous) =>
+                previous.map((entry) =>
+                    entry.id === id
+                        ? {
+                              ...entry,
+                              status,
+                              summary,
+                              completedAt:
+                                  status === "pending" ? entry.completedAt : Date.now(),
+                          }
+                        : entry
+                )
+            );
+        },
+        []
+    );
+
+    const clearDeleteHistory = useCallback(() => {
+        setDeleteHistory([]);
+    }, []);
 
     const {
         data,
@@ -398,79 +401,8 @@ function AppContent() {
     const { data: loraTags = [] } = useLoraTags(1000);
 
     const scanMutation = useScanDirectory();
-    const { progress: scanProgress, isScanning } = useScanProgress();
+    const { progress: scanProgress, scanResult, isScanning } = useScanProgress();
 
-    useEffect(() => {
-        localStorage.setItem("forgeBaseUrl", forgeBaseUrl);
-    }, [forgeBaseUrl]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeApiKey", forgeApiKey);
-    }, [forgeApiKey]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeOutputDir", forgeOutputDir);
-    }, [forgeOutputDir]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeModelsPath", forgeModelsPath);
-    }, [forgeModelsPath]);
-
-    useEffect(() => {
-        localStorage.setItem(
-            "forgeModelsScanSubfolders",
-            String(forgeModelsScanSubfolders)
-        );
-    }, [forgeModelsScanSubfolders]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeLoraPath", forgeLoraPath);
-    }, [forgeLoraPath]);
-
-    useEffect(() => {
-        localStorage.setItem(
-            "forgeLoraScanSubfolders",
-            String(forgeLoraScanSubfolders)
-        );
-    }, [forgeLoraScanSubfolders]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeSelectedLoras", JSON.stringify(forgeSelectedLoras));
-    }, [forgeSelectedLoras]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeLoraWeight", forgeLoraWeight);
-    }, [forgeLoraWeight]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeIncludeSeed", String(forgeIncludeSeed));
-    }, [forgeIncludeSeed]);
-
-    useEffect(() => {
-        localStorage.setItem(
-            "forgeAdetailerFaceEnabled",
-            String(forgeAdetailerFaceEnabled)
-        );
-    }, [forgeAdetailerFaceEnabled]);
-
-    useEffect(() => {
-        localStorage.setItem("forgeAdetailerFaceModel", forgeAdetailerFaceModel);
-    }, [forgeAdetailerFaceModel]);
-
-    useEffect(() => {
-        localStorage.setItem("columnCount", String(columnCount));
-    }, [columnCount]);
-
-    useEffect(() => {
-        localStorage.setItem("isSidebarCollapsed", String(isSidebarCollapsed));
-    }, [isSidebarCollapsed]);
-
-    useEffect(() => {
-        localStorage.setItem(
-            "selectedCheckpointFamilies",
-            JSON.stringify(selectedCheckpointFamilies)
-        );
-    }, [selectedCheckpointFamilies]);
 
     useEffect(() => {
         let cancelled = false;
@@ -503,7 +435,6 @@ function AppContent() {
                 setIsPrecachingThumbnails(true);
                 setThumbnailCacheProgress(progress);
                 setThumbnailCacheResult(null);
-                setThumbnailCacheMessage(null);
             });
 
             unlistenComplete = await onThumbnailCacheComplete((result) => {
@@ -511,10 +442,11 @@ function AppContent() {
                 setIsPrecachingThumbnails(false);
                 setThumbnailCacheProgress(null);
                 setThumbnailCacheResult(result);
-                setThumbnailCacheMessage(
+                pushToast(
                     result.failed > 0
-                        ? `Cache finished with ${result.failed} failures`
-                        : "Thumbnail cache completed"
+                        ? `Thumbnail cache finished with ${result.failed} failed file${result.failed === 1 ? "" : "s"}.`
+                        : "Thumbnail cache completed.",
+                    { tone: result.failed > 0 ? "warning" : "success" }
                 );
             });
         };
@@ -525,7 +457,7 @@ function AppContent() {
             if (unlistenProgress) unlistenProgress();
             if (unlistenComplete) unlistenComplete();
         };
-    }, []);
+    }, [pushToast]);
 
     const handleSearch = useCallback((query: string) => {
         setSearchQuery(query);
@@ -533,11 +465,7 @@ function AppContent() {
 
     const handleScan = useCallback(
         (directory: string) => {
-            scanMutation.mutate(directory, {
-                onSuccess: () => {
-                    setScanResult(null);
-                },
-            });
+            scanMutation.mutate(directory);
         },
         [scanMutation]
     );
@@ -555,16 +483,17 @@ function AppContent() {
     );
 
     const handlePrecacheAllThumbnails = useCallback(async () => {
-        setThumbnailCacheMessage(null);
         setThumbnailCacheResult(null);
         try {
             await precacheAllThumbnails();
             setIsPrecachingThumbnails(true);
         } catch (error) {
             setIsPrecachingThumbnails(false);
-            setThumbnailCacheMessage(`Failed to start cache: ${String(error)}`);
+            pushToast(`Failed to start thumbnail cache: ${String(error)}`, {
+                tone: "error",
+            });
         }
-    }, []);
+    }, [pushToast]);
 
     const handleLoadMore = useCallback(() => {
         if (hasNextPage && !isFetchingNextPage) {
@@ -593,6 +522,742 @@ function AppContent() {
         setSelectedIds(new Set());
     }, []);
 
+    const invalidateImageQueries = useCallback(() => {
+        queryClient.invalidateQueries({ queryKey: ["images"] });
+        queryClient.invalidateQueries({ queryKey: ["totalCount"] });
+        queryClient.invalidateQueries({ queryKey: ["topTags"] });
+        queryClient.invalidateQueries({ queryKey: ["models"] });
+    }, []);
+
+    const finalizeDeleteOperation = useCallback(
+        async (operation: PendingDeleteOperation) => {
+            setIsDeletingImages(true);
+            try {
+                const result = await deleteImages(operation.ids, operation.mode);
+                invalidateImageQueries();
+
+                const deletedLabel =
+                    operation.mode === "trash" ? "Moved to Trash" : "Deleted";
+                if (result.removed_from_db > 0) {
+                    pushToast(
+                        `${deletedLabel} ${result.removed_from_db} image${
+                            result.removed_from_db === 1 ? "" : "s"
+                        }.`,
+                        {
+                            tone:
+                                result.failed_files > 0 || result.blocked_protected > 0
+                                    ? "warning"
+                                    : "success",
+                        }
+                    );
+                    updateDeleteHistory(
+                        operation.activityId,
+                        "finalized",
+                        `${deletedLabel} ${result.removed_from_db} image${
+                            result.removed_from_db === 1 ? "" : "s"
+                        }${result.failed_files > 0 ? ` (${result.failed_files} failed)` : ""}.`
+                    );
+                } else {
+                    pushToast("No images were deleted.", { tone: "warning" });
+                    updateDeleteHistory(
+                        operation.activityId,
+                        "finalized",
+                        "No images were deleted."
+                    );
+                }
+
+                if (result.blocked_protected > 0) {
+                    pushToast(
+                        `Skipped ${result.blocked_protected} protected image${
+                            result.blocked_protected === 1 ? "" : "s"
+                        }. Unlock or unfavorite them first.`,
+                        { tone: "warning", durationMs: 4200 }
+                    );
+                }
+
+                if (result.failed_files > 0) {
+                    const firstFailure = result.failed_paths[0] ?? "unknown path";
+                    pushToast(
+                        `Failed to delete ${result.failed_files} file${
+                            result.failed_files === 1 ? "" : "s"
+                        } (e.g. ${firstFailure}).`,
+                        { tone: "error", durationMs: 5200 }
+                    );
+                }
+            } catch (error) {
+                pushToast(`Delete failed: ${String(error)}`, { tone: "error" });
+                updateDeleteHistory(
+                    operation.activityId,
+                    "failed",
+                    `Delete failed: ${String(error)}`
+                );
+                setImages((previous) => {
+                    const existing = new Set(previous.map((image) => image.id));
+                    const next = [...previous];
+                    const ordered = operation.removedItems
+                        .slice()
+                        .sort((left, right) => left.index - right.index);
+                    for (const { image, index } of ordered) {
+                        if (existing.has(image.id)) {
+                            continue;
+                        }
+                        next.splice(Math.min(index, next.length), 0, image);
+                        existing.add(image.id);
+                    }
+                    return next;
+                });
+                setSelectedIds((previous) => {
+                    const next = new Set(previous);
+                    for (const id of operation.selectedBefore) {
+                        next.add(id);
+                    }
+                    return next;
+                });
+                if (operation.selectedImageIdBefore != null) {
+                    setSelectedImageId(operation.selectedImageIdBefore);
+                }
+            } finally {
+                setIsDeletingImages(false);
+            }
+        },
+        [invalidateImageQueries, pushToast, updateDeleteHistory]
+    );
+
+    const undoPendingDelete = useCallback(() => {
+        const pending = pendingDeleteRef.current;
+        if (!pending) {
+            return;
+        }
+        window.clearTimeout(pending.timerId);
+        pendingDeleteRef.current = null;
+
+        setImages((previous) => {
+            const existing = new Set(previous.map((image) => image.id));
+            const next = [...previous];
+            const ordered = pending.removedItems
+                .slice()
+                .sort((left, right) => left.index - right.index);
+            for (const { image, index } of ordered) {
+                if (existing.has(image.id)) {
+                    continue;
+                }
+                next.splice(Math.min(index, next.length), 0, image);
+                existing.add(image.id);
+            }
+            return next;
+        });
+        setSelectedIds((previous) => {
+            const next = new Set(previous);
+            for (const id of pending.selectedBefore) {
+                next.add(id);
+            }
+            return next;
+        });
+        if (pending.selectedImageIdBefore != null) {
+            setSelectedImageId(pending.selectedImageIdBefore);
+        }
+
+        updateDeleteHistory(pending.activityId, "undone", "Deletion undone.");
+        pushToast("Deletion undone.", { tone: "success", durationMs: 2200 });
+    }, [pushToast, updateDeleteHistory]);
+
+    const flushPendingDelete = useCallback(async () => {
+        const pending = pendingDeleteRef.current;
+        if (!pending) {
+            return;
+        }
+        window.clearTimeout(pending.timerId);
+        pendingDeleteRef.current = null;
+        await finalizeDeleteOperation(pending);
+    }, [finalizeDeleteOperation]);
+
+    const scheduleDelete = useCallback(
+        async (
+            ids: number[],
+            confirmMessage: string,
+            fallbackViewerImageId: number | null = null
+        ) => {
+            const requestedIds = Array.from(new Set(ids));
+            if (requestedIds.length === 0 || isDeletingImages || isMovingImages) {
+                return;
+            }
+            await flushPendingDelete();
+            if (!window.confirm(confirmMessage)) {
+                return;
+            }
+
+            const requestedSet = new Set(requestedIds);
+            const protectedRecords = images.filter(
+                (image) =>
+                    requestedSet.has(image.id) &&
+                    (image.is_locked || image.is_favorite)
+            );
+            const protectedIds = protectedRecords
+                .map((image) => image.id);
+            const protectedSet = new Set(protectedIds);
+            const deletableIds = requestedIds.filter((id) => !protectedSet.has(id));
+
+            if (protectedRecords.length > 0) {
+                const lockedOnly = protectedRecords.filter(
+                    (image) => image.is_locked && !image.is_favorite
+                ).length;
+                const favoriteOnly = protectedRecords.filter(
+                    (image) => image.is_favorite && !image.is_locked
+                ).length;
+                const lockedAndFavorite = protectedRecords.filter(
+                    (image) => image.is_locked && image.is_favorite
+                ).length;
+                const reasons: string[] = [];
+                if (lockedOnly > 0) {
+                    reasons.push(`${lockedOnly} locked`);
+                }
+                if (favoriteOnly > 0) {
+                    reasons.push(`${favoriteOnly} favorited`);
+                }
+                if (lockedAndFavorite > 0) {
+                    reasons.push(`${lockedAndFavorite} locked+favorited`);
+                }
+                pushToast(
+                    `Skipped ${protectedRecords.length} protected image${
+                        protectedRecords.length === 1 ? "" : "s"
+                    } (${reasons.join(", ")}).`,
+                    { tone: "warning", durationMs: 4200 }
+                );
+            }
+            if (deletableIds.length === 0) {
+                return;
+            }
+
+            const deletedSet = new Set(deletableIds);
+            const removedItems = images
+                .map((image, index) => ({ image, index }))
+                .filter(({ image }) => deletedSet.has(image.id));
+            if (removedItems.length === 0) {
+                return;
+            }
+
+            const selectedBefore = deletableIds.filter((id) => selectedIds.has(id));
+            const selectedImageIdBefore = selectedImageId;
+
+            setImages((previous) =>
+                previous.filter((image) => !deletedSet.has(image.id))
+            );
+            setSelectedIds((previous) => {
+                const next = new Set(previous);
+                for (const id of deletableIds) {
+                    next.delete(id);
+                }
+                return next;
+            });
+            setSelectedImageId((previous) => {
+                if (previous == null || !deletedSet.has(previous)) {
+                    return previous;
+                }
+                return fallbackViewerImageId;
+            });
+
+            const timerId = window.setTimeout(() => {
+                const pending = pendingDeleteRef.current;
+                if (!pending || pending.timerId !== timerId) {
+                    return;
+                }
+                pendingDeleteRef.current = null;
+                void finalizeDeleteOperation(pending);
+            }, DELETE_UNDO_WINDOW_MS);
+
+            const actionPrefix = deleteMode === "trash" ? "Move to Trash" : "Delete";
+            const activityId = appendDeleteHistory(
+                deleteMode,
+                deletableIds.length,
+                `${actionPrefix} ${deletableIds.length} image${
+                    deletableIds.length === 1 ? "" : "s"
+                } (pending undo)`
+            );
+
+            pendingDeleteRef.current = {
+                activityId,
+                ids: deletableIds,
+                removedItems,
+                selectedBefore,
+                selectedImageIdBefore,
+                mode: deleteMode,
+                timerId,
+            };
+
+            pushToast(
+                `${
+                    deleteMode === "trash"
+                        ? `Queued ${deletableIds.length} image${
+                              deletableIds.length === 1 ? "" : "s"
+                          } for Trash.`
+                        : `Queued ${deletableIds.length} image${
+                              deletableIds.length === 1 ? "" : "s"
+                          } for permanent deletion.`
+                }`,
+                {
+                    tone: "warning",
+                    durationMs: DELETE_UNDO_WINDOW_MS,
+                    actionLabel: "Undo",
+                    onAction: undoPendingDelete,
+                }
+            );
+        },
+        [
+            deleteMode,
+            finalizeDeleteOperation,
+            flushPendingDelete,
+            isDeletingImages,
+            isMovingImages,
+            images,
+            appendDeleteHistory,
+            pushToast,
+            selectedIds,
+            selectedImageId,
+            undoPendingDelete,
+        ]
+    );
+
+    useEffect(() => {
+        return () => {
+            const pending = pendingDeleteRef.current;
+            if (!pending) {
+                return;
+            }
+            window.clearTimeout(pending.timerId);
+        };
+    }, []);
+
+    const handleDeleteSelected = useCallback(async () => {
+        if (selectedIds.size === 0) {
+            pushToast("Select images to delete first.", { tone: "warning" });
+            return;
+        }
+        const ids = Array.from(selectedIds);
+        const actionLabel =
+            deleteMode === "trash" ? "move to Trash" : "permanently delete";
+        await scheduleDelete(
+            ids,
+            `${
+                deleteMode === "trash" ? "Move" : "Delete"
+            } ${ids.length} selected image${
+                ids.length === 1 ? "" : "s"
+            } from disk (${actionLabel})?`,
+        );
+    }, [deleteMode, pushToast, scheduleDelete, selectedIds]);
+
+    const handleDeleteImageFromViewer = useCallback(
+        async (image: GalleryImageRecord) => {
+            const viewerImages = viewerImageState.viewerImages;
+            const index = viewerImages.findIndex((entry) => entry.id === image.id);
+            let fallbackViewerImageId: number | null = null;
+            if (index >= 0 && viewerImages.length > 1) {
+                const fallbackIndex =
+                    index < viewerImages.length - 1 ? index + 1 : index - 1;
+                fallbackViewerImageId = viewerImages[fallbackIndex]?.id ?? null;
+            }
+
+            const actionLabel =
+                deleteMode === "trash" ? "move to Trash" : "permanently delete";
+            await scheduleDelete(
+                [image.id],
+                `${
+                    deleteMode === "trash" ? "Move" : "Delete"
+                } ${image.filename} from disk (${actionLabel})?`,
+                fallbackViewerImageId
+            );
+        },
+        [deleteMode, scheduleDelete, viewerImageState]
+    );
+
+    const handleMoveSelectedToFolder = useCallback(async () => {
+        if (selectedIds.size === 0) {
+            pushToast("Select images to move first.", { tone: "warning" });
+            return;
+        }
+        if (isDeletingImages || isMovingImages || isUpdatingSelectionMarks) {
+            return;
+        }
+
+        const selected = await open({
+            directory: true,
+            multiple: false,
+            title: "Move selected images to folder",
+        });
+        if (!selected || typeof selected !== "string") {
+            return;
+        }
+        await flushPendingDelete();
+
+        const ids = Array.from(selectedIds);
+        setIsMovingImages(true);
+        try {
+            const result = await moveImagesToDirectory(ids, selected);
+            const movedById = new Map(
+                result.moved_items.map((item) => [item.id, item] as const)
+            );
+            if (movedById.size > 0) {
+                setImages((previous) =>
+                    previous.map((entry) => {
+                        const moved = movedById.get(entry.id);
+                        if (!moved) {
+                            return entry;
+                        }
+                        return {
+                            ...entry,
+                            filepath: moved.filepath,
+                            filename: moved.filename,
+                            directory: moved.directory,
+                        };
+                    })
+                );
+                invalidateImageQueries();
+            }
+
+            if (result.moved_files > 0) {
+                pushToast(
+                    `Moved ${result.moved_files} image${
+                        result.moved_files === 1 ? "" : "s"
+                    } to ${selected}.`,
+                    { tone: result.failed > 0 ? "warning" : "success" }
+                );
+            } else if (result.skipped_same_directory > 0) {
+                pushToast(
+                    "Selected images are already in that folder.",
+                    { tone: "warning" }
+                );
+            } else {
+                pushToast("No images were moved.", { tone: "warning" });
+            }
+
+            if (result.failed > 0) {
+                const firstFailure = result.failed_paths[0] ?? "unknown file";
+                pushToast(
+                    `Failed to move ${result.failed} image${
+                        result.failed === 1 ? "" : "s"
+                    } (e.g. ${firstFailure}).`,
+                    { tone: "error", durationMs: 5200 }
+                );
+            }
+        } catch (error) {
+            pushToast(`Move failed: ${String(error)}`, { tone: "error" });
+        } finally {
+            setIsMovingImages(false);
+        }
+    }, [
+        flushPendingDelete,
+        invalidateImageQueries,
+        isDeletingImages,
+        isMovingImages,
+        isUpdatingSelectionMarks,
+        pushToast,
+        selectedIds,
+    ]);
+
+    const handleBulkFavoriteSelected = useCallback(
+        async (isFavorite: boolean) => {
+            if (selectedIds.size === 0) {
+                pushToast("Select images first.", { tone: "warning" });
+                return;
+            }
+            if (isDeletingImages || isMovingImages || isUpdatingSelectionMarks) {
+                return;
+            }
+
+            const selectedSet = new Set(selectedIds);
+            const selectedRecords = images.filter((image) => selectedSet.has(image.id));
+            const previousById = new Map(
+                selectedRecords.map((image) => [
+                    image.id,
+                    {
+                        is_favorite: image.is_favorite,
+                        is_locked: image.is_locked,
+                    },
+                ])
+            );
+
+            const favoriteTargetIds = selectedRecords
+                .filter((image) => image.is_favorite !== isFavorite)
+                .map((image) => image.id);
+            const lockTargetIds =
+                isFavorite && autoLockFavorites
+                    ? selectedRecords
+                          .filter((image) => !image.is_locked)
+                          .map((image) => image.id)
+                    : [];
+
+            if (favoriteTargetIds.length === 0 && lockTargetIds.length === 0) {
+                pushToast(
+                    isFavorite
+                        ? "Selected images are already favorited."
+                        : "Selected images are already not favorited.",
+                    { tone: "warning" }
+                );
+                return;
+            }
+
+            setIsUpdatingSelectionMarks(true);
+            setImages((previous) =>
+                previous.map((entry) => {
+                    if (!selectedSet.has(entry.id)) {
+                        return entry;
+                    }
+                    return {
+                        ...entry,
+                        is_favorite: isFavorite,
+                        is_locked:
+                            isFavorite && autoLockFavorites
+                                ? true
+                                : entry.is_locked,
+                    };
+                })
+            );
+
+            try {
+                if (favoriteTargetIds.length > 0) {
+                    await setImagesFavorite(favoriteTargetIds, isFavorite);
+                }
+
+                if (lockTargetIds.length > 0) {
+                    try {
+                        await setImagesLocked(lockTargetIds, true);
+                    } catch (error) {
+                        setImages((previous) =>
+                            previous.map((entry) => {
+                                const prior = previousById.get(entry.id);
+                                if (!prior) {
+                                    return entry;
+                                }
+                                return {
+                                    ...entry,
+                                    is_locked: prior.is_locked,
+                                };
+                            })
+                        );
+                        pushToast(
+                            `Favorites updated, but auto-lock failed: ${String(error)}`,
+                            { tone: "warning" }
+                        );
+                        return;
+                    }
+                }
+
+                const affectedCount = new Set([
+                    ...favoriteTargetIds,
+                    ...lockTargetIds,
+                ]).size;
+                const message = isFavorite
+                    ? `Favorited ${affectedCount} selected image${
+                          affectedCount === 1 ? "" : "s"
+                      }.`
+                    : `Unfavorited ${affectedCount} selected image${
+                          affectedCount === 1 ? "" : "s"
+                      }.`;
+                pushToast(message, { tone: "success", durationMs: 2400 });
+            } catch (error) {
+                setImages((previous) =>
+                    previous.map((entry) => {
+                        const prior = previousById.get(entry.id);
+                        if (!prior) {
+                            return entry;
+                        }
+                        return {
+                            ...entry,
+                            is_favorite: prior.is_favorite,
+                            is_locked: prior.is_locked,
+                        };
+                    })
+                );
+                pushToast(`Bulk favorite update failed: ${String(error)}`, {
+                    tone: "error",
+                });
+            } finally {
+                setIsUpdatingSelectionMarks(false);
+            }
+        },
+        [
+            autoLockFavorites,
+            images,
+            isDeletingImages,
+            isMovingImages,
+            isUpdatingSelectionMarks,
+            pushToast,
+            selectedIds,
+        ]
+    );
+
+    const handleBulkLockSelected = useCallback(
+        async (isLocked: boolean) => {
+            if (selectedIds.size === 0) {
+                pushToast("Select images first.", { tone: "warning" });
+                return;
+            }
+            if (isDeletingImages || isMovingImages || isUpdatingSelectionMarks) {
+                return;
+            }
+
+            const selectedSet = new Set(selectedIds);
+            const selectedRecords = images.filter((image) => selectedSet.has(image.id));
+            const previousById = new Map(
+                selectedRecords.map((image) => [image.id, image.is_locked])
+            );
+            const lockTargetIds = selectedRecords
+                .filter((image) => image.is_locked !== isLocked)
+                .map((image) => image.id);
+
+            if (lockTargetIds.length === 0) {
+                pushToast(
+                    isLocked
+                        ? "Selected images are already locked."
+                        : "Selected images are already unlocked.",
+                    { tone: "warning" }
+                );
+                return;
+            }
+
+            setIsUpdatingSelectionMarks(true);
+            setImages((previous) =>
+                previous.map((entry) =>
+                    selectedSet.has(entry.id) ? { ...entry, is_locked: isLocked } : entry
+                )
+            );
+
+            try {
+                await setImagesLocked(lockTargetIds, isLocked);
+                const message = isLocked
+                    ? `Locked ${lockTargetIds.length} selected image${
+                          lockTargetIds.length === 1 ? "" : "s"
+                      }.`
+                    : `Unlocked ${lockTargetIds.length} selected image${
+                          lockTargetIds.length === 1 ? "" : "s"
+                      }.`;
+                pushToast(message, { tone: "success", durationMs: 2400 });
+            } catch (error) {
+                setImages((previous) =>
+                    previous.map((entry) => {
+                        const prior = previousById.get(entry.id);
+                        if (prior == null) {
+                            return entry;
+                        }
+                        return {
+                            ...entry,
+                            is_locked: prior,
+                        };
+                    })
+                );
+                pushToast(`Bulk lock update failed: ${String(error)}`, {
+                    tone: "error",
+                });
+            } finally {
+                setIsUpdatingSelectionMarks(false);
+            }
+        },
+        [
+            images,
+            isDeletingImages,
+            isMovingImages,
+            isUpdatingSelectionMarks,
+            pushToast,
+            selectedIds,
+        ]
+    );
+
+    const handleToggleFavorite = useCallback(
+        async (image: GalleryImageRecord) => {
+            const nextValue = !image.is_favorite;
+            const shouldAutoLock =
+                nextValue && autoLockFavorites && !image.is_locked;
+            setImages((previous) =>
+                previous.map((entry) =>
+                    entry.id === image.id
+                        ? {
+                              ...entry,
+                              is_favorite: nextValue,
+                              is_locked:
+                                  shouldAutoLock ? true : entry.is_locked,
+                          }
+                        : entry
+                )
+            );
+            let favoriteSaved = false;
+            try {
+                await setImageFavorite(image.id, nextValue);
+                favoriteSaved = true;
+                if (shouldAutoLock) {
+                    await setImageLocked(image.id, true);
+                }
+                pushToast(
+                    nextValue
+                        ? shouldAutoLock
+                            ? "Added to favorites and auto-locked."
+                            : "Added to favorites."
+                        : "Removed from favorites.",
+                    { tone: "success", durationMs: 2000 }
+                );
+            } catch (error) {
+                if (favoriteSaved) {
+                    setImages((previous) =>
+                        previous.map((entry) =>
+                            entry.id === image.id
+                                ? {
+                                      ...entry,
+                                      is_favorite: nextValue,
+                                      is_locked: image.is_locked,
+                                  }
+                                : entry
+                        )
+                    );
+                    pushToast(
+                        `Favorite saved, but auto-lock failed: ${String(error)}`,
+                        { tone: "warning" }
+                    );
+                    return;
+                }
+
+                setImages((previous) =>
+                    previous.map((entry) =>
+                        entry.id === image.id
+                            ? {
+                                  ...entry,
+                                  is_favorite: image.is_favorite,
+                                  is_locked: image.is_locked,
+                              }
+                            : entry
+                    )
+                );
+                pushToast(`Favorite update failed: ${String(error)}`, { tone: "error" });
+            }
+        },
+        [autoLockFavorites, pushToast]
+    );
+
+    const handleToggleLocked = useCallback(
+        async (image: GalleryImageRecord) => {
+            const nextValue = !image.is_locked;
+            setImages((previous) =>
+                previous.map((entry) =>
+                    entry.id === image.id ? { ...entry, is_locked: nextValue } : entry
+                )
+            );
+            try {
+                await setImageLocked(image.id, nextValue);
+                pushToast(
+                    nextValue
+                        ? "Image locked from deletion."
+                        : "Image unlocked.",
+                    { tone: "success", durationMs: 2200 }
+                );
+            } catch (error) {
+                setImages((previous) =>
+                    previous.map((entry) =>
+                        entry.id === image.id ? { ...entry, is_locked: image.is_locked } : entry
+                    )
+                );
+                pushToast(`Lock update failed: ${String(error)}`, { tone: "error" });
+            }
+        },
+        [pushToast]
+    );
+
     const toggleCheckpointFamilyFilter = useCallback((family: string) => {
         const normalized = family.trim().toLowerCase();
         if (!normalized) {
@@ -604,11 +1269,11 @@ function AppContent() {
             }
             return [...previous, normalized];
         });
-    }, []);
+    }, [setSelectedCheckpointFamilies]);
 
     const clearCheckpointFamilyFilters = useCallback(() => {
         setSelectedCheckpointFamilies([]);
-    }, []);
+    }, [setSelectedCheckpointFamilies]);
 
     const addTag = useCallback(
         (kind: "include" | "exclude", tag: string) => {
@@ -663,14 +1328,15 @@ function AppContent() {
                     format,
                     outputPath
                 );
-                setExportMessage(
-                    `Exported ${result.exported_count} images to ${result.output_path}`
+                pushToast(
+                    `Exported ${result.exported_count} image${result.exported_count === 1 ? "" : "s"} to ${result.output_path}`,
+                    { tone: "success" }
                 );
             } catch (error) {
-                setExportMessage(`Export failed: ${String(error)}`);
+                pushToast(`Export failed: ${String(error)}`, { tone: "error" });
             }
         },
-        [selectedIds]
+        [pushToast, selectedIds]
     );
 
     const handleExportAsFiles = useCallback(
@@ -690,7 +1356,7 @@ function AppContent() {
             }
 
             try {
-                setExportMessage("Exporting...");
+                pushToast("Export started…", { tone: "info", durationMs: 1800 });
                 const result = await exportImagesAsFiles(
                     Array.from(selectedIds),
                     format,
@@ -698,71 +1364,78 @@ function AppContent() {
                     outputPath
                 );
                 const sizeMB = (result.total_bytes / (1024 * 1024)).toFixed(1);
-                setExportMessage(
-                    `Exported ${result.exported_count} images (${sizeMB} MB)`
+                pushToast(
+                    `Exported ${result.exported_count} image${result.exported_count === 1 ? "" : "s"} (${sizeMB} MB).`,
+                    { tone: "success" }
                 );
             } catch (error) {
-                setExportMessage(`Export failed: ${String(error)}`);
+                pushToast(`Export failed: ${String(error)}`, { tone: "error" });
             }
         },
-        [selectedIds]
+        [pushToast, selectedIds]
     );
 
     const handleForgeTestConnection = useCallback(async () => {
         setIsTestingForge(true);
         try {
             const status = await forgeTestConnection(
-                forgeBaseUrl,
-                forgeApiKey.trim() ? forgeApiKey : null
+                forge.forgeBaseUrl,
+                forge.forgeApiKey.trim() ? forge.forgeApiKey : null
             );
-            setForgeStatusMessage(status.message);
+            pushToast(status.message, { tone: status.ok ? "success" : "warning" });
         } catch (error) {
-            setForgeStatusMessage(`Connection failed: ${String(error)}`);
+            pushToast(`Connection failed: ${String(error)}`, { tone: "error" });
         } finally {
             setIsTestingForge(false);
         }
-    }, [forgeApiKey, forgeBaseUrl]);
+    }, [forge.forgeApiKey, forge.forgeBaseUrl, pushToast]);
 
     const handleForgeSendSelected = useCallback(async () => {
         if (selectedIds.size === 0) {
-            setForgeStatusMessage("No images selected for Forge queue");
+            pushToast("No images selected for Forge queue.", { tone: "warning" });
+            return;
+        }
+
+        const parsedLoraWeight = forge.forgeLoraWeight.trim()
+            ? Number(forge.forgeLoraWeight)
+            : null;
+        if (
+            parsedLoraWeight != null &&
+            (!Number.isFinite(parsedLoraWeight) ||
+                parsedLoraWeight < 0 ||
+                parsedLoraWeight > 2)
+        ) {
+            pushToast("LoRA weight must be between 0 and 2 before queueing.", {
+                tone: "error",
+            });
             return;
         }
 
         setIsSendingForgeBatch(true);
-        setForgeStatusMessage(
-            `Queueing ${selectedIds.size} image${selectedIds.size === 1 ? "" : "s"}...`
+        pushToast(
+            `Queueing ${selectedIds.size} image${selectedIds.size === 1 ? "" : "s"}...`,
+            { tone: "info", durationMs: 1800 }
         );
         try {
             const result = await forgeSendToImages(
                 Array.from(selectedIds),
-                forgeBaseUrl,
-                forgeApiKey.trim() ? forgeApiKey : null,
-                forgeOutputDir.trim() ? forgeOutputDir : null,
-                forgeIncludeSeed,
-                forgeAdetailerFaceEnabled,
-                forgeAdetailerFaceModel.trim() ? forgeAdetailerFaceModel : null,
-                forgeSelectedLoras.length > 0 ? forgeSelectedLoras : null,
-                forgeLoraWeight.trim() ? Number(forgeLoraWeight) : null,
+                forge.forgeBaseUrl,
+                forge.forgeApiKey.trim() ? forge.forgeApiKey : null,
+                forge.forgeOutputDir.trim() ? forge.forgeOutputDir : null,
+                forge.forgeIncludeSeed,
+                forge.forgeAdetailerFaceEnabled,
+                forge.forgeAdetailerFaceModel.trim() ? forge.forgeAdetailerFaceModel : null,
+                forge.forgeSelectedLoras.length > 0 ? forge.forgeSelectedLoras : null,
+                parsedLoraWeight,
                 null
             );
-            setForgeStatusMessage(result.message);
+            pushToast(result.message, { tone: result.failed > 0 ? "warning" : "success" });
         } catch (error) {
-            setForgeStatusMessage(`Forge queue failed: ${String(error)}`);
+            pushToast(`Forge queue failed: ${String(error)}`, { tone: "error" });
         } finally {
             setIsSendingForgeBatch(false);
         }
-    }, [
-        forgeApiKey,
-        forgeAdetailerFaceEnabled,
-        forgeAdetailerFaceModel,
-        forgeBaseUrl,
-        forgeIncludeSeed,
-        forgeLoraWeight,
-        forgeSelectedLoras,
-        forgeOutputDir,
-        selectedIds,
-    ]);
+    }, [forge, pushToast, selectedIds]);
 
     const handleNavigateViewer = useCallback(
         (index: number) => {
@@ -803,6 +1476,46 @@ function AppContent() {
         [loraTags]
     );
 
+    const hasSearchQuery = searchQuery.trim().length > 0;
+    const hasSidebarTagFilters = includeTags.length > 0 || excludeTags.length > 0;
+    const hasFilterControls =
+        generationTypeFilter !== "all" ||
+        selectedModelFilter.trim().length > 0 ||
+        selectedLoraFilter.trim().length > 0 ||
+        selectedCheckpointFamilies.length > 0;
+    const hasAnyFilters = hasSearchQuery || hasSidebarTagFilters || hasFilterControls;
+
+    const galleryEmptyState = useMemo(() => {
+        if (totalCount === 0) {
+            return {
+                title: "No images loaded",
+                message: "Select a folder to scan for AI-generated images.",
+            };
+        }
+
+        if (hasSearchQuery) {
+            return {
+                title: "No images match your search",
+                message: "Try broader keywords or clear search terms.",
+            };
+        }
+
+        if (hasAnyFilters) {
+            return {
+                title: "No images match current filters",
+                message: "Clear tags or model filters to widen results.",
+            };
+        }
+
+        return {
+            title: "No images available",
+            message: "Rescan your folder if images should appear here.",
+        };
+    }, [hasAnyFilters, hasSearchQuery, totalCount]);
+
+    const isGalleryMutationInFlight =
+        isDeletingImages || isMovingImages || isUpdatingSelectionMarks;
+
     return (
         <div className="app-layout">
             <Sidebar
@@ -828,32 +1541,41 @@ function AppContent() {
                 selectedCount={selectedIds.size}
                 onExportSelected={handleExportSelected}
                 onExportAsFiles={handleExportAsFiles}
-                forgeBaseUrl={forgeBaseUrl}
-                forgeApiKey={forgeApiKey}
-                onForgeBaseUrlChange={setForgeBaseUrl}
-                onForgeApiKeyChange={setForgeApiKey}
-                forgeOutputDir={forgeOutputDir}
-                onForgeOutputDirChange={setForgeOutputDir}
-                forgeModelsPath={forgeModelsPath}
-                onForgeModelsPathChange={setForgeModelsPath}
-                forgeModelsScanSubfolders={forgeModelsScanSubfolders}
-                onForgeModelsScanSubfoldersChange={setForgeModelsScanSubfolders}
-                forgeLoraPath={forgeLoraPath}
-                onForgeLoraPathChange={setForgeLoraPath}
-                forgeLoraScanSubfolders={forgeLoraScanSubfolders}
-                onForgeLoraScanSubfoldersChange={setForgeLoraScanSubfolders}
-                forgeIncludeSeed={forgeIncludeSeed}
-                onForgeIncludeSeedChange={setForgeIncludeSeed}
-                forgeAdetailerFaceEnabled={forgeAdetailerFaceEnabled}
-                onForgeAdetailerFaceEnabledChange={setForgeAdetailerFaceEnabled}
-                forgeAdetailerFaceModel={forgeAdetailerFaceModel}
-                onForgeAdetailerFaceModelChange={setForgeAdetailerFaceModel}
+                onMoveSelectedToFolder={handleMoveSelectedToFolder}
+                isMovingSelected={isMovingImages}
+                onBulkFavoriteSelected={() => handleBulkFavoriteSelected(true)}
+                onBulkUnfavoriteSelected={() => handleBulkFavoriteSelected(false)}
+                onBulkLockSelected={() => handleBulkLockSelected(true)}
+                onBulkUnlockSelected={() => handleBulkLockSelected(false)}
+                isApplyingSelectionActions={isGalleryMutationInFlight}
+                autoLockFavorites={autoLockFavorites}
+                onAutoLockFavoritesChange={setAutoLockFavorites}
+                recentDeleteHistory={deleteHistory}
+                onClearDeleteHistory={clearDeleteHistory}
+                forgeBaseUrl={forge.forgeBaseUrl}
+                forgeApiKey={forge.forgeApiKey}
+                onForgeBaseUrlChange={forge.setForgeBaseUrl}
+                onForgeApiKeyChange={forge.setForgeApiKey}
+                forgeOutputDir={forge.forgeOutputDir}
+                onForgeOutputDirChange={forge.setForgeOutputDir}
+                forgeModelsPath={forge.forgeModelsPath}
+                onForgeModelsPathChange={forge.setForgeModelsPath}
+                forgeModelsScanSubfolders={forge.forgeModelsScanSubfolders}
+                onForgeModelsScanSubfoldersChange={forge.setForgeModelsScanSubfolders}
+                forgeLoraPath={forge.forgeLoraPath}
+                onForgeLoraPathChange={forge.setForgeLoraPath}
+                forgeLoraScanSubfolders={forge.forgeLoraScanSubfolders}
+                onForgeLoraScanSubfoldersChange={forge.setForgeLoraScanSubfolders}
+                forgeIncludeSeed={forge.forgeIncludeSeed}
+                onForgeIncludeSeedChange={forge.setForgeIncludeSeed}
+                forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
+                onForgeAdetailerFaceEnabledChange={forge.setForgeAdetailerFaceEnabled}
+                forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}
+                onForgeAdetailerFaceModelChange={forge.setForgeAdetailerFaceModel}
                 onForgeTestConnection={handleForgeTestConnection}
                 onForgeSendSelected={handleForgeSendSelected}
-                forgeStatusMessage={forgeStatusMessage}
                 isTestingForge={isTestingForge}
                 isSendingForgeBatch={isSendingForgeBatch}
-                operationMessage={exportMessage}
                 columnCount={columnCount}
                 onColumnCountChange={setColumnCount}
                 storageProfile={storageProfile}
@@ -862,7 +1584,6 @@ function AppContent() {
                 isPrecachingThumbnails={isPrecachingThumbnails}
                 thumbnailCacheProgress={thumbnailCacheProgress}
                 thumbnailCacheResult={thumbnailCacheResult}
-                thumbnailCacheMessage={thumbnailCacheMessage}
             />
 
             <main className="main-content">
@@ -878,6 +1599,10 @@ function AppContent() {
                     selectedCount={selectedIds.size}
                     onSelectAll={selectAll}
                     onDeselectAll={clearSelection}
+                    onDeleteSelected={handleDeleteSelected}
+                    isDeletingSelected={isGalleryMutationInFlight}
+                    deleteMode={deleteMode}
+                    onDeleteModeChange={setDeleteMode}
                     modelFilter={selectedModelFilter}
                     modelOptions={modelFilterOptions}
                     onModelFilterChange={setSelectedModelFilter}
@@ -900,11 +1625,15 @@ function AppContent() {
                         onToggleSelected={toggleSelected}
                         onSelectAll={selectAll}
                         onClearSelection={clearSelection}
+                        onDeleteSelected={handleDeleteSelected}
+                        isDeletingSelected={isGalleryMutationInFlight}
                         onLoadMore={handleLoadMore}
                         hasMore={hasNextPage ?? false}
                         isFetchingNextPage={isFetchingNextPage}
                         columnCount={columnCount}
                         storageProfile={storageProfile}
+                        onShowToast={pushToast}
+                        emptyState={galleryEmptyState}
                     />
                 )}
             </main>
@@ -915,29 +1644,37 @@ function AppContent() {
                     currentIndex={selectedImageIndex}
                     onNavigate={handleNavigateViewer}
                     onClose={() => setSelectedImageId(null)}
-                    forgeBaseUrl={forgeBaseUrl}
-                    forgeApiKey={forgeApiKey}
-                    forgeOutputDir={forgeOutputDir}
-                    forgeModelsPath={forgeModelsPath}
-                    forgeModelsScanSubfolders={forgeModelsScanSubfolders}
-                    onForgeModelsPathChange={setForgeModelsPath}
+                    forgeBaseUrl={forge.forgeBaseUrl}
+                    forgeApiKey={forge.forgeApiKey}
+                    forgeOutputDir={forge.forgeOutputDir}
+                    forgeModelsPath={forge.forgeModelsPath}
+                    forgeModelsScanSubfolders={forge.forgeModelsScanSubfolders}
+                    onForgeModelsPathChange={forge.setForgeModelsPath}
                     onForgeModelsScanSubfoldersChange={
-                        setForgeModelsScanSubfolders
+                        forge.setForgeModelsScanSubfolders
                     }
-                    forgeLoraPath={forgeLoraPath}
-                    forgeLoraScanSubfolders={forgeLoraScanSubfolders}
-                    onForgeLoraPathChange={setForgeLoraPath}
-                    onForgeLoraScanSubfoldersChange={setForgeLoraScanSubfolders}
-                    forgeSelectedLoras={forgeSelectedLoras}
-                    onForgeSelectedLorasChange={setForgeSelectedLoras}
-                    forgeLoraWeight={forgeLoraWeight}
-                    onForgeLoraWeightChange={setForgeLoraWeight}
-                    forgeIncludeSeed={forgeIncludeSeed}
-                    forgeAdetailerFaceEnabled={forgeAdetailerFaceEnabled}
-                    forgeAdetailerFaceModel={forgeAdetailerFaceModel}
+                    forgeLoraPath={forge.forgeLoraPath}
+                    forgeLoraScanSubfolders={forge.forgeLoraScanSubfolders}
+                    onForgeLoraPathChange={forge.setForgeLoraPath}
+                    onForgeLoraScanSubfoldersChange={forge.setForgeLoraScanSubfolders}
+                    forgeSelectedLoras={forge.forgeSelectedLoras}
+                    onForgeSelectedLorasChange={forge.setForgeSelectedLoras}
+                    forgeLoraWeight={forge.forgeLoraWeight}
+                    onForgeLoraWeightChange={forge.setForgeLoraWeight}
+                    forgeIncludeSeed={forge.forgeIncludeSeed}
+                    forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
+                    forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}
                     onSearchBySeed={handleSearchBySeed}
+                    onDeleteCurrentImage={handleDeleteImageFromViewer}
+                    isDeletingCurrentImage={isGalleryMutationInFlight}
+                    deleteMode={deleteMode}
+                    onToggleFavorite={handleToggleFavorite}
+                    onToggleLocked={handleToggleLocked}
+                    onShowToast={pushToast}
                 />
             )}
+
+            <ToastHost toast={toast} onDismiss={clearToast} />
         </div>
     );
 }

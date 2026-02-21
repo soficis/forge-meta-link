@@ -7,6 +7,9 @@ import type {
     TagCount,
     ExportResult,
     FileExportResult,
+    DeleteImagesResult,
+    DeleteMode,
+    MoveImagesResult,
     ImageExportFormat,
     ThumbnailMapping,
     ForgeStatus,
@@ -16,7 +19,6 @@ import type {
     ForgePayloadOverrides,
     CursorPage,
     SidecarData,
-    DirectoryEntry,
     GenerationType,
     ModelEntry,
     SortOption,
@@ -66,6 +68,14 @@ export async function setStorageProfile(profile: StorageProfile): Promise<void> 
     return invoke<void>("set_storage_profile", { profile });
 }
 
+export async function getForgeApiKey(): Promise<string> {
+    return invoke<string>("get_forge_api_key");
+}
+
+export async function setForgeApiKey(apiKey: string): Promise<void> {
+    return invoke<void>("set_forge_api_key", { apiKey });
+}
+
 export async function precacheAllThumbnails(): Promise<void> {
     return invoke<void>("precache_all_thumbnails");
 }
@@ -104,13 +114,6 @@ export async function onThumbnailCacheComplete(
 
 // ── Image Queries ───────────────────────────────────────────────────────
 
-export async function getImages(
-    limit: number,
-    offset: number
-): Promise<ImageRecord[]> {
-    return invoke<ImageRecord[]>("get_images", { limit, offset });
-}
-
 export async function getImagesCursor(
     cursor: string | null,
     limit: number,
@@ -129,14 +132,6 @@ export async function getImagesCursor(
     });
 }
 
-export async function searchImages(
-    query: string,
-    limit: number,
-    offset: number
-): Promise<ImageRecord[]> {
-    return invoke<ImageRecord[]>("search_images", { query, limit, offset });
-}
-
 export async function searchImagesCursor(
     query: string,
     cursor: string | null,
@@ -147,29 +142,15 @@ export async function searchImagesCursor(
     modelFamilyFilters?: string[] | null
 ): Promise<CursorPage<GalleryImageRecord>> {
     return invoke<CursorPage<GalleryImageRecord>>("search_images_cursor", {
-        query,
-        cursor,
-        limit,
-        generationTypes: generationTypes ?? null,
-        sortBy: sortBy ?? null,
-        modelFilter: modelFilter ?? null,
-        modelFamilyFilters: modelFamilyFilters ?? null,
-    });
-}
-
-export async function filterImages(
-    tagsInclude: string[],
-    tagsExclude: string[],
-    query: string | null,
-    limit: number,
-    offset: number
-): Promise<ImageRecord[]> {
-    return invoke<ImageRecord[]>("filter_images", {
-        tagsInclude,
-        tagsExclude,
-        query,
-        limit,
-        offset,
+        request: {
+            query,
+            cursor,
+            limit,
+            generationTypes: generationTypes ?? null,
+            sortBy: sortBy ?? null,
+            modelFilter: modelFilter ?? null,
+            modelFamilyFilters: modelFamilyFilters ?? null,
+        },
     });
 }
 
@@ -185,15 +166,17 @@ export async function filterImagesCursor(
     modelFamilyFilters?: string[] | null
 ): Promise<CursorPage<GalleryImageRecord>> {
     return invoke<CursorPage<GalleryImageRecord>>("filter_images_cursor", {
-        tagsInclude,
-        tagsExclude,
-        query,
-        cursor,
-        limit,
-        generationTypes: generationTypes ?? null,
-        sortBy: sortBy ?? null,
-        modelFilter: modelFilter ?? null,
-        modelFamilyFilters: modelFamilyFilters ?? null,
+        request: {
+            tagsInclude,
+            tagsExclude,
+            query,
+            cursor,
+            limit,
+            generationTypes: generationTypes ?? null,
+            sortBy: sortBy ?? null,
+            modelFilter: modelFilter ?? null,
+            modelFamilyFilters: modelFamilyFilters ?? null,
+        },
     });
 }
 
@@ -208,10 +191,6 @@ export async function listTags(
 
 export async function getTopTags(limit: number): Promise<TagCount[]> {
     return invoke<TagCount[]>("get_top_tags", { limit });
-}
-
-export async function getImageTags(id: number): Promise<string[]> {
-    return invoke<string[]>("get_image_tags", { id });
 }
 
 // ── Image Detail ────────────────────────────────────────────────────────
@@ -259,10 +238,6 @@ export async function getThumbnailPaths(
 
 // ── Group-by Queries ────────────────────────────────────────────────────
 
-export async function getDirectories(): Promise<DirectoryEntry[]> {
-    return invoke<DirectoryEntry[]>("get_directories");
-}
-
 export async function getModels(): Promise<ModelEntry[]> {
     return invoke<ModelEntry[]>("get_models");
 }
@@ -271,6 +246,72 @@ export async function getModels(): Promise<ModelEntry[]> {
 
 export async function openFileLocation(filepath: string): Promise<void> {
     return invoke<void>("open_file_location", { filepath });
+}
+
+export async function directoryExists(path: string): Promise<boolean> {
+    return invoke<boolean>("directory_exists", { path });
+}
+
+export async function deleteImages(
+    ids: number[],
+    mode: DeleteMode
+): Promise<DeleteImagesResult> {
+    return invoke<DeleteImagesResult>("delete_images", {
+        request: {
+            ids,
+            mode,
+        },
+    });
+}
+
+export async function setImageFavorite(
+    imageId: number,
+    isFavorite: boolean
+): Promise<void> {
+    return invoke<void>("set_image_favorite", { imageId, isFavorite });
+}
+
+export async function setImagesFavorite(
+    ids: number[],
+    isFavorite: boolean
+): Promise<number> {
+    return invoke<number>("set_images_favorite", {
+        request: {
+            ids,
+            isFavorite,
+        },
+    });
+}
+
+export async function setImageLocked(
+    imageId: number,
+    isLocked: boolean
+): Promise<void> {
+    return invoke<void>("set_image_locked", { imageId, isLocked });
+}
+
+export async function setImagesLocked(
+    ids: number[],
+    isLocked: boolean
+): Promise<number> {
+    return invoke<number>("set_images_locked", {
+        request: {
+            ids,
+            isLocked,
+        },
+    });
+}
+
+export async function moveImagesToDirectory(
+    ids: number[],
+    destinationDirectory: string
+): Promise<MoveImagesResult> {
+    return invoke<MoveImagesResult>("move_images_to_directory", {
+        request: {
+            ids,
+            destinationDirectory,
+        },
+    });
 }
 
 // ── Export ───────────────────────────────────────────────────────────────
@@ -341,16 +382,20 @@ export async function forgeSendToImage(
     overrides: ForgePayloadOverrides | null
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_send_to_image", {
-        imageId,
-        baseUrl,
-        apiKey,
-        outputDir,
-        includeSeed,
-        adetailerFaceEnabled,
-        adetailerFaceModel,
-        loraTokens,
-        loraWeight,
-        overrides,
+        request: {
+            imageId,
+            options: {
+                baseUrl,
+                apiKey,
+                outputDir,
+                includeSeed,
+                adetailerFaceEnabled,
+                adetailerFaceModel,
+                loraTokens,
+                loraWeight,
+                overrides,
+            },
+        },
     });
 }
 
@@ -367,16 +412,20 @@ export async function forgeSendToImages(
     overrides: ForgePayloadOverrides | null
 ): Promise<ForgeBatchSendResult> {
     return invoke<ForgeBatchSendResult>("forge_send_to_images", {
-        imageIds,
-        baseUrl,
-        apiKey,
-        outputDir,
-        includeSeed,
-        adetailerFaceEnabled,
-        adetailerFaceModel,
-        loraTokens,
-        loraWeight,
-        overrides,
+        request: {
+            imageIds,
+            options: {
+                baseUrl,
+                apiKey,
+                outputDir,
+                includeSeed,
+                adetailerFaceEnabled,
+                adetailerFaceModel,
+                loraTokens,
+                loraWeight,
+                overrides,
+            },
+        },
     });
 }
 
