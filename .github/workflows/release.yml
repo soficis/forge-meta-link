@@ -165,10 +165,49 @@ jobs:
           RELEASE_TAG: ${{ steps.release_tag.outputs.value }}
         shell: bash
         run: |
-          mapfile -d '' release_files < <(find release-artifacts -type f -print0)
-          if [ "${#release_files[@]}" -eq 0 ]; then
-            echo "No release assets found."
+          set -euo pipefail
+
+          mapfile -d '' candidate_files < <(
+            find release-artifacts -type f \
+              \( -name 'forge-meta-link_*.deb' \
+              -o -name 'forge-meta-link_*.AppImage' \
+              -o -name 'forge-meta-link_*.dmg' \
+              -o -name 'forge-meta-link_*.msi' \
+              -o -name 'forge-meta-link_*.exe' \) \
+              -print0
+          )
+
+          declare -A release_assets=()
+          for file_path in "${candidate_files[@]}"; do
+            asset_name="$(basename "${file_path}")"
+            if [[ -n "${release_assets[$asset_name]:-}" ]]; then
+              echo "Skipping duplicate asset filename: ${asset_name}"
+              continue
+            fi
+            release_assets["$asset_name"]="${file_path}"
+          done
+
+          if [[ "${#release_assets[@]}" -eq 0 ]]; then
+            echo "No release package artifacts found in release-artifacts/."
             exit 1
           fi
 
-          gh release upload "${RELEASE_TAG}" --clobber "${release_files[@]}"
+          release_id="$(gh release view "${RELEASE_TAG}" --json id -q .id)"
+          mapfile -t asset_names < <(printf '%s\n' "${!release_assets[@]}" | sort)
+
+          for asset_name in "${asset_names[@]}"; do
+            existing_asset_id="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+                --jq ".[] | select(.name==\"${asset_name}\") | .id" || true
+            )"
+            if [[ -n "${existing_asset_id}" ]]; then
+              echo "Deleting existing release asset: ${asset_name} (id=${existing_asset_id})"
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${existing_asset_id}"
+            fi
+          done
+
+          for asset_name in "${asset_names[@]}"; do
+            file_path="${release_assets[$asset_name]}"
+            echo "Uploading ${asset_name}"
+            gh release upload "${RELEASE_TAG}" "${file_path}"
+          done
