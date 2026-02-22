@@ -105,7 +105,34 @@ jobs:
           DMG_PATH="${DMG_DIR}/forge-meta-link_${VERSION}_${{ matrix.bundle_arch }}.dmg"
           mkdir -p "${DMG_DIR}"
 
-          hdiutil create -volname "ForgeMetaLink" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"
+          # Stage the .app in a temp directory so hdiutil doesn't hit a busy build output path.
+          TEMP_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/forgemetalink-dmg.XXXXXX")"
+          STAGED_APP="${TEMP_ROOT}/forge-meta-link.app"
+          TEMP_DMG="${TEMP_ROOT}/forge-meta-link_${VERSION}_${{ matrix.bundle_arch }}.dmg"
+          trap 'rm -rf "${TEMP_ROOT}"' EXIT
+          ditto "${APP_PATH}" "${STAGED_APP}"
+
+          # Best effort: detach stale mounted images using the same volume name.
+          while read -r device; do
+            [[ -z "${device}" ]] && continue
+            hdiutil detach "${device}" -force || true
+          done < <(
+            hdiutil info | awk '/^\/dev\//{dev=$1} /\/Volumes\/ForgeMetaLink/{print dev}'
+          )
+
+          rm -f "${DMG_PATH}"
+          attempt=1
+          until hdiutil create -volname "ForgeMetaLink" -srcfolder "${STAGED_APP}" -ov -format UDZO "${TEMP_DMG}"; do
+            if [[ "${attempt}" -ge 3 ]]; then
+              echo "hdiutil create failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            echo "hdiutil create failed (attempt ${attempt}); retrying..."
+            sleep $(( attempt * 5 ))
+            attempt=$(( attempt + 1 ))
+          done
+
+          mv "${TEMP_DMG}" "${DMG_PATH}"
           ls -lah "${DMG_DIR}"
 
       - name: Upload bundle artifacts
