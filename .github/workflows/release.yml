@@ -302,22 +302,10 @@ jobs:
             exit 1
           fi
 
-          release_id="$(gh release view "${RELEASE_TAG}" --json id -q .id)"
           mapfile -t asset_names < <(printf '%s\n' "${!release_assets[@]}" | sort)
 
           for asset_name in "${asset_names[@]}"; do
-            existing_asset_id="$(
-              gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
-                --jq ".[] | select(.name==\"${asset_name}\") | .id" || true
-            )"
-            if [[ -n "${existing_asset_id}" ]]; then
-              echo "Deleting existing release asset: ${asset_name} (id=${existing_asset_id})"
-              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${existing_asset_id}"
-            fi
-          done
-
-          for asset_name in "${asset_names[@]}"; do
             file_path="${release_assets[$asset_name]}"
-            echo "Uploading ${asset_name}"
-            gh release upload "${RELEASE_TAG}" "${file_path}"
+            echo "Uploading ${asset_name} (--clobber)"
+            gh release upload "${RELEASE_TAG}" "${file_path}" --clobber
           done
