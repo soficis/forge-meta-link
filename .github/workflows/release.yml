@@ -52,6 +52,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -85,8 +88,78 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Prefetch Windows bundler tools (NSIS/WiX) with retry
+        if: startsWith(matrix.runner, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          function Download-WithRetry([string]$Url, [string]$OutFile, [int]$MaxAttempts = 5) {
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -TimeoutSec 180
+                if (-not (Test-Path $OutFile)) {
+                  throw "File not created: $OutFile"
+                }
+                $size = (Get-Item $OutFile).Length
+                if ($size -le 0) {
+                  throw "Downloaded file is empty: $OutFile"
+                }
+                Write-Host "Downloaded $(Split-Path $OutFile -Leaf) ($size bytes)"
+                return
+              } catch {
+                if ($attempt -ge $MaxAttempts) {
+                  throw "Failed to download $Url after $MaxAttempts attempts. $($_.Exception.Message)"
+                }
+                $sleepSeconds = 10 * $attempt
+                Write-Warning "Download failed: $($_.Exception.Message). Retrying in $sleepSeconds seconds..."
+                Start-Sleep -Seconds $sleepSeconds
+              }
+            }
+          }
+
+          $prefetchDir = Join-Path $env:RUNNER_TEMP "tauri-bundler-prefetch"
+          New-Item -ItemType Directory -Path $prefetchDir -Force | Out-Null
+
+          Download-WithRetry "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" (Join-Path $prefetchDir "wix314-binaries.zip")
+          Download-WithRetry "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip" (Join-Path $prefetchDir "nsis-3.11.zip")
+          Download-WithRetry "https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll" (Join-Path $prefetchDir "nsis_tauri_utils.dll")
+
+          Write-Host "Prefetched tool artifacts:"
+          Get-ChildItem $prefetchDir | Select-Object Name, Length
+
       - name: Build release bundle
+        if: ${{ !startsWith(matrix.runner, 'windows') }}
         run: npm run tauri -- build --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }}
+
+      - name: Build release bundle (Windows retry on transient download failures)
+        if: startsWith(matrix.runner, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $maxAttempts = 4
+          $succeeded = $false
+
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Starting Windows bundle build attempt $attempt of $maxAttempts..."
+            npm run tauri -- build --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }}
+            if ($LASTEXITCODE -eq 0) {
+              $succeeded = $true
+              break
+            }
+
+            if ($attempt -lt $maxAttempts) {
+              $sleepSeconds = 15 * $attempt
+              Write-Warning "Build failed with exit code $LASTEXITCODE. Retrying in $sleepSeconds seconds..."
+              Start-Sleep -Seconds $sleepSeconds
+            }
+          }
+
+          if (-not $succeeded) {
+            throw "Windows bundle build failed after $maxAttempts attempts."
+          }
 
       - name: Build macOS DMG (manual fallback to avoid bundle_dmg.sh failures)
         if: startsWith(matrix.runner, 'macos')
@@ -150,6 +223,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Resolve release tag
         id: release_tag
@@ -169,7 +245,14 @@ jobs:
 
       - name: Show downloaded artifacts
         shell: bash
-        run: find release-artifacts -type f | sort
+        run: |
+          find release-artifacts -type f \
+            \( -name 'forge-meta-link_*.deb' \
+            -o -name 'forge-meta-link_*.AppImage' \
+            -o -name 'forge-meta-link_*.dmg' \
+            -o -name 'forge-meta-link_*.msi' \
+            -o -name 'forge-meta-link_*.exe' \) \
+            | sort
 
       - name: Create/Update Github Release 
         uses: docker://ghcr.io/mini-bomba/create-github-release:v1.2.0
