@@ -39,13 +39,15 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
             bundles: msi,nsis
           - label: macos-x64
-            runner: macos-15
+            runner: macos-15-intel
             rust_target: x86_64-apple-darwin
-            bundles: app,dmg
+            bundles: app
+            bundle_arch: x64
           - label: macos-arm64
             runner: macos-14
             rust_target: aarch64-apple-darwin
-            bundles: app,dmg
+            bundles: app
+            bundle_arch: arm64
 
     steps:
       - name: Checkout
@@ -85,6 +87,26 @@ jobs:
 
       - name: Build release bundle
         run: npm run tauri -- build --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }}
+
+      - name: Build macOS DMG (manual fallback to avoid bundle_dmg.sh failures)
+        if: startsWith(matrix.runner, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_ROOT="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+          APP_PATH="${BUNDLE_ROOT}/macos/forge-meta-link.app"
+          if [[ ! -d "${APP_PATH}" ]]; then
+            echo "App bundle not found at ${APP_PATH}" >&2
+            exit 1
+          fi
+
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")"
+          DMG_DIR="${BUNDLE_ROOT}/dmg"
+          DMG_PATH="${DMG_DIR}/forge-meta-link_${VERSION}_${{ matrix.bundle_arch }}.dmg"
+          mkdir -p "${DMG_DIR}"
+
+          hdiutil create -volname "ForgeMetaLink" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"
+          ls -lah "${DMG_DIR}"
 
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
