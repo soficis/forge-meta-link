@@ -231,6 +231,30 @@ export interface LineageCursor {
     children: LineageEdge[];
 }
 
+export interface LineageTraceNode {
+    id: number;
+    filepath: string;
+    filename: string;
+    is_ghost: boolean;
+    ghost_recipe: string | null;
+    ops_json: string | null;
+    source: string;
+    parent_id: number | null;
+    depth: number;
+    seed: string | null;
+    cfg_scale: string | null;
+    steps: string | null;
+    sampler: string | null;
+    scheduler: string | null;
+    model_name: string | null;
+    prompt: string | null;
+}
+
+export interface LineageTrace {
+    target_id: number;
+    nodes: LineageTraceNode[];
+}
+
 export interface TagProvenance {
     tag: string;
     count: number;

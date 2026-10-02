@@ -87,6 +87,32 @@ pub struct LineageOpaqueCursor {
     pub last_parent: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LineageTraceNode {
+    pub id: i64,
+    pub filepath: String,
+    pub filename: String,
+    pub is_ghost: bool,
+    pub ghost_recipe: Option<String>,
+    pub ops_json: Option<String>,
+    pub source: String,
+    pub parent_id: Option<i64>,
+    pub depth: u32,
+    pub seed: Option<String>,
+    pub cfg_scale: Option<String>,
+    pub steps: Option<String>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub model_name: Option<String>,
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LineageTrace {
+    pub target_id: i64,
+    pub nodes: Vec<LineageTraceNode>,
+}
+
 fn lineage_edge_from_row(row: &rusqlite::Row<'_>) -> SqlResult<LineageEdge> {
     Ok(LineageEdge {
         child_filepath: row.get(0)?,
@@ -98,6 +124,177 @@ fn lineage_edge_from_row(row: &rusqlite::Row<'_>) -> SqlResult<LineageEdge> {
 }
 
 impl Database {
+    /// Walks lineage ancestry from `image_id` upwards through `images` (including culled/ghost rows).
+    /// Returns nodes with ghost status, ghost recipe, ops_json, and parameters.
+    /// Cycle detection via HashSet and max depth cap of 64.
+    /// Falls back to legacy heuristic lineage when no stamped edge exists, marked with source="inferred".
+    pub fn get_lineage_trace(&self, image_id: i64) -> SqlResult<LineageTrace> {
+        let conn = self.pool.get().map_err(pool_error)?;
+        let mut nodes = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut curr_id = image_id;
+        let mut depth = 0;
+
+        let mut image_stmt = conn.prepare(
+            "SELECT id, filepath, filename, culled_at, ghost_recipe, seed, cfg_scale, steps, sampler, schedule_type, model_name, prompt
+             FROM images
+             WHERE id = ?1",
+        )?;
+
+        let mut edge_stmt = conn.prepare(
+            "SELECT parent_id, ops_json, source
+             FROM lineage_edges
+             WHERE child_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+        )?;
+
+        let mut legacy_edge_stmt = conn.prepare(
+            "SELECT parent_filepath FROM (
+                SELECT l.parent_filepath, l.confidence, l.created_at
+                FROM lineage l
+                LEFT JOIN lineage_overrides o ON o.child_filepath = l.child_filepath AND o.parent_filepath = l.parent_filepath AND o.action = 'unlink'
+                WHERE l.child_filepath = ?1 AND o.child_filepath IS NULL
+                UNION
+                SELECT parent_filepath, confidence, created_at
+                FROM lineage_overrides
+                WHERE child_filepath = ?1 AND action = 'link'
+            )
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT 1",
+        )?;
+
+        let mut find_by_filepath_stmt = conn.prepare(
+            "SELECT id FROM images WHERE filepath = ?1 LIMIT 1",
+        )?;
+
+        while depth < 64 {
+            if visited.contains(&curr_id) {
+                break;
+            }
+            visited.insert(curr_id);
+
+            // Fetch current image from images table (NOT images_live, so ghosts are accessible)
+            let img_row = image_stmt.query_row(params![curr_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            });
+
+            let Ok((id, filepath, filename, culled_at, ghost_recipe, mut seed, mut cfg, mut steps, mut sampler, mut scheduler, mut model, prompt)) = img_row else {
+                break;
+            };
+
+            let is_ghost = culled_at.is_some();
+
+            // If permanent ghost, ghost_recipe JSON contains scalar values
+            if let Some(recipe_str) = &ghost_recipe {
+                if let Ok(recipe) = serde_json::from_str::<serde_json::Value>(recipe_str) {
+                    if seed.as_deref().unwrap_or("").is_empty() {
+                        seed = recipe.get("seed").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                    if cfg.as_deref().unwrap_or("").is_empty() {
+                        cfg = recipe.get("cfg").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                    if steps.as_deref().unwrap_or("").is_empty() {
+                        steps = recipe.get("steps").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                    if sampler.as_deref().unwrap_or("").is_empty() {
+                        sampler = recipe.get("sampler").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                    if scheduler.as_deref().unwrap_or("").is_empty() {
+                        scheduler = recipe.get("scheduler").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                    if model.as_deref().unwrap_or("").is_empty() {
+                        model = recipe.get("model").and_then(|v| v.as_str()).map(ToString::to_string);
+                    }
+                }
+            }
+
+            // Look for parent in lineage_edges
+            let edge_res = edge_stmt.query_row(params![curr_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            });
+
+            let (next_parent_id, ops_json, source) = match edge_res {
+                Ok((p_id, ops, src)) => (Some(p_id), ops, src),
+                Err(_) => {
+                    // Fall back to legacy heuristic lineage by filepath
+                    let legacy_res = legacy_edge_stmt.query_row(params![&filepath], |row| {
+                        row.get::<_, String>(0)
+                    });
+                    match legacy_res {
+                        Ok(p_fp) => {
+                            let p_id_res = find_by_filepath_stmt.query_row(params![&p_fp], |row| {
+                                row.get::<_, i64>(0)
+                            });
+                            match p_id_res {
+                                Ok(p_id) => (Some(p_id), None, "inferred".to_string()),
+                                Err(_) => (None, None, if depth == 0 { "root".to_string() } else { "inferred".to_string() }),
+                            }
+                        }
+                        Err(_) => (None, None, if depth == 0 { "root".to_string() } else { "inferred".to_string() }),
+                    }
+                }
+            };
+
+            let node_prompt = if is_ghost && ghost_recipe.is_some() && prompt.trim().is_empty() {
+                None
+            } else if prompt.trim().is_empty() {
+                None
+            } else {
+                Some(prompt)
+            };
+
+            nodes.push(LineageTraceNode {
+                id,
+                filepath,
+                filename,
+                is_ghost,
+                ghost_recipe,
+                ops_json,
+                source,
+                parent_id: next_parent_id,
+                depth,
+                seed,
+                cfg_scale: cfg,
+                steps,
+                sampler,
+                scheduler,
+                model_name: model,
+                prompt: node_prompt,
+            });
+
+            match next_parent_id {
+                Some(p_id) => {
+                    curr_id = p_id;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        Ok(LineageTrace {
+            target_id: image_id,
+            nodes,
+        })
+    }
+
     /// Returns lineage cursor for a filepath: up to 3 ancestors and 2 children
     /// ordered by confidence DESC, created_at DESC. Overrides win: unlink hides,
     /// link injects.

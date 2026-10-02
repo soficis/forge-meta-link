@@ -24,6 +24,8 @@ import type {
     SortOption,
     StorageProfile,
     LineageCursor,
+    LineageTrace,
+    LineageTraceNode,
     TagProvenance,
 } from "../types/metadata";
 
@@ -468,6 +470,10 @@ export async function getFileMtimesForQuery(query: string, limit = 50000): Promi
 
 export async function getLineageCursor(filepath: string): Promise<LineageCursor> {
     return invoke<LineageCursor>("get_lineage_cursor", { filepath });
+}
+
+export async function getLineageTrace(imageId: number): Promise<LineageTrace> {
+    return invoke<LineageTrace>("get_lineage_trace", { imageId });
 }
 
 export async function getSeedWalk(

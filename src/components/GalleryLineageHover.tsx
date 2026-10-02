@@ -37,11 +37,40 @@ function LineageThumb({
     onClick: () => void;
     label: string;
 }) {
+    const isGhost = filepath.startsWith("ghost://");
     const src = useMemo(
-        () => lineageThumbSrc(filepath, thumbnailCache),
-        [filepath, thumbnailCache]
+        () => (isGhost ? "" : lineageThumbSrc(filepath, thumbnailCache)),
+        [filepath, thumbnailCache, isGhost]
     );
     const filename = filepath.replace(/\\/g, "/").split("/").pop() ?? filepath;
+
+    if (isGhost) {
+        return (
+            <div
+                className="gallery-lineage-thumb is-ghost"
+                title="culled ancestor"
+                aria-label={`Culled ${label}`}
+                style={{
+                    width: 56,
+                    height: 56,
+                    background: "rgba(245, 158, 11, 0.08)",
+                    border: "1px dashed rgba(245, 158, 11, 0.4)",
+                    borderRadius: "4px",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: "10px",
+                    color: "#fbbf24",
+                }}
+                data-testid="gallery-lineage-ghost-thumb"
+            >
+                <span style={{ fontSize: "16px" }}>👻</span>
+                <span style={{ fontSize: "9px", opacity: 0.8 }}>culled</span>
+            </div>
+        );
+    }
+
     return (
         <button
             type="button"

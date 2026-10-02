@@ -10,6 +10,7 @@ import {
     getImageClipboardPayload,
     getImageDetail,
     getLineageCursor,
+    getLineageTrace,
     getSidecarData,
     getThumbnailPath,
     getThumbnailPaths,
@@ -22,6 +23,7 @@ import {
     copyCompressedImageForDiscord,
     formatBytes,
 } from "../utils/imageClipboard";
+import { formatOpsLabel, formatGhostRecipeText } from "../utils/lineageTrace";
 import type {
     ForgePayloadOverrides,
     GalleryImageRecord,
@@ -29,6 +31,8 @@ import type {
     ImageRecord,
     LineageCursor,
     LineageEdge,
+    LineageTrace,
+    LineageTraceNode,
 } from "../types/metadata";
 import { usePersistedState } from "../hooks/usePersistedState";
 import type { ShowToastOptions } from "../hooks/useToast";
@@ -382,6 +386,7 @@ export function PhotoViewer({
     const [isInfoOpen, setIsInfoOpen] = useState(true);
     const [infoPanelTab, setInfoPanelTab] = useState<"info" | "forge" | "lineage">("info");
     const [lineageCursor, setLineageCursor] = useState<LineageCursor | null>(null);
+    const [lineageTrace, setLineageTrace] = useState<LineageTrace | null>(null);
     const [isLineageLoading, setIsLineageLoading] = useState(false);
     const [lineageThumbs, setLineageThumbs] = useState<Record<string, string>>({});
     const [linkParentInput, setLinkParentInput] = useState("");
@@ -859,6 +864,7 @@ export function PhotoViewer({
     useEffect(() => {
         if (!currentImage?.filepath) {
             setLineageCursor(null);
+            setLineageTrace(null);
             setLineageThumbs({});
             setIsLineageLoading(false);
             return;
@@ -867,41 +873,74 @@ export function PhotoViewer({
         const reqId = lineageRequestRef.current + 1;
         lineageRequestRef.current = reqId;
         setIsLineageLoading(true);
-        getLineageCursor(currentImage.filepath)
+
+        const pCursor = getLineageCursor(currentImage.filepath)
             .then((cursor) => {
-                if (cancelled || lineageRequestRef.current !== reqId) return;
+                if (cancelled || lineageRequestRef.current !== reqId) return null;
                 setLineageCursor(cursor);
-                const allPaths = [
-                    ...cursor.ancestors.map((e) => e.parent_filepath),
-                    ...cursor.children.map((e) => e.child_filepath),
-                ];
-                if (allPaths.length === 0) {
+                return cursor;
+            })
+            .catch(() => {
+                if (cancelled || lineageRequestRef.current !== reqId) return null;
+                setLineageCursor({ ancestors: [], children: [] });
+                return null;
+            });
+
+        const pTrace = currentImage.id
+            ? getLineageTrace(currentImage.id)
+                  .then((trace) => {
+                      if (cancelled || lineageRequestRef.current !== reqId) return null;
+                      setLineageTrace(trace);
+                      return trace;
+                  })
+                  .catch(() => {
+                      if (cancelled || lineageRequestRef.current !== reqId) return null;
+                      setLineageTrace(null);
+                      return null;
+                  })
+            : Promise.resolve(null);
+
+        Promise.all([pCursor, pTrace])
+            .then(([cursor, trace]) => {
+                if (cancelled || lineageRequestRef.current !== reqId) return;
+                const allPaths: string[] = [];
+                if (cursor) {
+                    allPaths.push(
+                        ...cursor.ancestors.map((e) => e.parent_filepath),
+                        ...cursor.children.map((e) => e.child_filepath)
+                    );
+                }
+                if (trace) {
+                    allPaths.push(
+                        ...trace.nodes
+                            .filter((n) => !n.is_ghost && !n.filepath.startsWith("ghost://"))
+                            .map((n) => n.filepath)
+                    );
+                }
+                const uniquePaths = Array.from(new Set(allPaths.filter(Boolean)));
+                if (uniquePaths.length === 0) {
                     setLineageThumbs({});
                     return;
                 }
-                return getThumbnailPaths(allPaths)
-                    .then((mappings) => {
-                        if (cancelled || lineageRequestRef.current !== reqId) return;
-                        const next: Record<string, string> = {};
-                        for (const m of mappings) {
-                            if (m.thumbnail_path !== m.filepath) next[m.filepath] = m.thumbnail_path;
-                        }
-                        setLineageThumbs(next);
-                    })
-                    .catch(() => {});
+                return getThumbnailPaths(uniquePaths).then((mappings) => {
+                    if (cancelled || lineageRequestRef.current !== reqId) return;
+                    const next: Record<string, string> = {};
+                    for (const m of mappings) {
+                        if (m.thumbnail_path !== m.filepath) next[m.filepath] = m.thumbnail_path;
+                    }
+                    setLineageThumbs(next);
+                });
             })
-            .catch(() => {
-                if (cancelled || lineageRequestRef.current !== reqId) return;
-                setLineageCursor({ ancestors: [], children: [] });
-            })
+            .catch(() => {})
             .finally(() => {
                 if (cancelled || lineageRequestRef.current !== reqId) return;
                 setIsLineageLoading(false);
             });
+
         return () => {
             cancelled = true;
         };
-    }, [currentImage?.filepath]);
+    }, [currentImage?.filepath, currentImage?.id]);
 
     useEffect(() => {
         if (zoom <= 1) {
@@ -2878,6 +2917,91 @@ export function PhotoViewer({
                                                             );
                                                         })}
                                                     </div>
+                                                )}
+                                                {lineageTrace && lineageTrace.nodes.length > 1 && (
+                                                    <>
+                                                        <div className="viewer-form-label" style={{ marginTop: "12px" }}>
+                                                            Ancestry Trace-Back ({lineageTrace.nodes.length - 1} ancestor{lineageTrace.nodes.length - 1 === 1 ? "" : "s"})
+                                                        </div>
+                                                        <div className="viewer-lineage-list" data-testid="lineage-trace-list">
+                                                            {lineageTrace.nodes.slice(1).map((node) => {
+                                                                const opsLabel = formatOpsLabel(node.ops_json);
+                                                                if (node.is_ghost) {
+                                                                    return (
+                                                                        <div
+                                                                            key={`trace-ghost-${node.id}`}
+                                                                            className="viewer-lineage-row ghost-ancestor-row"
+                                                                            data-testid={`lineage-trace-ghost-${node.id}`}
+                                                                            style={{
+                                                                                padding: "8px 10px",
+                                                                                background: "rgba(245, 158, 11, 0.05)",
+                                                                                borderRadius: "4px",
+                                                                                border: "1px dashed rgba(245, 158, 11, 0.4)",
+                                                                                display: "flex",
+                                                                                flexDirection: "column",
+                                                                                gap: "2px",
+                                                                            }}
+                                                                        >
+                                                                            <span style={{ fontSize: "11px", fontWeight: 600, color: "#fbbf24" }}>
+                                                                                👻 {formatGhostRecipeText(node)}
+                                                                            </span>
+                                                                            {opsLabel && (
+                                                                                <span style={{ fontSize: "10px", color: "var(--color-text-muted, #888)" }}>
+                                                                                    Mutations: {opsLabel}
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                }
+                                                                const thumb = lineageThumbs[node.filepath];
+                                                                return (
+                                                                    <div
+                                                                        key={`trace-live-${node.id}`}
+                                                                        className="viewer-lineage-row"
+                                                                        data-testid={`lineage-trace-live-${node.id}`}
+                                                                    >
+                                                                        <button
+                                                                            type="button"
+                                                                            className="viewer-lineage-thumb-btn"
+                                                                            onClick={() => handleLineageJump(node.filepath)}
+                                                                            title={`Jump to ${node.filename}`}
+                                                                            data-testid={`lineage-jump-trace-${node.id}`}
+                                                                        >
+                                                                            {thumb ? (
+                                                                                <img src={toAssetSrc(thumb)} alt={node.filename} loading="lazy" decoding="async" />
+                                                                            ) : (
+                                                                                <span className="viewer-lineage-thumb-placeholder">—</span>
+                                                                            )}
+                                                                        </button>
+                                                                        <div className="viewer-lineage-meta">
+                                                                            <span className="viewer-lineage-filename" title={node.filepath}>
+                                                                                {node.filename}
+                                                                            </span>
+                                                                            <span className="viewer-lineage-relation">
+                                                                                {opsLabel ? opsLabel : `${node.source} • depth ${node.depth}`}
+                                                                            </span>
+                                                                        </div>
+                                                                        <div className="viewer-lineage-actions">
+                                                                            <button
+                                                                                type="button"
+                                                                                className="viewer-control-button"
+                                                                                onClick={() => handleLineageJump(node.filepath)}
+                                                                            >
+                                                                                Jump
+                                                                            </button>
+                                                                            <button
+                                                                                type="button"
+                                                                                className="viewer-control-button"
+                                                                                onClick={() => handlePinLineageToCompare(node.filepath)}
+                                                                            >
+                                                                                Pin
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </>
                                                 )}
                                                 <div className="viewer-form-label">Children ({lineageCursor.children.length}/2)</div>
                                                 {lineageCursor.children.length === 0 ? (

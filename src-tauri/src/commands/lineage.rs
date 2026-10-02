@@ -1,4 +1,24 @@
-use crate::database::{GalleryImageRecord, LineageCursor, TagProvenance};
+use crate::database::{GalleryImageRecord, LineageCursor, LineageTrace, TagProvenance};
+
+#[tauri::command]
+pub fn get_lineage_trace(
+    image_id: i64,
+    state: tauri::State<AppState>,
+) -> Result<LineageTrace, String> {
+    let started = std::time::Instant::now();
+    let result = state.db.get_lineage_trace(image_id).map_err(|e| e.to_string());
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    match &result {
+        Ok(trace) => log::info!(
+            "get_lineage_trace image_id={} -> {} nodes in {:.1}ms",
+            image_id,
+            trace.nodes.len(),
+            elapsed
+        ),
+        Err(e) => log::warn!("get_lineage_trace image_id={} failed {:.1}ms: {}", image_id, elapsed, e),
+    }
+    result
+}
 
 #[tauri::command]
 pub fn get_lineage_cursor(

@@ -620,7 +620,7 @@ mod lineage;
 mod read_queries;
 mod timeline;
 
-pub use lineage::{LineageCursor, LineageEdge, TagProvenance};
+pub use lineage::{LineageCursor, LineageEdge, LineageTrace, LineageTraceNode, TagProvenance};
 pub use read_queries::DuplicateGroup;
 
 impl Database {
