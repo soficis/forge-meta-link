@@ -62,7 +62,9 @@ impl Database {
                          extra_params=excluded.extra_params,
                          file_mtime=excluded.file_mtime,
                          file_size=excluded.file_size,
-                         quick_hash=excluded.quick_hash
+                         quick_hash=excluded.quick_hash,
+                         culled_at=NULL,
+                         ghost_recipe=NULL
                      RETURNING id",
                 )?;
                 let mut delete_image_tags_stmt =
@@ -193,7 +195,9 @@ impl Database {
                  extra_params=excluded.extra_params,
                  file_mtime=excluded.file_mtime,
                  file_size=excluded.file_size,
-                 quick_hash=excluded.quick_hash
+                 quick_hash=excluded.quick_hash,
+                 culled_at=NULL,
+                 ghost_recipe=NULL
              RETURNING id",
             params![
                 filepath,
@@ -281,6 +285,101 @@ impl Database {
 
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// Culls images using either Trash mode (culled_at tombstone) or Permanent mode
+    /// (ghost recipe + blank text + ghost://<id> filepath to evict FTS while preserving lineage).
+    pub fn cull_images(&self, ids: &[i64], mode: CullMode) -> SqlResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.pool.get().map_err(pool_error)?;
+        let tx = conn.transaction()?;
+
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let params_ids: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
+
+        // 1. Remove image_tags for the culled ids
+        tx.execute(
+            &format!("DELETE FROM image_tags WHERE image_id IN ({})", placeholders),
+            params_from_iter(params_ids.clone()),
+        )?;
+
+        // 2. Prune orphaned tags
+        tx.execute(
+            "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)",
+            [],
+        )?;
+
+        // 3. Apply culling per mode
+        match mode {
+            CullMode::Trash => {
+                let sql = format!(
+                    "UPDATE images SET culled_at = strftime('%s','now') WHERE id IN ({})",
+                    placeholders
+                );
+                tx.execute(&sql, params_from_iter(params_ids))?;
+            }
+            CullMode::Permanent => {
+                let mut select_stmt = tx.prepare(
+                    "SELECT filepath, seed, cfg_scale, steps, sampler, schedule_type, model_name
+                     FROM images WHERE id = ?1",
+                )?;
+                let mut update_stmt = tx.prepare(
+                    "UPDATE images SET
+                        culled_at = strftime('%s','now'),
+                        ghost_recipe = ?1,
+                        prompt = '',
+                        negative_prompt = '',
+                        raw_metadata = '',
+                        extra_params = NULL,
+                        model_name = NULL,
+                        model_hash = NULL,
+                        filepath = ?2
+                     WHERE id = ?3",
+                )?;
+                let mut del_lineage = tx.prepare(
+                    "DELETE FROM lineage WHERE child_filepath = ?1 OR parent_filepath = ?1",
+                )?;
+                let mut del_lineage_overrides = tx.prepare(
+                    "DELETE FROM lineage_overrides WHERE child_filepath = ?1 OR parent_filepath = ?1",
+                )?;
+
+                for id in ids {
+                    let row_res = select_stmt.query_row(params![id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    });
+
+                    if let Ok((old_fp, seed, cfg, steps, sampler, scheduler, model)) = row_res {
+                        del_lineage.execute(params![old_fp])?;
+                        del_lineage_overrides.execute(params![old_fp])?;
+
+                        let recipe = serde_json::json!({
+                            "seed": seed,
+                            "cfg": cfg,
+                            "steps": steps,
+                            "sampler": sampler,
+                            "scheduler": scheduler,
+                            "model": model,
+                        });
+                        let ghost_path = format!("ghost://{}", id);
+                        update_stmt.execute(params![recipe.to_string(), ghost_path, id])?;
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(ids.len())
     }
 
     // ────────────────────────────── Reads ──────────────────────────────

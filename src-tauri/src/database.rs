@@ -127,6 +127,13 @@ pub struct CursorPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CullMode {
+    Trash,
+    Permanent,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CursorQueryOptions<'a> {
     pub cursor: Option<&'a str>,

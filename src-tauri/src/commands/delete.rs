@@ -478,12 +478,16 @@ pub fn delete_images_sync(
         }
     }
 
-    let (removed_from_db, failed_paths, db_error) = match db.delete_images_by_ids(&deleted_ids) {
+    let cull_mode = match request.mode {
+        DeleteMode::Permanent => crate::database::CullMode::Permanent,
+        DeleteMode::Trash => crate::database::CullMode::Trash,
+    };
+    let (removed_from_db, failed_paths, db_error) = match db.cull_images(&deleted_ids, cull_mode) {
         Ok(count) => (count, failed_paths, None),
         Err(error) => {
-            log::error!("Failed to remove deleted images from database: {}", error);
+            log::error!("Failed to cull deleted images in database: {}", error);
             let mut paths = failed_paths;
-            let err_msg = format!("Database error removing rows: {}", error);
+            let err_msg = format!("Database error culling rows: {}", error);
             paths.push(err_msg.clone());
             (0, paths, Some(err_msg))
         }
@@ -1026,7 +1030,8 @@ mod delete_tests {
         {
             let conn = db.pool_get_for_test().unwrap();
             conn.execute_batch(
-                "CREATE TRIGGER abort_delete BEFORE DELETE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;",
+                "CREATE TRIGGER abort_delete BEFORE DELETE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;
+                 CREATE TRIGGER abort_update BEFORE UPDATE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;",
             )
             .unwrap();
         }

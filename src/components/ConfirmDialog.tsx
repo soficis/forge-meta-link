@@ -57,7 +57,7 @@ export function ConfirmDialog({
 
     const description = isTrash
         ? "They will be moved to the Recycle Bin."
-        : "They will not go to the Recycle Bin.";
+        : "Prompt text is removed; seed, CFG, steps, sampler, scheduler and model are kept so lineage can still be traced.";
 
     return (
         <div
