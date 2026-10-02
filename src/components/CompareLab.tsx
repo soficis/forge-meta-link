@@ -18,6 +18,8 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useCompareLabStore, isCompareReady } from "../store/compareLabStore";
 import { MetadataDeltaTable } from "./MetadataDeltaTable";
+import { MutationPopover } from "./MutationPopover";
+import { useForgeSettings } from "../hooks/useForgeSettings";
 import type { GalleryImageRecord, ImageRecord } from "../types/metadata";
 import { getImageDetail, getLineageCursor, getSeedWalk } from "../services/commands";
 import type { LineageCursor } from "../types/metadata";
@@ -31,10 +33,12 @@ type SwipeMode = "thumb" | "full";
 
 interface SortablePinProps {
     image: GalleryImageRecord;
+    isWinner: boolean;
+    onPickWinner: (id: number) => void;
     onRemove: (id: number) => void;
 }
 
-function SortablePinCard({ image, onRemove }: SortablePinProps) {
+function SortablePinCard({ image, isWinner, onPickWinner, onRemove }: SortablePinProps) {
     const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
         id: String(image.id),
     });
@@ -48,7 +52,7 @@ function SortablePinCard({ image, onRemove }: SortablePinProps) {
         <div
             ref={setNodeRef}
             style={style}
-            className={`compare-lab-pin-card ${isDragging ? "dragging" : ""}`.trim()}
+            className={`compare-lab-pin-card ${isDragging ? "dragging" : ""} ${isWinner ? "is-winner" : ""}`.trim()}
             data-testid={`compare-pin-${image.id}`}
         >
             <div className="compare-lab-pin-thumb">
@@ -68,6 +72,16 @@ function SortablePinCard({ image, onRemove }: SortablePinProps) {
                 </span>
             </div>
             <div className="compare-lab-pin-actions">
+                <button
+                    type="button"
+                    className={`compare-lab-pin-winner-btn ${isWinner ? "active" : ""}`}
+                    aria-label={`Set ${image.filename} as winner`}
+                    title={isWinner ? "Active winner for mutations" : "Pick winner"}
+                    onClick={() => onPickWinner(image.id)}
+                    data-testid={`pin-winner-${image.id}`}
+                >
+                    {isWinner ? "🏆 Winner" : "👑 Win"}
+                </button>
                 <button
                     type="button"
                     className="compare-lab-pin-handle"
@@ -252,6 +266,16 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
     const reorder = useCompareLabStore((s) => s.reorder);
     const clear = useCompareLabStore((s) => s.clear);
     const unpin = useCompareLabStore((s) => s.unpin);
+    const winnerId = useCompareLabStore((s) => s.winnerId);
+    const setWinner = useCompareLabStore((s) => s.setWinner);
+
+    const forge = useForgeSettings();
+    const [isMutateOpen, setIsMutateOpen] = useState(false);
+
+    const winner = useMemo(() => {
+        if (winnerId === null) return null;
+        return pins.find((p) => p.id === winnerId) ?? null;
+    }, [pins, winnerId]);
 
     const [mode, setMode] = useState<SwipeMode>("full");
     const [detailsMap, setDetailsMap] = useState<Map<number, ImageRecord>>(
@@ -451,6 +475,17 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
                             Full 640
                         </button>
                     </div>
+                    {winner && (
+                        <button
+                            type="button"
+                            className="compare-lab-btn compare-lab-mutate-btn"
+                            onClick={() => setIsMutateOpen(true)}
+                            data-testid="mutate-winner-btn"
+                            title={`Mutate winner: ${winner.filename}`}
+                        >
+                            ⚡ Mutate Winner
+                        </button>
+                    )}
                     <button
                         type="button"
                         className="compare-lab-btn"
@@ -468,7 +503,13 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
                 <SortableContext items={ids} strategy={horizontalListSortingStrategy}>
                     <div className="compare-lab-pin-strip" data-testid="pin-strip">
                         {pins.map((p) => (
-                            <SortablePinCard key={p.id} image={p} onRemove={handleRemove} />
+                            <SortablePinCard
+                                key={p.id}
+                                image={p}
+                                isWinner={p.id === winnerId}
+                                onPickWinner={setWinner}
+                                onRemove={handleRemove}
+                            />
                         ))}
                         {/* Skeletons for empty slots */}
                         {Array.from({ length: emptyCount }).map((_, i) => (
@@ -549,8 +590,27 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
 
             {/* Delta table */}
             <div className="compare-lab-delta" data-testid="compare-delta">
-                <MetadataDeltaTable pins={pins} detailsMap={detailsMap} />
+                <MetadataDeltaTable
+                    pins={pins}
+                    detailsMap={detailsMap}
+                    winnerId={winnerId}
+                    onPickWinner={setWinner}
+                    onMutateWinner={() => setIsMutateOpen(true)}
+                />
             </div>
+
+            {/* Mutation Popover */}
+            {isMutateOpen && winner && (
+                <MutationPopover
+                    winner={winner}
+                    winnerDetails={detailsMap.get(winner.id)}
+                    baseUrl={forge.forgeBaseUrl}
+                    apiKey={forge.forgeApiKey || null}
+                    outputDir={forge.forgeOutputDir || null}
+                    includeSeed={forge.forgeIncludeSeed}
+                    onClose={() => setIsMutateOpen(false)}
+                />
+            )}
         </section>
     );
 }

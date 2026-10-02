@@ -471,3 +471,45 @@
 }
 
 .metadata-delta-hint { color: var(--text-secondary); }
+
+/* ── Winner and Mutation Sweep Styles ───────────────────────────── */
+.compare-lab-pin-card.is-winner {
+  border-color: #f59e0b;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.25);
+}
+
+.compare-lab-pin-winner-btn {
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(10, 11, 15, 0.72);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  backdrop-filter: blur(4px);
+  transition: all 0.15s ease;
+}
+
+.compare-lab-pin-winner-btn:hover {
+  border-color: #f59e0b;
+  color: #f59e0b;
+}
+
+.compare-lab-pin-winner-btn.active {
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+}
+
+.compare-lab-mutate-btn {
+  border-color: #f59e0b !important;
+  color: #fbbf24 !important;
+  background: rgba(245, 158, 11, 0.1) !important;
+  font-weight: 600;
+}
+
+.compare-lab-mutate-btn:hover {
+  background: rgba(245, 158, 11, 0.2) !important;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.35);
+}

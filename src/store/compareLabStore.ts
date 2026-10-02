@@ -6,12 +6,14 @@ export const COMPARE_MAX_PINS = 4;
 
 interface CompareLabState {
     pins: GalleryImageRecord[];
+    winnerId: number | null;
     pin: (image: GalleryImageRecord) => boolean;
     pinToSlot: (image: GalleryImageRecord, slotIndex: number) => boolean;
     unpin: (id: number) => void;
     togglePin: (image: GalleryImageRecord) => boolean;
     reorder: (fromIndex: number, toIndex: number) => void;
     setPins: (pins: GalleryImageRecord[]) => void;
+    setWinner: (id: number | null) => void;
     clear: () => void;
     isPinned: (id: number) => boolean;
 }
@@ -30,6 +32,8 @@ function dedupeAndClamp(pins: GalleryImageRecord[]): GalleryImageRecord[] {
 
 export const useCompareLabStore = create<CompareLabState>((set, get) => ({
     pins: [],
+    winnerId: null,
+    setWinner: (id) => set({ winnerId: id }),
 
     pin: (image) => {
         const { pins } = get();
@@ -57,14 +61,20 @@ export const useCompareLabStore = create<CompareLabState>((set, get) => ({
     },
 
     unpin: (id) => {
-        const { pins } = get();
-        set({ pins: pins.filter((p) => p.id !== id) });
+        const { pins, winnerId } = get();
+        set({
+            pins: pins.filter((p) => p.id !== id),
+            winnerId: winnerId === id ? null : winnerId,
+        });
     },
 
     togglePin: (image) => {
-        const { pins } = get();
+        const { pins, winnerId } = get();
         if (pins.some((p) => p.id === image.id)) {
-            set({ pins: pins.filter((p) => p.id !== image.id) });
+            set({
+                pins: pins.filter((p) => p.id !== image.id),
+                winnerId: winnerId === image.id ? null : winnerId,
+            });
             return false;
         }
         if (pins.length >= COMPARE_MAX_PINS) return false;
@@ -88,9 +98,16 @@ export const useCompareLabStore = create<CompareLabState>((set, get) => ({
         set({ pins: next });
     },
 
-    setPins: (pins) => set({ pins: dedupeAndClamp(pins) }),
+    setPins: (pins) => {
+        const next = dedupeAndClamp(pins);
+        const { winnerId } = get();
+        set({
+            pins: next,
+            winnerId: winnerId !== null && next.some((p) => p.id === winnerId) ? winnerId : null,
+        });
+    },
 
-    clear: () => set({ pins: [] }),
+    clear: () => set({ pins: [], winnerId: null }),
 
     isPinned: (id) => get().pins.some((p) => p.id === id),
 }));
