@@ -1,6 +1,7 @@
 use crate::{
     database::{
-        BulkRecord, CursorPage, DirectoryEntry, DuplicateGroup, ImageRecord, ModelEntry, TagCount,
+        BulkRecord, BulkRecordWithLineage, CursorPage, DirectoryEntry, DuplicateGroup,
+        ImageRecord, LineageEdgeRecord, ModelEntry, TagCount,
     },
     forge_api, image_decode, image_processing, parser, scanner, sidecar, AppState, ExportResult,
     ScanResult, StorageProfile,

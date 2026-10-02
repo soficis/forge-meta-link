@@ -152,6 +152,8 @@ export function buildForgePayload(
         alwayson_scripts: alwaysonScripts,
         send_images: true,
         save_images: true,
+        batch_size: 1,
+        n_iter: 1,
     };
 }
 

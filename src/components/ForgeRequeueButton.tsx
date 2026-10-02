@@ -16,6 +16,7 @@ interface ForgeRequeueButtonProps {
     loraTokens?: string[] | null;
     loraWeight?: number | null;
     overrides?: Partial<ForgePayloadOverrides> | null;
+    mutationOps?: unknown | null;
     onQueued?: (queueId: string, result: ForgeSendResult | ForgeBatchSendResult) => void;
     onError?: (message: string) => void;
     /** Site-specific pre-send validation (payload ranges, selection state). Return an error message to abort, null to proceed. */
@@ -45,6 +46,7 @@ export function ForgeRequeueButton({
     loraTokens = null,
     loraWeight = null,
     overrides = null,
+    mutationOps = null,
     onQueued,
     onError,
     validate,
@@ -120,7 +122,8 @@ export function ForgeRequeueButton({
                     adetailerModel,
                     loraTokens,
                     loraWeight,
-                    overrides
+                    overrides,
+                    mutationOps
                 );
                 const fallback = `batch-${Date.now()}`;
                 const qid = extractQueueId(result.message, fallback);
@@ -143,7 +146,8 @@ export function ForgeRequeueButton({
                     adetailerModel,
                     loraTokens,
                     loraWeight,
-                    overrides
+                    overrides,
+                    mutationOps
                 );
                 const fallback = `requeue-${Date.now()}`;
                 const qid = extractQueueId(result.message, fallback);

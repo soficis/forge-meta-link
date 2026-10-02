@@ -21,19 +21,21 @@ impl Database {
         Ok(map)
     }
 
-    /// Batch upsert images and their tags in a single transaction.
-    /// Dramatically faster than individual upserts (10-50x for large libraries)
-    /// because SQLite only syncs to disk once at commit time.
-    pub fn bulk_upsert_with_tags(&self, records: &[BulkRecord]) -> SqlResult<usize> {
-        if records.is_empty() {
-            return Ok(0);
+    /// Batch upsert images and their tags (and optional lineage edges) in a single transaction.
+    /// Returns the inserted/updated image ids.
+    pub fn bulk_upsert_with_lineage(
+        &self,
+        items: &[BulkRecordWithLineage],
+    ) -> SqlResult<Vec<i64>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut conn = self.pool.get().map_err(pool_error)?;
-        let mut total = 0usize;
+        let mut inserted_ids = Vec::with_capacity(items.len());
         let mut tag_id_cache: HashMap<String, i64> = HashMap::with_capacity(4096);
 
-        for chunk in records.chunks(500) {
+        for chunk in items.chunks(500) {
             let tx = conn.transaction()?;
             {
                 let mut upsert_image_stmt = tx.prepare_cached(
@@ -77,8 +79,15 @@ impl Database {
                 let mut insert_image_tag_stmt = tx.prepare_cached(
                     "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
                 )?;
+                let mut insert_lineage_edge_stmt = tx.prepare_cached(
+                    "INSERT INTO lineage_edges (child_id, parent_id, ops_json, source)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(child_id, parent_id, source) DO UPDATE SET
+                         ops_json = excluded.ops_json",
+                )?;
 
-                for record in chunk {
+                for item in chunk {
+                    let record = &item.record;
                     let extra =
                         serde_json::to_string(&record.params.extra_params).unwrap_or_default();
                     let generation_type = record
@@ -139,14 +148,35 @@ impl Database {
                         insert_image_tag_stmt.execute(params![id, tag_id])?;
                     }
 
-                    total += 1;
+                    if let Some(edge) = &item.edge {
+                        insert_lineage_edge_stmt.execute(params![
+                            id,
+                            edge.parent_id,
+                            edge.ops_json,
+                            edge.source
+                        ])?;
+                    }
+
+                    inserted_ids.push(id);
                 }
             }
 
             tx.commit()?;
         }
 
-        Ok(total)
+        Ok(inserted_ids)
+    }
+
+    /// Batch upsert images and their tags in a single transaction.
+    /// Dramatically faster than individual upserts (10-50x for large libraries)
+    /// because SQLite only syncs to disk once at commit time.
+    pub fn bulk_upsert_with_tags(&self, records: &[BulkRecord]) -> SqlResult<usize> {
+        let items: Vec<BulkRecordWithLineage> = records
+            .iter()
+            .cloned()
+            .map(|record| BulkRecordWithLineage { record, edge: None })
+            .collect();
+        self.bulk_upsert_with_lineage(&items).map(|ids| ids.len())
     }
 
     // ────────────────────────────── Writes ──────────────────────────────

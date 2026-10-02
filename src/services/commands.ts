@@ -389,7 +389,8 @@ export async function forgeSendToImage(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: Partial<ForgePayloadOverrides> | null
+    overrides: Partial<ForgePayloadOverrides> | null,
+    mutationOps: unknown | null = null
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_send_to_image", {
         request: {
@@ -404,6 +405,7 @@ export async function forgeSendToImage(
                 loraTokens,
                 loraWeight,
                 overrides,
+                mutationOps,
             },
         },
     });
@@ -419,7 +421,8 @@ export async function forgeSendToImages(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: Partial<ForgePayloadOverrides> | null
+    overrides: Partial<ForgePayloadOverrides> | null,
+    mutationOps: unknown | null = null
 ): Promise<ForgeBatchSendResult> {
     return invoke<ForgeBatchSendResult>("forge_send_to_images", {
         request: {
@@ -434,6 +437,7 @@ export async function forgeSendToImages(
                 loraTokens,
                 loraWeight,
                 overrides,
+                mutationOps,
             },
         },
     });

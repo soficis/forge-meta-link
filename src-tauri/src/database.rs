@@ -173,6 +173,7 @@ pub struct ModelEntry {
 }
 
 /// Record for bulk insert operations.
+#[derive(Debug, Clone)]
 pub struct BulkRecord {
     pub filepath: String,
     pub filename: String,
@@ -182,6 +183,19 @@ pub struct BulkRecord {
     pub file_size: Option<i64>,
     pub quick_hash: Option<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LineageEdgeRecord {
+    pub parent_id: i64,
+    pub ops_json: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkRecordWithLineage {
+    pub record: BulkRecord,
+    pub edge: Option<LineageEdgeRecord>,
 }
 
 impl Database {

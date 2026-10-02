@@ -38,6 +38,14 @@ pub struct ForgePayloadOverridesInput {
     pub model_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildResult {
+    pub parent_image_id: i64,
+    pub saved_path: String,
+    pub mutation_ops: Option<serde_json::Value>,
+    pub variant_label: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeSendOptionsRequest {
@@ -50,6 +58,7 @@ pub struct ForgeSendOptionsRequest {
     pub lora_tokens: Option<Vec<String>>,
     pub lora_weight: Option<f32>,
     pub overrides: Option<ForgePayloadOverridesInput>,
+    pub mutation_ops: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +86,7 @@ struct NormalizedForgeSendOptions {
     lora_tokens: Option<Vec<String>>,
     lora_weight: f32,
     overrides: Option<ForgePayloadOverridesInput>,
+    mutation_ops: Option<serde_json::Value>,
 }
 
 struct ForgeSendContext<'a> {
@@ -89,6 +99,7 @@ struct ForgeSendContext<'a> {
     lora_tokens: Option<&'a [String]>,
     lora_weight: f32,
     overrides: Option<&'a ForgePayloadOverridesInput>,
+    mutation_ops: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +109,7 @@ pub struct ForgeSendOutput {
     pub output_dir: String,
     pub generated_count: usize,
     pub saved_paths: Vec<String>,
+    pub children: Vec<ChildResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +120,7 @@ pub struct ForgeBatchItemOutput {
     pub message: String,
     pub generated_count: usize,
     pub saved_paths: Vec<String>,
+    pub children: Vec<ChildResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +225,7 @@ fn normalize_forge_send_options(
         lora_tokens: options.lora_tokens,
         lora_weight,
         overrides: options.overrides,
+        mutation_ops: options.mutation_ops,
     })
 }
 
@@ -923,6 +937,7 @@ async fn send_image_record_to_forge(
     context: &ForgeSendContext<'_>,
 ) -> Result<ForgeSendOutput, String> {
     let mut saved_paths = Vec::new();
+    let mut children = Vec::new();
     let mut failures = Vec::new();
     let mut unprocessed_count = 0usize;
     let mut processed_count = 0usize;
@@ -949,6 +964,14 @@ async fn send_image_record_to_forge(
         {
             Ok(paths) => {
                 unprocessed_count = paths.len();
+                for path in &paths {
+                    children.push(ChildResult {
+                        parent_image_id: image.id,
+                        saved_path: path.clone(),
+                        mutation_ops: context.mutation_ops.cloned(),
+                        variant_label: Some("unprocessed".to_string()),
+                    });
+                }
                 saved_paths.extend(paths);
             }
             Err(error) => failures.push(format!("Unprocessed request failed: {}", error)),
@@ -981,6 +1004,14 @@ async fn send_image_record_to_forge(
     {
         Ok(paths) => {
             processed_count = paths.len();
+            for path in &paths {
+                children.push(ChildResult {
+                    parent_image_id: image.id,
+                    saved_path: path.clone(),
+                    mutation_ops: context.mutation_ops.cloned(),
+                    variant_label: processed_variant.map(|s| s.to_string()),
+                });
+            }
             saved_paths.extend(paths);
         }
         Err(error) => {
@@ -1020,6 +1051,7 @@ async fn send_image_record_to_forge(
             output_dir: output_dir_display,
             generated_count,
             saved_paths,
+            children,
         });
     }
 
@@ -1046,20 +1078,23 @@ async fn send_image_record_to_forge(
         output_dir: output_dir_display,
         generated_count,
         saved_paths,
+        children,
     })
 }
 
-async fn ingest_forge_saved_paths(
-    saved_paths: &[String],
+async fn ingest_forge_children(
+    children: &[ChildResult],
     state: &AppState,
     app: Option<&tauri::AppHandle>,
 ) {
-    if saved_paths.is_empty() {
+    if children.is_empty() {
         return;
     }
 
+    let saved_paths: Vec<String> = children.iter().map(|c| c.saved_path.clone()).collect();
+
     if let Some(app_handle) = app {
-        for path_str in saved_paths {
+        for path_str in &saved_paths {
             let path = Path::new(path_str);
             if let Some(parent) = path.parent() {
                 if parent.exists() {
@@ -1069,7 +1104,7 @@ async fn ingest_forge_saved_paths(
         }
     }
 
-    let paths_clone = saved_paths.to_vec();
+    let children_clone = children.to_vec();
     let db = state.db.clone();
     let cache_dir = state.cache_dir.clone();
     let thumbnail_index = state.thumbnail_index.clone();
@@ -1080,11 +1115,11 @@ async fn ingest_forge_saved_paths(
         .unwrap_or(StorageProfile::Hdd);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut records = Vec::with_capacity(paths_clone.len());
-        let mut pathbufs = Vec::with_capacity(paths_clone.len());
+        let mut items = Vec::with_capacity(children_clone.len());
+        let mut pathbufs = Vec::with_capacity(children_clone.len());
 
-        for path_str in &paths_clone {
-            let path = PathBuf::from(path_str);
+        for child in &children_clone {
+            let path = PathBuf::from(&child.saved_path);
             if !path.exists() {
                 continue;
             }
@@ -1128,8 +1163,8 @@ async fn ingest_forge_saved_paths(
                 .to_string_lossy()
                 .to_string();
 
-            records.push(BulkRecord {
-                filepath: path_str.clone(),
+            let record = BulkRecord {
+                filepath: child.saved_path.clone(),
                 filename,
                 directory,
                 params,
@@ -1137,15 +1172,36 @@ async fn ingest_forge_saved_paths(
                 file_size: Some(file_size),
                 quick_hash,
                 tags,
-            });
+            };
+
+            let edge = if child.parent_image_id > 0 {
+                let ops_value = match &child.mutation_ops {
+                    Some(v) if v.is_array() => v.clone(),
+                    Some(v) => serde_json::json!([v]),
+                    None => serde_json::json!([]),
+                };
+                let ops_obj = serde_json::json!({
+                    "ops": ops_value,
+                    "variant_label": child.variant_label,
+                });
+                Some(LineageEdgeRecord {
+                    parent_id: child.parent_image_id,
+                    ops_json: serde_json::to_string(&ops_obj).ok(),
+                    source: "forge_requeue".to_string(),
+                })
+            } else {
+                None
+            };
+
+            items.push(BulkRecordWithLineage { record, edge });
             pathbufs.push(path);
         }
 
-        if !records.is_empty() {
-            if let Err(e) = db.bulk_upsert_with_tags(&records) {
+        if !items.is_empty() {
+            if let Err(e) = db.bulk_upsert_with_lineage(&items) {
                 log::error!("Failed to ingest Forge generated images into database: {}", e);
             } else {
-                log::info!("Successfully ingested {} Forge generated image(s)", records.len());
+                log::info!("Successfully ingested {} Forge generated image(s)", items.len());
             }
         }
 
@@ -1170,6 +1226,24 @@ async fn ingest_forge_saved_paths(
     if let Some(app) = app {
         let _ = app.emit("forge-images-ingested", saved_paths);
     }
+}
+
+#[allow(dead_code)]
+async fn ingest_forge_saved_paths(
+    saved_paths: &[String],
+    state: &AppState,
+    app: Option<&tauri::AppHandle>,
+) {
+    let dummy_children: Vec<ChildResult> = saved_paths
+        .iter()
+        .map(|p| ChildResult {
+            parent_image_id: 0,
+            saved_path: p.clone(),
+            mutation_ops: None,
+            variant_label: None,
+        })
+        .collect();
+    ingest_forge_children(&dummy_children, state, app).await;
 }
 
 #[tauri::command]
@@ -1198,11 +1272,12 @@ pub async fn forge_send_to_image(
         lora_tokens: normalized.lora_tokens.as_deref(),
         lora_weight: normalized.lora_weight,
         overrides: normalized.overrides.as_ref(),
+        mutation_ops: normalized.mutation_ops.as_ref(),
     };
 
     let result = send_image_record_to_forge(&image, &context).await?;
-    if !result.saved_paths.is_empty() {
-        ingest_forge_saved_paths(&result.saved_paths, &state, Some(&app)).await;
+    if !result.children.is_empty() {
+        ingest_forge_children(&result.children, &state, Some(&app)).await;
     }
     Ok(result)
 }
@@ -1236,6 +1311,7 @@ pub async fn forge_send_to_images(
         lora_tokens: normalized.lora_tokens.as_deref(),
         lora_weight: normalized.lora_weight,
         overrides: normalized.overrides.as_ref(),
+        mutation_ops: normalized.mutation_ops.as_ref(),
     };
 
     for image_id in image_ids {
@@ -1248,6 +1324,7 @@ pub async fn forge_send_to_images(
                 message: "Batch queue cancelled".to_string(),
                 generated_count: 0,
                 saved_paths: Vec::new(),
+                children: Vec::new(),
             });
             break;
         }
@@ -1266,6 +1343,7 @@ pub async fn forge_send_to_images(
                     message: format!("Image not found: {}", image_id),
                     generated_count: 0,
                     saved_paths: Vec::new(),
+                    children: Vec::new(),
                 });
                 continue;
             }
@@ -1281,8 +1359,8 @@ pub async fn forge_send_to_images(
                 if result.ok {
                     succeeded += 1;
                 }
-                if !result.saved_paths.is_empty() {
-                    ingest_forge_saved_paths(&result.saved_paths, &state, Some(&app)).await;
+                if !result.children.is_empty() {
+                    ingest_forge_children(&result.children, &state, Some(&app)).await;
                 }
                 items.push(ForgeBatchItemOutput {
                     image_id,
@@ -1291,6 +1369,7 @@ pub async fn forge_send_to_images(
                     message: result.message,
                     generated_count: result.generated_count,
                     saved_paths: result.saved_paths,
+                    children: result.children,
                 });
             }
             Err(error) => {
@@ -1301,6 +1380,7 @@ pub async fn forge_send_to_images(
                     message: error,
                     generated_count: 0,
                     saved_paths: Vec::new(),
+                    children: Vec::new(),
                 });
             }
         }
@@ -1395,8 +1475,17 @@ pub async fn forge_requeue_image(
     }
     let saved_paths =
         save_generated_images(&api_result.images, &output_dir, &image.filename, None)?;
-    if !saved_paths.is_empty() {
-        ingest_forge_saved_paths(&saved_paths, &state, Some(&app)).await;
+    let children: Vec<ChildResult> = saved_paths
+        .iter()
+        .map(|path| ChildResult {
+            parent_image_id: image.id,
+            saved_path: path.clone(),
+            mutation_ops: None,
+            variant_label: None,
+        })
+        .collect();
+    if !children.is_empty() {
+        ingest_forge_children(&children, &state, Some(&app)).await;
     }
     let message = api_result.message.clone();
     Ok(ForgeSendOutput {
@@ -1405,5 +1494,6 @@ pub async fn forge_requeue_image(
         output_dir: output_dir.to_string_lossy().to_string(),
         generated_count: saved_paths.len(),
         saved_paths,
+        children,
     })
 }

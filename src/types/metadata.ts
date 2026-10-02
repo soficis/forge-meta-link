@@ -113,6 +113,13 @@ export interface SidecarData {
     rating?: number | null;
 }
 
+export interface ChildResult {
+    parent_image_id: number;
+    saved_path: string;
+    mutation_ops?: Record<string, unknown> | null;
+    variant_label?: string | null;
+}
+
 export interface ForgePayload {
     prompt: string;
     negative_prompt: string;
@@ -127,6 +134,8 @@ export interface ForgePayload {
     alwayson_scripts?: Record<string, unknown>;
     send_images?: boolean;
     save_images?: boolean;
+    batch_size?: number;
+    n_iter?: number;
 }
 
 export interface ForgeStatus {
@@ -140,6 +149,7 @@ export interface ForgeSendResult {
     output_dir: string;
     generated_count: number;
     saved_paths: string[];
+    children: ChildResult[];
 }
 
 export interface ForgeBatchItemResult {
@@ -149,6 +159,7 @@ export interface ForgeBatchItemResult {
     message: string;
     generated_count: number;
     saved_paths: string[];
+    children: ChildResult[];
 }
 
 export interface ForgeBatchSendResult {

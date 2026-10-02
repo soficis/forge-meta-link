@@ -34,6 +34,10 @@ pub struct ForgePayload {
     pub save_images: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alwayson_scripts: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_iter: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +236,8 @@ pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> For
         send_images: Some(true),
         save_images: Some(true),
         alwayson_scripts,
+        batch_size: Some(1),
+        n_iter: Some(1),
     }
 }
 
@@ -305,6 +311,8 @@ pub fn build_payload_from_generation_params(
         send_images: Some(true),
         save_images: Some(true),
         alwayson_scripts,
+        batch_size: Some(1),
+        n_iter: Some(1),
     }
 }
 
