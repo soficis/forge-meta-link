@@ -1,28 +1,38 @@
 import { useState, useEffect, useRef } from "react";
-import type { DeleteMode, GenerationType, SortOption } from "../types/metadata";
+import type { GenerationType, SortOption } from "../types/metadata";
+import { CHECKPOINT_FAMILY_OPTIONS } from "../utils/checkpointFamilies";
+
+export interface ActiveFilterChip {
+    id: string;
+    label: string;
+    onRemove: () => void;
+}
 
 interface SearchBarProps {
     searchValue: string;
     onSearch: (query: string) => void;
     totalCount: number;
     resultCount: number;
+    hasMoreResults: boolean;
     sortBy: SortOption;
     onSortChange: (sort: SortOption) => void;
     generationTypeFilter: GenerationType | "all";
     onGenerationTypeChange: (value: GenerationType | "all") => void;
     selectedCount: number;
     onSelectAll: () => void;
-    onDeselectAll: () => void;
-    onDeleteSelected: () => void;
-    isDeletingSelected: boolean;
-    deleteMode: DeleteMode;
-    onDeleteModeChange: (mode: DeleteMode) => void;
     modelFilter: string;
     modelOptions: string[];
     onModelFilterChange: (value: string) => void;
     loraFilter: string;
     loraOptions: string[];
     onLoraFilterChange: (value: string) => void;
+    tagFilterInput: string;
+    onTagFilterInputChange: (value: string) => void;
+    onApplyTagFilter: (value: string) => void;
+    checkpointFamilyFilters: string[];
+    onToggleCheckpointFamilyFilter: (family: string) => void;
+    activeFilters: ActiveFilterChip[];
+    onClearAllFilters: () => void;
 }
 
 const SORT_OPTIONS: { value: SortOption; label: string }[] = [
@@ -38,7 +48,7 @@ const GENERATION_TYPE_OPTIONS: {
     value: GenerationType | "all";
     label: string;
 }[] = [
-    { value: "all", label: "All Types" },
+    { value: "all", label: "All types" },
     { value: "txt2img", label: "txt2img" },
     { value: "img2img", label: "img2img" },
     { value: "inpaint", label: "inpaint" },
@@ -52,34 +62,35 @@ export function SearchBar({
     onSearch,
     totalCount,
     resultCount,
+    hasMoreResults,
     sortBy,
     onSortChange,
     generationTypeFilter,
     onGenerationTypeChange,
     selectedCount,
     onSelectAll,
-    onDeselectAll,
-    onDeleteSelected,
-    isDeletingSelected,
-    deleteMode,
-    onDeleteModeChange,
     modelFilter,
     modelOptions,
     onModelFilterChange,
     loraFilter,
     loraOptions,
     onLoraFilterChange,
+    tagFilterInput,
+    onTagFilterInputChange,
+    onApplyTagFilter,
+    checkpointFamilyFilters,
+    onToggleCheckpointFamilyFilter,
+    activeFilters,
+    onClearAllFilters,
 }: SearchBarProps) {
     const [value, setValue] = useState(searchValue);
     const [showHelp, setShowHelp] = useState(false);
     const [showFilters, setShowFilters] = useState(false);
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const inputRef = useRef<HTMLInputElement>(null);
 
-    const hasActiveFilters =
-        generationTypeFilter !== "all" ||
-        modelFilter !== "" ||
-        loraFilter !== "" ||
-        sortBy !== "newest";
+    const filterCount = activeFilters.filter((chip) => chip.id !== "search").length;
+    const isFiltered = activeFilters.length > 0;
 
     useEffect(() => {
         setValue(searchValue);
@@ -96,6 +107,19 @@ export function SearchBar({
         };
     }, [value, onSearch]);
 
+    // Ctrl/Cmd+F focuses search. Skipped while a modal dialog owns the keyboard.
+    useEffect(() => {
+        const handleKey = (event: KeyboardEvent) => {
+            if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "f") return;
+            if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+            event.preventDefault();
+            inputRef.current?.focus();
+            inputRef.current?.select();
+        };
+        window.addEventListener("keydown", handleKey);
+        return () => window.removeEventListener("keydown", handleKey);
+    }, []);
+
     return (
         <div className="search-bar-wrapper">
             <div className="search-bar">
@@ -106,25 +130,38 @@ export function SearchBar({
                         fill="none"
                         stroke="currentColor"
                         strokeWidth="2"
+                        aria-hidden="true"
                     >
                         <circle cx="11" cy="11" r="8" />
                         <path d="m21 21-4.3-4.3" />
                     </svg>
                     <input
+                        ref={inputRef}
                         type="text"
-                        placeholder='Search prompts, models, seeds...'
+                        placeholder="Search prompts, models, seeds… (Ctrl+F)"
+                        aria-label="Search images"
                         value={value}
                         onChange={(e) => setValue(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === "Escape" && value) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setValue("");
+                                onSearch("");
+                            }
+                        }}
                         className="search-input"
                     />
                     {value && (
                         <button
+                            type="button"
                             className="search-clear"
                             onClick={() => {
                                 setValue("");
                                 onSearch("");
                             }}
                             title="Clear search"
+                            aria-label="Clear search"
                         >
                             &#x2715;
                         </button>
@@ -134,6 +171,7 @@ export function SearchBar({
                         className="search-help-btn"
                         onClick={() => setShowHelp((prev) => !prev)}
                         title="Search syntax help"
+                        aria-label="Search syntax help"
                         aria-expanded={showHelp}
                     >
                         ?
@@ -142,133 +180,178 @@ export function SearchBar({
 
                 <button
                     type="button"
-                    className={`search-filter-toggle ${showFilters || hasActiveFilters ? "active" : ""}`}
+                    className={`search-filter-toggle ${showFilters || filterCount > 0 ? "active" : ""}`}
                     onClick={() => setShowFilters((prev) => !prev)}
-                    title="Toggle filters"
+                    aria-expanded={showFilters}
                 >
-                    Filters{hasActiveFilters ? " *" : ""}
+                    Filters{filterCount > 0 ? ` (${filterCount})` : ""}
                 </button>
 
-                <div className="search-stats">
-                    {value.trim() || modelFilter || loraFilter ? (
-                        <span>{resultCount} results</span>
+                <select
+                    className="sort-select"
+                    value={sortBy}
+                    onChange={(e) => onSortChange(e.target.value as SortOption)}
+                    aria-label="Sort order"
+                >
+                    {SORT_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                            Sort: {opt.label}
+                        </option>
+                    ))}
+                </select>
+
+                <div className="search-stats" aria-live="polite">
+                    {isFiltered ? (
+                        <span
+                            title={
+                                hasMoreResults
+                                    ? "More matches load as you scroll"
+                                    : undefined
+                            }
+                        >
+                            {resultCount.toLocaleString()}
+                            {hasMoreResults ? "+" : ""} match{resultCount === 1 && !hasMoreResults ? "" : "es"}
+                        </span>
                     ) : (
                         <span>{totalCount.toLocaleString()} images</span>
                     )}
+                    {selectedCount === 0 && resultCount > 0 && (
+                        <button
+                            type="button"
+                            className="search-select-all"
+                            onClick={onSelectAll}
+                            title="Select all loaded images (Ctrl+A)"
+                        >
+                            Select all
+                        </button>
+                    )}
                 </div>
-
-                {selectedCount > 0 && (
-                    <div className="search-selection-bar">
-                        <span className="search-selection-info">{selectedCount} selected</span>
-                        <select
-                            className="search-select-all"
-                            value={deleteMode}
-                            onChange={(event) =>
-                                onDeleteModeChange(event.target.value as DeleteMode)
-                            }
-                            title="Deletion mode"
-                            disabled={isDeletingSelected}
-                        >
-                            <option value="trash">Move to Recycle Bin/Trash</option>
-                            <option value="permanent">Delete Permanently</option>
-                        </select>
-                        <button
-                            className="search-select-all danger"
-                            onClick={onDeleteSelected}
-                            disabled={isDeletingSelected}
-                            title={
-                                deleteMode === "trash"
-                                    ? "Move selected images to Trash"
-                                    : "Permanently delete selected images"
-                            }
-                        >
-                            {isDeletingSelected
-                                ? "Working..."
-                                : deleteMode === "trash"
-                                  ? "Trash Selected"
-                                  : "Delete Selected"}
-                        </button>
-                        <button
-                            className="search-select-all"
-                            onClick={onDeselectAll}
-                            disabled={isDeletingSelected}
-                            title="Deselect all images"
-                        >
-                            Deselect All
-                        </button>
-                    </div>
-                )}
             </div>
 
             {showFilters && (
-                <div className="search-filters-row">
-                    <select
-                        className="sort-select"
-                        value={sortBy}
-                        onChange={(e) => onSortChange(e.target.value as SortOption)}
-                    >
-                        {SORT_OPTIONS.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                                {opt.label}
-                            </option>
-                        ))}
-                    </select>
+                <div className="search-filters-panel">
+                    <div className="search-filters-row">
+                        <label className="search-filter-field">
+                            <span>Type</span>
+                            <select
+                                className="sort-select"
+                                value={generationTypeFilter}
+                                onChange={(e) =>
+                                    onGenerationTypeChange(e.target.value as GenerationType | "all")
+                                }
+                            >
+                                {GENERATION_TYPE_OPTIONS.map((opt) => (
+                                    <option key={opt.value} value={opt.value}>
+                                        {opt.label}
+                                    </option>
+                                ))}
+                            </select>
+                        </label>
 
-                    <select
-                        className="sort-select"
-                        value={generationTypeFilter}
-                        onChange={(e) =>
-                            onGenerationTypeChange(e.target.value as GenerationType | "all")
-                        }
-                        title="Filter by generation type"
-                    >
-                        {GENERATION_TYPE_OPTIONS.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                                {opt.label}
-                            </option>
-                        ))}
-                    </select>
+                        <label className="search-filter-field">
+                            <span>Model</span>
+                            <select
+                                className="sort-select"
+                                value={modelFilter}
+                                onChange={(e) => onModelFilterChange(e.target.value)}
+                            >
+                                <option value="">All models</option>
+                                {modelOptions.map((model) => (
+                                    <option key={model} value={model}>
+                                        {model}
+                                    </option>
+                                ))}
+                            </select>
+                        </label>
 
-                    <select
-                        className="sort-select"
-                        value={modelFilter}
-                        onChange={(e) => onModelFilterChange(e.target.value)}
-                        title="Filter by detected model"
-                    >
-                        <option value="">All Models</option>
-                        {modelOptions.map((model) => (
-                            <option key={model} value={model}>
-                                {model}
-                            </option>
-                        ))}
-                    </select>
+                        <label className="search-filter-field">
+                            <span>LoRA</span>
+                            <select
+                                className="sort-select"
+                                value={loraFilter}
+                                onChange={(e) => onLoraFilterChange(e.target.value)}
+                            >
+                                <option value="">All LoRAs</option>
+                                {loraOptions.map((loraTag) => {
+                                    const display = loraTag.startsWith("lora:")
+                                        ? loraTag.slice("lora:".length)
+                                        : loraTag;
+                                    return (
+                                        <option key={loraTag} value={loraTag}>
+                                            {display}
+                                        </option>
+                                    );
+                                })}
+                            </select>
+                        </label>
 
-                    <select
-                        className="sort-select"
-                        value={loraFilter}
-                        onChange={(e) => onLoraFilterChange(e.target.value)}
-                        title="Filter by detected LoRA tag"
-                    >
-                        <option value="">All LoRAs</option>
-                        {loraOptions.map((loraTag) => {
-                            const display = loraTag.startsWith("lora:")
-                                ? loraTag.slice("lora:".length)
-                                : loraTag;
+                        <form
+                            className="search-filter-field search-filter-tags"
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                onApplyTagFilter(tagFilterInput);
+                            }}
+                        >
+                            <label htmlFor="tag-filter-input">Tags</label>
+                            <div className="search-filter-inline">
+                                <input
+                                    id="tag-filter-input"
+                                    className="sidebar-input"
+                                    value={tagFilterInput}
+                                    placeholder="1girl -nsfw"
+                                    aria-describedby="tag-filter-hint"
+                                    onChange={(event) => onTagFilterInputChange(event.target.value)}
+                                />
+                                <button type="submit" className="search-select-all">
+                                    Apply
+                                </button>
+                            </div>
+                            <span id="tag-filter-hint" className="search-filter-hint">
+                                Separate tags with spaces. Put - in front to exclude.
+                            </span>
+                        </form>
+                    </div>
+
+                    <div className="search-filters-row" role="group" aria-label="Checkpoint family">
+                        <span className="search-filter-label">Checkpoint family</span>
+                        {CHECKPOINT_FAMILY_OPTIONS.map((option) => {
+                            const active = checkpointFamilyFilters.includes(option.value);
                             return (
-                                <option key={loraTag} value={loraTag}>
-                                    {display}
-                                </option>
+                                <button
+                                    key={option.value}
+                                    type="button"
+                                    className={`checkpoint-family-toggle ${active ? "active" : ""}`}
+                                    aria-pressed={active}
+                                    onClick={() => onToggleCheckpointFamilyFilter(option.value)}
+                                >
+                                    {option.label}
+                                </button>
                             );
                         })}
-                    </select>
+                    </div>
+                </div>
+            )}
 
-                    <button
-                        className="search-select-all"
-                        onClick={selectedCount > 0 ? onDeselectAll : onSelectAll}
-                        title={selectedCount > 0 ? "Deselect all images" : "Select all loaded images"}
-                    >
-                        {selectedCount > 0 ? "Deselect All" : "Select All"}
-                    </button>
+            {activeFilters.length > 0 && (
+                <div className="active-filter-row" role="group" aria-label="Active filters">
+                    {activeFilters.map((chip) => (
+                        <span key={chip.id} className="active-filter-chip">
+                            {chip.label}
+                            <button
+                                type="button"
+                                onClick={chip.onRemove}
+                                aria-label={`Remove filter: ${chip.label}`}
+                                title="Remove filter"
+                            >
+                                ✕
+                            </button>
+                        </span>
+                    ))}
+                    {activeFilters.length > 1 && (
+                        <button type="button" className="active-filter-clear" onClick={onClearAllFilters}>
+                            Clear all
+                        </button>
+                    )}
                 </div>
             )}
 
@@ -276,7 +359,14 @@ export function SearchBar({
                 <div className="search-help-popup">
                     <div className="search-help-header">
                         <strong>Search Syntax</strong>
-                        <button onClick={() => setShowHelp(false)} className="search-help-close">&#x2715;</button>
+                        <button
+                            type="button"
+                            onClick={() => setShowHelp(false)}
+                            className="search-help-close"
+                            aria-label="Close search help"
+                        >
+                            &#x2715;
+                        </button>
                     </div>
                     <div className="search-help-body">
                         <div className="search-help-row">
@@ -293,7 +383,7 @@ export function SearchBar({
                         </div>
                         <div className="search-help-row">
                             <code>tag1 -tag2</code>
-                            <span>Booru-style include/exclude tags in Tag Filters</span>
+                            <span>Include/exclude tags: use the Tags box under Filters</span>
                         </div>
                         <div className="search-help-row">
                             <code>cat*</code>

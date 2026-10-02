@@ -1,6 +1,6 @@
 {
     "identifier": "default",
-    "description": "Default capabilities for ForgeMetaLink",
+    "description": "Default capabilities for ForgeMetaLink — window main only.",
     "windows": [
         "main"
     ],

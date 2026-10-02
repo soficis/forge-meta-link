@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use flate2::read::ZlibDecoder;
+use rayon::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -8,10 +9,18 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::StorageProfile;
+
+/// HDD-optimized WalkDir buffer: 256 KiB sequential, no rayon par_iter.
+/// SSD uses rayon with cpu-1 global pool for parallel filtering.
+const HDD_WALK_BUFFER_CAPACITY: usize = 256 * 1024;
+
 /// PNG file signature (first 8 bytes of any valid PNG)
 const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 const PNG_READER_CAPACITY: usize = 128 * 1024;
 const QUICK_HASH_SAMPLE_BYTES: usize = 64 * 1024;
+pub const MAX_TEXT_CHUNK_BYTES: u32 = 16 * 1024 * 1024; // 16 MiB
+pub const MAX_DECOMPRESSED_TEXT_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 const PRIMARY_METADATA_KEYS: &[&str] = &[
     "parameters",
     "Parameters",
@@ -42,6 +51,7 @@ pub fn extract_text_chunks(
     path: &Path,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(PNG_READER_CAPACITY, file);
     let mut text_chunks = HashMap::new();
 
@@ -61,8 +71,20 @@ pub fn extract_text_chunks(
             break;
         }
 
+        let current_pos = reader.stream_position().unwrap_or(file_len);
+        let remaining_bytes = file_len.saturating_sub(current_pos);
+
         match &chunk_type {
             b"tEXt" | b"zTXt" | b"iTXt" => {
+                if length > MAX_TEXT_CHUNK_BYTES || (length as u64) > remaining_bytes {
+                    let skip_bytes = (length as u64).saturating_add(4);
+                    if skip_bytes > remaining_bytes {
+                        break;
+                    }
+                    reader.seek(SeekFrom::Current(skip_bytes as i64))?;
+                    continue;
+                }
+
                 let mut data = vec![0u8; length as usize];
                 reader.read_exact(&mut data)?;
                 reader.seek(SeekFrom::Current(4))?; // Skip CRC
@@ -82,8 +104,11 @@ pub fn extract_text_chunks(
                 break; // End of PNG
             }
             _ => {
-                // Skip chunk data + CRC (4 bytes)
-                reader.seek(SeekFrom::Current(length as i64 + 4))?;
+                let skip_bytes = (length as u64).saturating_add(4);
+                if skip_bytes > remaining_bytes {
+                    break;
+                }
+                reader.seek(SeekFrom::Current(skip_bytes as i64))?;
             }
         }
     }
@@ -280,17 +305,39 @@ fn parse_itxt_chunk_pair(data: &[u8]) -> Option<(String, String)> {
 }
 
 fn decompress_zlib_to_string(data: &[u8]) -> Option<String> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut output = String::new();
-    decoder.read_to_string(&mut output).ok()?;
-    Some(output)
+    let decoder = ZlibDecoder::new(data);
+    let mut limited = decoder.take(MAX_DECOMPRESSED_TEXT_BYTES + 1);
+    let mut output = Vec::new();
+    limited.read_to_end(&mut output).ok()?;
+    if output.len() as u64 > MAX_DECOMPRESSED_TEXT_BYTES {
+        return None;
+    }
+    String::from_utf8(output).ok()
 }
 
 /// Supported image extensions for scanning.
 const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "avif", "gif", "jxl"];
 
+pub fn is_within_jail(canonical_root: &Path, canonical_child: &Path) -> bool {
+    canonical_child.starts_with(canonical_root)
+}
+
 /// Recursively scans a directory for supported image files and returns their paths.
+/// StorageProfile::Hdd uses sequential WalkDir with 256 KiB buffering; Ssd uses rayon cpu-1.
 pub fn scan_directory(dir: &Path) -> Vec<ScannedFile> {
+    scan_directory_with_profile(dir, StorageProfile::Hdd)
+}
+
+pub fn scan_directory_with_profile(dir: &Path, profile: StorageProfile) -> Vec<ScannedFile> {
+    match profile {
+        StorageProfile::Hdd => scan_directory_sequential_hdd(dir),
+        StorageProfile::Ssd => scan_directory_parallel_ssd(dir),
+    }
+}
+
+fn scan_directory_sequential_hdd(dir: &Path) -> Vec<ScannedFile> {
+    let _buffer_hint = HDD_WALK_BUFFER_CAPACITY;
+    let canonical_root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let mut paths = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
@@ -301,18 +348,24 @@ pub fn scan_directory(dir: &Path) -> Vec<ScannedFile> {
         if !entry.file_type().is_file() {
             continue;
         }
-
         let path = entry.path();
+        let canonical_child = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !is_within_jail(&canonical_root, &canonical_child) {
+            continue;
+        }
         if let Some(ext) = path.extension() {
             let ext_lower = ext.to_string_lossy().to_ascii_lowercase();
             if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
                 let metadata = entry.metadata().ok();
                 let file_mtime = metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|m| m.modified().ok())
                     .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs() as i64);
-                let file_size = metadata.as_ref().map(|metadata| metadata.len() as i64);
+                    .map(|d| d.as_secs() as i64);
+                let file_size = metadata.as_ref().map(|m| m.len() as i64);
                 paths.push(ScannedFile {
                     path: path.to_path_buf(),
                     file_mtime,
@@ -322,6 +375,44 @@ pub fn scan_directory(dir: &Path) -> Vec<ScannedFile> {
         }
     }
     paths
+}
+
+fn scan_directory_parallel_ssd(dir: &Path) -> Vec<ScannedFile> {
+    let canonical_root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let entries: Vec<_> = walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .max_open(32)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .collect();
+    entries
+        .into_par_iter()
+        .filter_map(|entry| {
+            let path = entry.path().to_path_buf();
+            let canonical_child = path.canonicalize().ok()?;
+            if !is_within_jail(&canonical_root, &canonical_child) {
+                return None;
+            }
+            let ext = path.extension()?;
+            let ext_lower = ext.to_string_lossy().to_ascii_lowercase();
+            if !SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                return None;
+            }
+            let metadata = entry.metadata().ok();
+            let file_mtime = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let file_size = metadata.as_ref().map(|m| m.len() as i64);
+            Some(ScannedFile {
+                path,
+                file_mtime,
+                file_size,
+            })
+        })
+        .collect()
 }
 
 /// Computes a fast, HDD-friendly content fingerprint from sampled bytes.
@@ -388,6 +479,86 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn walkdir_jail_symlink_outside_root_is_excluded() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("fml_jail_root_{}_{}", pid, nanos));
+        let outside = std::env::temp_dir().join(format!("fml_jail_outside_{}_{}", pid, nanos));
+        let _ = fs::create_dir_all(&root);
+        let _ = fs::create_dir_all(&outside);
+        let outside_file = outside.join("secret.png");
+        let _ = fs::write(&outside_file, b"fake png");
+        let inside_file = root.join("inside.png");
+        let _ = fs::write(&inside_file, b"inside png");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_path = root.join("link_to_outside.png");
+            let _ = symlink(&outside_file, &link_path);
+        }
+        #[cfg(windows)]
+        {
+            let link_path = root.join("link_to_outside.png");
+            let _ = std::os::windows::fs::symlink_file(&outside_file, &link_path);
+        }
+
+        let results = scan_directory(&root);
+        let found_outside = results.iter().any(|f| {
+            f.path
+                .canonicalize()
+                .map(|p| p == outside_file.canonicalize().unwrap_or(outside_file.clone()))
+                .unwrap_or(false)
+        });
+        let found_inside = results.iter().any(|f| f.path == inside_file);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            !found_outside,
+            "symlink to /etc/passwd outside root must be jailed"
+        );
+        assert!(found_inside, "inside file must be found");
+    }
+
+    #[test]
+    fn walkdir_jail_symlink_dir_outside_root_not_traversed() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            + 1;
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("fml_jail_root_dir_{}_{}", pid, nanos));
+        let outside = std::env::temp_dir().join(format!("fml_jail_outside_dir_{}_{}", pid, nanos));
+        let _ = fs::create_dir_all(&root);
+        let _ = fs::create_dir_all(&outside);
+        let outside_file = outside.join("evil.png");
+        let _ = fs::write(&outside_file, b"evil");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_dir = root.join("linkdir");
+            let _ = symlink(&outside, &link_dir);
+        }
+        #[cfg(windows)]
+        {
+            let link_dir = root.join("linkdir");
+            let _ = std::os::windows::fs::symlink_dir(&outside, &link_dir);
+        }
+        let results = scan_directory(&root);
+        let found_evil = results.iter().any(|f| f.path.ends_with("evil.png"));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            !found_evil,
+            "symlinked dir outside root must not be traversed"
+        );
+    }
 
     fn build_chunk(chunk_type: [u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -606,5 +777,64 @@ mod tests {
         assert_eq!(hash_a, hash_b);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_extract_text_chunks_oversized_length_does_not_allocate_or_panic() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "fml_png_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let png_path = temp_dir.join("oversized_chunk.png");
+
+        let mut data = Vec::new();
+        // PNG signature
+        data.extend_from_slice(&PNG_SIGNATURE);
+        // tEXt chunk with claimed length 0xFFFFFFFF
+        data.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+        data.extend_from_slice(b"tEXt");
+        data.extend_from_slice(b"Comment\0hello");
+        data.extend_from_slice(&[0, 0, 0, 0]); // dummy CRC
+
+        fs::write(&png_path, &data).unwrap();
+
+        let chunks = extract_text_chunks(&png_path).expect("should handle oversized chunk cleanly");
+        assert!(
+            chunks.is_empty(),
+            "chunk with invalid claimed length should be skipped"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ztxt_bomb_decompression_returns_none() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 20 MiB of zeros compressed with zlib
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        let zero_buf = vec![0u8; 1024 * 1024]; // 1 MiB chunk
+        for _ in 0..20 {
+            encoder.write_all(&zero_buf).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+
+        // Build zTXt payload: keyword + null + compression method (0) + compressed data
+        let mut ztxt_data = Vec::new();
+        ztxt_data.extend_from_slice(b"Comment\0");
+        ztxt_data.push(0); // compression method 0 (deflate)
+        ztxt_data.extend_from_slice(&compressed);
+
+        let parsed = parse_ztxt_chunk_pair(&ztxt_data);
+        assert!(
+            parsed.is_none(),
+            "zTXt bomb exceeding MAX_DECOMPRESSED_TEXT_BYTES must return None"
+        );
     }
 }

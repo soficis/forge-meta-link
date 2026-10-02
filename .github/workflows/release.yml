@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -63,12 +63,13 @@ jobs:
           cache: npm
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Rust
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           workspaces: src-tauri
 
@@ -87,6 +88,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
 
       - name: Prefetch Windows bundler tools (NSIS/WiX) with retry
         if: startsWith(matrix.runner, 'windows')
@@ -220,6 +227,8 @@ jobs:
     needs:
       - build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -227,15 +236,16 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
-      - name: Resolve release tag
+      - name: Resolve and validate release tag
         id: release_tag
+        env:
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' || { echo "Invalid tag: $TAG"; exit 1; }
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -254,20 +264,41 @@ jobs:
             -o -name 'forge-meta-link_*.exe' \) \
             | sort
 
-      - name: Create/Update Github Release 
-        uses: docker://ghcr.io/mini-bomba/create-github-release:v1.2.0
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          find . -maxdepth 2 -type f \
+            \( -name 'forge-meta-link_*.deb' \
+            -o -name 'forge-meta-link_*.AppImage' \
+            -o -name 'forge-meta-link_*.dmg' \
+            -o -name 'forge-meta-link_*.msi' \
+            -o -name 'forge-meta-link_*.exe' \) \
+            -exec sha256sum {} + | sed 's|\./||' | sort -k2 > SHA256SUMS.txt
+          echo "Generated SHA256SUMS.txt:"
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
         env:
-          INPUT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_TAG: ${{ steps.release_tag.outputs.value }}
-          INPUT_NAME: ${{ steps.release_tag.outputs.value }}
-          INPUT_BODY: |
-            ForgeMetaLink release ${{ steps.release_tag.outputs.value }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release_tag.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY=$(cat <<EOF
+          ForgeMetaLink release ${TAG}
 
-            Automated release created by GitHub Actions.
-            Commit: ${{ github.sha }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Automated release created by GitHub Actions.
+          Commit: ${GITHUB_SHA}
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
-            Build artifacts are uploaded by the next workflow step.
+          Build artifacts and SHA256SUMS.txt are attached below.
+          EOF
+          )
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --title "${TAG}" --notes "${BODY}"
+          fi
 
       - name: Upload assets to GitHub release
         env:
@@ -283,7 +314,8 @@ jobs:
               -o -name 'forge-meta-link_*.AppImage' \
               -o -name 'forge-meta-link_*.dmg' \
               -o -name 'forge-meta-link_*.msi' \
-              -o -name 'forge-meta-link_*.exe' \) \
+              -o -name 'forge-meta-link_*.exe' \
+              -o -name 'SHA256SUMS.txt' \) \
               -print0
           )
 

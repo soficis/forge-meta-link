@@ -1,5 +1,7 @@
 use crate::{
-    database::{BulkRecord, CursorPage, DirectoryEntry, ImageRecord, ModelEntry, TagCount},
+    database::{
+        BulkRecord, CursorPage, DirectoryEntry, DuplicateGroup, ImageRecord, ModelEntry, TagCount,
+    },
     forge_api, image_decode, image_processing, parser, scanner, sidecar, AppState, ExportResult,
     ScanResult, StorageProfile,
 };
@@ -8,10 +10,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
 /// Mapping between a source filepath and its resolved thumbnail path.
@@ -80,9 +82,7 @@ struct PendingFile {
     file_size: Option<i64>,
 }
 
-/// Size of each bulk-upsert transaction chunk.
-/// Larger = fewer disk syncs; 500 is a sweet-spot for SQLite WAL mode.
-const BULK_CHUNK_SIZE: usize = 1_000;
+const BULK_CHUNK_SIZE: usize = 500;
 /// File chunk size for metadata parsing to avoid building huge in-memory vectors.
 const METADATA_PARSE_CHUNK_SIZE: usize = 2_048;
 
@@ -108,9 +108,10 @@ fn scan_threads(profile: StorageProfile) -> usize {
     let cpu_count = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4);
+    let cpu_minus_one = cpu_count.saturating_sub(1).max(2);
     match profile {
-        StorageProfile::Hdd => cpu_count.clamp(2, HDD_FRIENDLY_SCAN_THREADS),
-        StorageProfile::Ssd => cpu_count.clamp(4, SSD_FRIENDLY_SCAN_THREADS),
+        StorageProfile::Hdd => cpu_minus_one.clamp(2, HDD_FRIENDLY_SCAN_THREADS),
+        StorageProfile::Ssd => cpu_minus_one.clamp(4, SSD_FRIENDLY_SCAN_THREADS),
     }
 }
 
@@ -191,11 +192,19 @@ pub fn set_storage_profile(
 
 #[tauri::command]
 pub fn get_forge_api_key(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    state
-        .forge_api_key
-        .read()
-        .map(|api_key| api_key.clone())
-        .map_err(|_| "Failed to read Forge API key".to_string())
+    match crate::load_forge_api_key(&state.forge_api_key_path) {
+        Ok(Some(key)) => {
+            if let Ok(mut lock) = state.forge_api_key.write() {
+                *lock = key.clone();
+            }
+            Ok(key)
+        }
+        Ok(None) => Ok(String::new()),
+        Err(e) => {
+            log::warn!("Failed to read Forge API key: {}", e);
+            Err(format!("Could not read saved Forge API key: {}", e))
+        }
+    }
 }
 
 #[tauri::command]
@@ -210,6 +219,45 @@ pub fn set_forge_api_key(api_key: String, state: tauri::State<'_, AppState>) -> 
 
     crate::persist_forge_api_key(&state.forge_api_key_path, &api_key)?;
     Ok(())
+}
+
+/// Returns true if filepath is either an indexed image in the DB,
+/// or located under the thumbnail cache directory or the display cache directory.
+pub fn is_allowed_path(filepath: &str, db: &crate::database::Database, cache_dir: &Path) -> bool {
+    if db.is_indexed_path(filepath) {
+        return true;
+    }
+
+    let path = Path::new(filepath);
+
+    // Allow files directly inside or subdirectories of cache_dir (thumbnails)
+    if let (Ok(canonical_path), Ok(canonical_cache)) =
+        (path.canonicalize(), cache_dir.canonicalize())
+    {
+        if canonical_path.starts_with(&canonical_cache) {
+            return true;
+        }
+    } else if path.starts_with(cache_dir) {
+        return true;
+    }
+
+    // Allow files in display-cache
+    let display_cache = cache_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("display-cache");
+    if let (Ok(canonical_path), Ok(canonical_display)) =
+        (path.canonicalize(), display_cache.canonicalize())
+    {
+        if canonical_path.starts_with(&canonical_display) {
+            return true;
+        }
+    } else if path.starts_with(&display_cache) {
+        return true;
+    }
+
+    false
 }
 
 include!("commands/scan.rs");
@@ -227,3 +275,90 @@ include!("commands/forge.rs");
 include!("commands/sidecar.rs");
 
 include!("commands/delete.rs");
+
+include!("commands/timeline.rs");
+
+include!("commands/lineage.rs");
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_indexed_and_allowed_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "fml_path_val_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+        let db = crate::database::Database::new(&db_path, crate::StorageProfile::Hdd).unwrap();
+        let cache_dir = temp_dir.join("cache");
+        let display_cache_dir = temp_dir.join("display-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&display_cache_dir).unwrap();
+
+        let indexed_file = temp_dir.join("indexed.png");
+        std::fs::write(&indexed_file, b"data").unwrap();
+
+        let conn = db.pool_get_for_test().unwrap();
+        conn.execute(
+            "INSERT INTO images(filepath, filename, directory, prompt, quick_hash, file_mtime)
+             VALUES (?1, 'indexed.png', ?2, 'p', NULL, 100)",
+            rusqlite::params![indexed_file.to_str().unwrap(), temp_dir.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // 1. is_indexed_path
+        assert!(db.is_indexed_path(indexed_file.to_str().unwrap()));
+        // Slash variation
+        let alt_indexed = indexed_file.to_str().unwrap().replace('\\', "/");
+        assert!(db.is_indexed_path(&alt_indexed));
+        // Non-indexed path
+        let unindexed_file = temp_dir.join("unindexed.png");
+        assert!(!db.is_indexed_path(unindexed_file.to_str().unwrap()));
+        assert!(!db.is_indexed_path("C:\\Windows\\System32\\calc.exe"));
+
+        // 2. is_allowed_path
+        // Indexed path is allowed
+        assert!(is_allowed_path(
+            indexed_file.to_str().unwrap(),
+            &db,
+            &cache_dir
+        ));
+        // Path in cache_dir (e.g. thumbnail) is allowed
+        let thumb_file = cache_dir.join("thumb1.jpg");
+        std::fs::write(&thumb_file, b"thumb").unwrap();
+        assert!(is_allowed_path(
+            thumb_file.to_str().unwrap(),
+            &db,
+            &cache_dir
+        ));
+
+        // Path in display-cache is allowed
+        let display_file = display_cache_dir.join("proxy1.png");
+        std::fs::write(&display_file, b"proxy").unwrap();
+        assert!(is_allowed_path(
+            display_file.to_str().unwrap(),
+            &db,
+            &cache_dir
+        ));
+
+        // Unindexed path outside cache is rejected
+        assert!(!is_allowed_path(
+            unindexed_file.to_str().unwrap(),
+            &db,
+            &cache_dir
+        ));
+        assert!(!is_allowed_path(
+            "C:\\Windows\\System32\\calc.exe",
+            &db,
+            &cache_dir
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

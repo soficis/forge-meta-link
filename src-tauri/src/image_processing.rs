@@ -9,11 +9,12 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Thumbnails are written as JPEG with tuned quality for compact cache size.
 const THUMB_EXTENSION: &str = "jpg";
-const THUMB_SIZE: u32 = 640;
+const THUMB_SIZE_HDD: u32 = 480;
+const THUMB_SIZE_SSD: u32 = 640;
 const THUMB_FILTER: FilterType = FilterType::Lanczos3;
-const THUMB_JPEG_QUALITY_DEFAULT: u8 = 90;
+const THUMB_JPEG_QUALITY_HDD: u8 = 82;
+const THUMB_JPEG_QUALITY_SSD: u8 = 90;
 const THUMB_CACHE_VERSION: &str = "thumb-v2-hq";
 const HDD_FRIENDLY_IO_THREADS: usize = 4;
 const SSD_FRIENDLY_IO_THREADS: usize = 12;
@@ -61,15 +62,23 @@ fn profile_label(profile: StorageProfile) -> &'static str {
     }
 }
 
-fn thumb_jpeg_quality() -> u8 {
-    static QUALITY: OnceLock<u8> = OnceLock::new();
-    *QUALITY.get_or_init(|| {
-        std::env::var("FORGE_THUMB_JPEG_QUALITY")
-            .ok()
-            .and_then(|raw| raw.parse::<u8>().ok())
-            .map(|quality| quality.clamp(40, 95))
-            .unwrap_or(THUMB_JPEG_QUALITY_DEFAULT)
-    })
+fn thumb_size(profile: StorageProfile) -> u32 {
+    match profile {
+        StorageProfile::Hdd => THUMB_SIZE_HDD,
+        StorageProfile::Ssd => THUMB_SIZE_SSD,
+    }
+}
+
+fn thumb_jpeg_quality(profile: StorageProfile) -> u8 {
+    if let Ok(raw) = std::env::var("FORGE_THUMB_JPEG_QUALITY") {
+        if let Ok(parsed) = raw.parse::<u8>() {
+            return parsed.clamp(40, 95);
+        }
+    }
+    match profile {
+        StorageProfile::Hdd => THUMB_JPEG_QUALITY_HDD,
+        StorageProfile::Ssd => THUMB_JPEG_QUALITY_SSD,
+    }
 }
 
 pub fn prepare_cache_dir(cache_dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -83,16 +92,19 @@ pub fn prepare_cache_dir(cache_dir: &Path) -> Result<(), Box<dyn std::error::Err
     })
 }
 
-/// Generates thumbnails for a batch of image paths using parallel processing.
-///
-/// - Uses Rayon's par_iter for work-stealing parallelism across CPU cores.
-/// - Skips files that already have thumbnails in the cache.
-/// - Each thumbnail is named by SHA256(original_path) to avoid filename collisions.
-/// - Saves as JPEG for smaller, storage-efficient thumbnails.
 pub fn generate_thumbnails(
     paths: &[PathBuf],
     cache_dir: &Path,
     profile: StorageProfile,
+) -> Vec<(PathBuf, PathBuf)> {
+    generate_thumbnails_ext(paths, cache_dir, profile, false)
+}
+
+pub fn generate_thumbnails_ext(
+    paths: &[PathBuf],
+    cache_dir: &Path,
+    profile: StorageProfile,
+    force: bool,
 ) -> Vec<(PathBuf, PathBuf)> {
     if let Err(e) = prepare_cache_dir(cache_dir) {
         log::error!("Failed to create thumbnail cache dir: {}", e);
@@ -102,26 +114,25 @@ pub fn generate_thumbnails(
     io_pool(profile).install(|| {
         paths
             .par_iter()
-            .filter_map(|path| match generate_single_thumbnail(path, cache_dir) {
-                Ok(thumb_path) => Some((path.clone(), thumb_path)),
-                Err(e) => {
-                    log::warn!("Thumbnail generation failed for {}: {}", path.display(), e);
-                    None
+            .filter_map(|path| {
+                match generate_single_thumbnail_impl(path, cache_dir, profile, force) {
+                    Ok(thumb_path) => Some((path.clone(), thumb_path)),
+                    Err(e) => {
+                        log::warn!("Thumbnail generation failed for {}: {}", path.display(), e);
+                        None
+                    }
                 }
             })
             .collect()
     })
 }
 
-/// Generates a single thumbnail if it doesn't already exist.
-///
-/// Public so callers (e.g. `get_thumbnail_path`) can generate on-demand.
 pub fn ensure_thumbnail(
     source: &Path,
     cache_dir: &Path,
-    _profile: StorageProfile,
+    profile: StorageProfile,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    generate_single_thumbnail(source, cache_dir)
+    generate_single_thumbnail(source, cache_dir, profile)
 }
 
 /// Resolves thumbnail mappings for a batch of source filepaths.
@@ -150,7 +161,7 @@ pub fn resolve_thumbnail_paths(
                     return (filepath.clone(), thumb.to_string_lossy().to_string());
                 }
 
-                match generate_single_thumbnail(source, cache_dir) {
+                match generate_single_thumbnail(source, cache_dir, profile) {
                     Ok(generated) => (filepath.clone(), generated.to_string_lossy().to_string()),
                     Err(e) => {
                         log::warn!("On-demand thumbnail failed for {}: {}", filepath, e);
@@ -162,35 +173,53 @@ pub fn resolve_thumbnail_paths(
     })
 }
 
-/// Generates a single thumbnail, returning the thumbnail path.
-fn generate_single_thumbnail(
+fn generate_single_thumbnail_impl(
     source: &Path,
     cache_dir: &Path,
+    profile: StorageProfile,
+    force: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let thumb_name = hash_path(source);
     let thumb_path = cache_dir.join(format!("{}.{}", thumb_name, THUMB_EXTENSION));
 
-    // Skip if already cached
-    if thumb_path.exists() {
+    if !force && thumb_path.exists() {
         return Ok(thumb_path);
     }
 
-    // Open and resize using the configured high-quality filter.
     let img = image_decode::open_image(source)?;
-    let thumbnail = img.resize(THUMB_SIZE, THUMB_SIZE, THUMB_FILTER);
-    encode_jpeg_thumbnail(&thumbnail, &thumb_path)?;
+    let size = thumb_size(profile);
+    let thumbnail = img.resize(size, size, THUMB_FILTER);
+
+    let tmp_path = cache_dir.join(format!("{}.{}.tmp", thumb_name, std::process::id()));
+    encode_jpeg_thumbnail(&thumbnail, &tmp_path, profile)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &thumb_path) {
+        if std::fs::copy(&tmp_path, &thumb_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 
     Ok(thumb_path)
+}
+
+fn generate_single_thumbnail(
+    source: &Path,
+    cache_dir: &Path,
+    profile: StorageProfile,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    generate_single_thumbnail_impl(source, cache_dir, profile, false)
 }
 
 fn encode_jpeg_thumbnail(
     thumbnail: &image::DynamicImage,
     out_path: &Path,
+    profile: StorageProfile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let rgb = thumbnail.to_rgb8();
     let file = File::create(out_path)?;
     let writer = BufWriter::with_capacity(64 * 1024, file);
-    let mut encoder = JpegEncoder::new_with_quality(writer, thumb_jpeg_quality());
+    let mut encoder = JpegEncoder::new_with_quality(writer, thumb_jpeg_quality(profile));
     encoder.encode(
         rgb.as_raw(),
         rgb.width(),

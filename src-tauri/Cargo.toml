@@ -48,3 +48,5 @@ base64 = "0.22"
 zune-core = "0.5.0"
 zune-jpegxl = "0.5.2"
 jxl-oxide = { version = "0.12.5", features = ["image"] }
+keyring = "3"
+trash = "5"

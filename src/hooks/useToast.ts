@@ -18,18 +18,28 @@ export interface ShowToastOptions {
 }
 
 const DEFAULT_TOAST_DURATION_MS = 3200;
+const MAX_VISIBLE_TOASTS = 3;
 
 export function useToast() {
-    const [toast, setToast] = useState<ToastState | null>(null);
-    const timeoutRef = useRef<number | null>(null);
+    const [toasts, setToasts] = useState<ToastState[]>([]);
+    const timersRef = useRef<Map<number, number>>(new Map());
     const idRef = useRef(0);
 
-    const clearToast = useCallback(() => {
-        setToast(null);
-        if (timeoutRef.current != null) {
-            window.clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
+    const dismissToast = useCallback((id: number) => {
+        const timer = timersRef.current.get(id);
+        if (timer != null) {
+            window.clearTimeout(timer);
+            timersRef.current.delete(id);
         }
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, []);
+
+    const clearToast = useCallback(() => {
+        for (const timer of timersRef.current.values()) {
+            window.clearTimeout(timer);
+        }
+        timersRef.current.clear();
+        setToasts([]);
     }, []);
 
     const showToast = useCallback(
@@ -37,32 +47,71 @@ export function useToast() {
             const durationMs = options.durationMs ?? DEFAULT_TOAST_DURATION_MS;
             const tone = options.tone ?? "info";
 
-            if (timeoutRef.current != null) {
-                window.clearTimeout(timeoutRef.current);
-            }
-
             idRef.current += 1;
-            setToast({
-                id: idRef.current,
+            const id = idRef.current;
+
+            const newToast: ToastState = {
+                id,
                 message,
                 tone,
                 actionLabel: options.actionLabel,
                 onAction: options.onAction,
-            });
+            };
 
-            timeoutRef.current = window.setTimeout(() => {
-                setToast(null);
-                timeoutRef.current = null;
+            const timerId = window.setTimeout(() => {
+                timersRef.current.delete(id);
+                setToasts((prev) => prev.filter((t) => t.id !== id));
             }, durationMs);
+
+            timersRef.current.set(id, timerId);
+
+            setToasts((prev) => {
+                if (prev.length < MAX_VISIBLE_TOASTS) {
+                    return [...prev, newToast];
+                }
+
+                // If already at cap (3 visible), displace the oldest non-actionable toast.
+                // Actionable toasts (e.g. Undo) are never displaced.
+                const nonActionableIndex = prev.findIndex(
+                    (t) => !t.actionLabel || !t.onAction
+                );
+
+                if (nonActionableIndex !== -1) {
+                    const displaced = prev[nonActionableIndex];
+                    if (displaced) {
+                        const oldTimer = timersRef.current.get(displaced.id);
+                        if (oldTimer != null) {
+                            window.clearTimeout(oldTimer);
+                            timersRef.current.delete(displaced.id);
+                        }
+                    }
+                    const next = [...prev];
+                    next.splice(nonActionableIndex, 1);
+                    return [...next, newToast];
+                }
+
+                return [...prev, newToast];
+            });
         },
         []
     );
 
-    useEffect(() => clearToast, [clearToast]);
+    useEffect(() => {
+        const timers = timersRef.current;
+        return () => {
+            for (const timer of timers.values()) {
+                window.clearTimeout(timer);
+            }
+            timers.clear();
+        };
+    }, []);
 
     return {
-        toast,
+        toast: toasts[toasts.length - 1] ?? null,
+        toasts,
         showToast,
+        pushToast: showToast,
         clearToast,
+        dismissToast,
     };
 }

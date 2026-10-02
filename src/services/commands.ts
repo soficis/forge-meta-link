@@ -23,6 +23,8 @@ import type {
     ModelEntry,
     SortOption,
     StorageProfile,
+    LineageCursor,
+    TagProvenance,
 } from "../types/metadata";
 
 // ── Directory Scanning ──────────────────────────────────────────────────
@@ -76,8 +78,8 @@ export async function setForgeApiKey(apiKey: string): Promise<void> {
     return invoke<void>("set_forge_api_key", { apiKey });
 }
 
-export async function precacheAllThumbnails(): Promise<void> {
-    return invoke<void>("precache_all_thumbnails");
+export async function precacheAllThumbnails(force?: boolean): Promise<void> {
+    return invoke<void>("precache_all_thumbnails", { force: Boolean(force) });
 }
 
 export async function onScanProgress(
@@ -108,6 +110,14 @@ export async function onThumbnailCacheComplete(
     callback: (result: ThumbnailCacheComplete) => void
 ): Promise<UnlistenFn> {
     return listen<ThumbnailCacheComplete>("thumbnail-cache-complete", (event) => {
+        callback(event.payload);
+    });
+}
+
+export async function onForgeImagesIngested(
+    callback: (paths: string[]) => void
+): Promise<UnlistenFn> {
+    return listen<string[]>("forge-images-ingested", (event) => {
         callback(event.payload);
     });
 }
@@ -379,7 +389,7 @@ export async function forgeSendToImage(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: ForgePayloadOverrides | null
+    overrides: Partial<ForgePayloadOverrides> | null
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_send_to_image", {
         request: {
@@ -409,7 +419,7 @@ export async function forgeSendToImages(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: ForgePayloadOverrides | null
+    overrides: Partial<ForgePayloadOverrides> | null
 ): Promise<ForgeBatchSendResult> {
     return invoke<ForgeBatchSendResult>("forge_send_to_images", {
         request: {
@@ -426,6 +436,78 @@ export async function forgeSendToImages(
                 overrides,
             },
         },
+    });
+}
+
+export async function forgeRequeueImage(
+    imageId: number,
+    baseUrl: string,
+    apiKey: string | null,
+    includeSeed = true
+): Promise<ForgeSendResult> {
+    return invoke<ForgeSendResult>("forge_requeue_image", {
+        request: { imageId, baseUrl, apiKey, includeSeed },
+    });
+}
+
+// ── Timeline (file_mtime histogram) ─────────────────────────────────────
+
+export async function getFileMtimes(limit = 50000, offset = 0): Promise<number[]> {
+    return invoke<number[]>("get_file_mtimes", { limit, offset });
+}
+
+export async function getFileMtimesForQuery(query: string, limit = 50000): Promise<number[]> {
+    return invoke<number[]>("get_file_mtimes_for_query", { query, limit });
+}
+
+// ── Lineage (API-01) ─────────────────────────────────────────────────────
+
+export async function getLineageCursor(filepath: string): Promise<LineageCursor> {
+    return invoke<LineageCursor>("get_lineage_cursor", { filepath });
+}
+
+export async function getSeedWalk(
+    seed: string,
+    promptLike: string | null,
+    limit = 16
+): Promise<GalleryImageRecord[]> {
+    return invoke<GalleryImageRecord[]>("get_seed_walk", { seed, promptLike, limit });
+}
+
+export async function getTagProvenance(tag: string): Promise<TagProvenance> {
+    return invoke<TagProvenance>("get_tag_provenance", { tag });
+}
+
+export interface DuplicateGroup {
+    quick_hash: string;
+    count: number;
+    sample_filepaths: string[];
+}
+
+export async function getDuplicateGroups(
+    limit?: number,
+    offset?: number
+): Promise<DuplicateGroup[]> {
+    return invoke<DuplicateGroup[]>("get_duplicate_groups", { limit, offset });
+}
+
+export async function inferLineage(): Promise<number> {
+    return invoke<number>("infer_lineage");
+}
+
+export async function setLineageOverride(
+    childFilepath: string,
+    parentFilepath: string,
+    relation: string,
+    confidence: number,
+    action: string
+): Promise<void> {
+    return invoke<void>("set_lineage_override", {
+        childFilepath,
+        parentFilepath,
+        relation,
+        confidence,
+        action,
     });
 }
 

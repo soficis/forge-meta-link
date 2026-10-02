@@ -3,12 +3,21 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Gallery } from "./components/Gallery";
 import { PhotoViewer } from "./components/PhotoViewer";
-import { SearchBar } from "./components/SearchBar";
+import { SearchBar, type ActiveFilterChip } from "./components/SearchBar";
+import { CHECKPOINT_FAMILY_OPTIONS } from "./utils/checkpointFamilies";
+import { SelectionActionBar } from "./components/SelectionActionBar";
+import { SettingsDialog, type SettingsSectionId } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
+import { TimelineHeatmap, type TimelineRange } from "./components/TimelineHeatmap";
 import { ToastHost } from "./components/ToastHost";
+import { HelpOverlay } from "./components/HelpOverlay";
+import { CompareLab } from "./components/CompareLab";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { resolveGalleryKeyTarget } from "./utils/galleryKeyTarget";
 import { useAppSettings } from "./hooks/useAppSettings";
 import { useForgeSettings } from "./hooks/useForgeSettings";
 import { useToast, type ShowToastOptions } from "./hooks/useToast";
+import { useCompareLabStore } from "./store/compareLabStore";
 import {
     useImages,
     useLoraTags,
@@ -20,12 +29,13 @@ import {
 } from "./hooks/useImages";
 import {
     deleteImages,
+    directoryExists,
     exportImages,
     exportImagesAsFiles,
-    forgeSendToImages,
     forgeTestConnection,
     getStorageProfile,
     moveImagesToDirectory,
+    onForgeImagesIngested,
     onThumbnailCacheComplete,
     onThumbnailCacheProgress,
     precacheAllThumbnails,
@@ -42,6 +52,7 @@ import type {
     ImageExportFormat,
     StorageProfile,
 } from "./types/metadata";
+import { needsBulkTrashConfirm } from "./utils/deleteHelpers";
 
 const queryClient = new QueryClient({
     defaultOptions: {
@@ -54,42 +65,7 @@ const queryClient = new QueryClient({
 
 const DELETE_UNDO_WINDOW_MS = 6000;
 
-function parseBooruTagFilter(input: string): {
-    include: string[];
-    exclude: string[];
-} {
-    const include: string[] = [];
-    const exclude: string[] = [];
-    const seenInclude = new Set<string>();
-    const seenExclude = new Set<string>();
-
-    const tokenRegex = /"([^"]+)"|(\S+)/g;
-    let match: RegExpExecArray | null = tokenRegex.exec(input);
-    while (match) {
-        const raw = (match[1] ?? match[2] ?? "").trim().toLowerCase();
-        if (raw) {
-            if (raw.startsWith("-") && raw.length > 1) {
-                const token = raw.slice(1).trim();
-                if (token && !seenExclude.has(token)) {
-                    seenExclude.add(token);
-                    exclude.push(token);
-                }
-            } else {
-                const token = raw.startsWith("+") ? raw.slice(1).trim() : raw;
-                if (token && !seenInclude.has(token)) {
-                    seenInclude.add(token);
-                    include.push(token);
-                }
-            }
-        }
-        match = tokenRegex.exec(input);
-    }
-
-    return {
-        include: include.filter((token) => !seenExclude.has(token)),
-        exclude,
-    };
-}
+import { parseBooruTagFilter } from "./utils/booruTags";
 
 const JPEG_EXTENSIONS = new Set(["jpg", "jpeg", "jpe"]);
 
@@ -163,19 +139,19 @@ interface PendingDeleteOperation {
 
 function AppContent() {
     const [searchQuery, setSearchQuery] = useState("");
+    const [timelineRange, setTimelineRange] = useState<TimelineRange | null>(null);
     const [selectedImageId, setSelectedImageId] = useState<number | null>(null);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
     const [includeTags, setIncludeTags] = useState<string[]>([]);
     const [excludeTags, setExcludeTags] = useState<string[]>([]);
     const [booruTagFilterInput, setBooruTagFilterInput] = useState("");
     const [isTestingForge, setIsTestingForge] = useState(false);
-    const [isSendingForgeBatch, setIsSendingForgeBatch] = useState(false);
     const [isDeletingImages, setIsDeletingImages] = useState(false);
     const [isMovingImages, setIsMovingImages] = useState(false);
     const [isUpdatingSelectionMarks, setIsUpdatingSelectionMarks] = useState(false);
     const [storageProfile, setStorageProfileState] =
         useState<StorageProfile>("hdd");
-    const { toast, showToast, clearToast } = useToast();
+    const { toasts, showToast, clearToast, dismissToast } = useToast();
 
     const forge = useForgeSettings();
     const {
@@ -193,8 +169,6 @@ function AppContent() {
         setSelectedLoraFilter,
         selectedCheckpointFamilies,
         setSelectedCheckpointFamilies,
-        deleteMode,
-        setDeleteMode,
         autoLockFavorites,
         setAutoLockFavorites,
     } = useAppSettings();
@@ -214,8 +188,16 @@ function AppContent() {
         failed: number;
     } | null>(null);
     const pendingDeleteRef = useRef<PendingDeleteOperation | null>(null);
+    const [confirmDeleteTarget, setConfirmDeleteTarget] = useState<{
+        ids: number[];
+        filenames: string[];
+        mode: DeleteMode;
+        fallbackViewerImageId: number | null;
+    } | null>(null);
     const [deleteHistory, setDeleteHistory] = useState<DeleteHistoryEntry[]>([]);
     const deleteHistoryIdRef = useRef(0);
+    const [isHelpOpen, setIsHelpOpen] = useState(false);
+    const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null);
 
     const pushToast = useCallback(
         (message: string, options?: ShowToastOptions) => {
@@ -383,9 +365,18 @@ function AppContent() {
         };
     }, [data, dedupeImages, querySignature]);
 
+    const timelineFilteredImages = useMemo(() => {
+        if (!timelineRange) return images;
+        return images.filter((img) => {
+            const m = img.file_mtime;
+            if (m == null) return false;
+            return m >= timelineRange.start && m < timelineRange.end;
+        });
+    }, [images, timelineRange]);
+
     const viewerImageState = useMemo(
-        () => buildJpegPreferredViewerState(images),
-        [images]
+        () => buildJpegPreferredViewerState(timelineFilteredImages),
+        [timelineFilteredImages]
     );
 
     const selectedImageIndex = useMemo(() => {
@@ -428,6 +419,7 @@ function AppContent() {
         let active = true;
         let unlistenProgress: (() => void) | undefined;
         let unlistenComplete: (() => void) | undefined;
+        let unlistenForge: (() => void) | undefined;
 
         const setupListeners = async () => {
             unlistenProgress = await onThumbnailCacheProgress((progress) => {
@@ -449,6 +441,19 @@ function AppContent() {
                     { tone: result.failed > 0 ? "warning" : "success" }
                 );
             });
+
+            unlistenForge = await onForgeImagesIngested((paths) => {
+                if (!active) return;
+                queryClient.invalidateQueries({ queryKey: ["images"] });
+                queryClient.invalidateQueries({ queryKey: ["totalCount"] });
+                queryClient.invalidateQueries({ queryKey: ["topTags"] });
+                queryClient.invalidateQueries({ queryKey: ["models"] });
+                queryClient.invalidateQueries({ queryKey: ["directories"] });
+                pushToast(
+                    `Generated ${paths.length} image${paths.length === 1 ? "" : "s"} added to gallery`,
+                    { tone: "success" }
+                );
+            });
         };
 
         setupListeners();
@@ -456,12 +461,22 @@ function AppContent() {
             active = false;
             if (unlistenProgress) unlistenProgress();
             if (unlistenComplete) unlistenComplete();
+            if (unlistenForge) unlistenForge();
         };
     }, [pushToast]);
 
     const handleSearch = useCallback((query: string) => {
         setSearchQuery(query);
     }, []);
+
+    const handleTimelineSelect = useCallback((range: TimelineRange | null) => {
+        setTimelineRange(range);
+        if (range) {
+            pushToast(`Timeline filter ${new Date(range.start * 1000).toISOString().slice(0,10)}`, { tone: "info", durationMs: 2200 });
+        } else {
+            pushToast("Timeline filter cleared", { tone: "info", durationMs: 1500 });
+        }
+    }, [pushToast]);
 
     const handleScan = useCallback(
         (directory: string) => {
@@ -482,11 +497,17 @@ function AppContent() {
         []
     );
 
-    const handlePrecacheAllThumbnails = useCallback(async () => {
+    const handlePrecacheAllThumbnails = useCallback(async (force?: boolean) => {
         setThumbnailCacheResult(null);
         try {
-            await precacheAllThumbnails();
+            await precacheAllThumbnails(force);
             setIsPrecachingThumbnails(true);
+            pushToast(
+                force
+                    ? "Started force rebuilding all thumbnails in background…"
+                    : "Started building missing thumbnails in background…",
+                { tone: "info" }
+            );
         } catch (error) {
             setIsPrecachingThumbnails(false);
             pushToast(`Failed to start thumbnail cache: ${String(error)}`, {
@@ -515,12 +536,41 @@ function AppContent() {
     }, []);
 
     const selectAll = useCallback(() => {
-        setSelectedIds(new Set(images.map((image) => image.id)));
-    }, [images]);
+        setSelectedIds(new Set(timelineFilteredImages.map((image) => image.id)));
+    }, [timelineFilteredImages]);
 
     const clearSelection = useCallback(() => {
         setSelectedIds(new Set());
     }, []);
+
+    const addToSelection = useCallback((imageIds: number[]) => {
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            for (const id of imageIds) next.add(id);
+            return next;
+        });
+    }, []);
+
+    const handlePickFolderToScan = useCallback(async () => {
+        const selected = await open({
+            directory: true,
+            multiple: false,
+            title: "Select image folder to scan",
+        });
+        if (typeof selected !== "string") {
+            return;
+        }
+        try {
+            if (!(await directoryExists(selected))) {
+                pushToast("That folder no longer exists. Choose another folder.", { tone: "error" });
+                return;
+            }
+        } catch {
+            pushToast("Could not open that folder. Try again or choose another one.", { tone: "error" });
+            return;
+        }
+        handleScan(selected);
+    }, [handleScan, pushToast]);
 
     const invalidateImageQueries = useCallback(() => {
         queryClient.invalidateQueries({ queryKey: ["images"] });
@@ -557,6 +607,16 @@ function AppContent() {
                             result.removed_from_db === 1 ? "" : "s"
                         }${result.failed_files > 0 ? ` (${result.failed_files} failed)` : ""}.`
                     );
+                } else if (result.db_error) {
+                    pushToast(
+                        "Files were moved but the library could not be updated. Rescan to refresh.",
+                        { tone: "warning" }
+                    );
+                    updateDeleteHistory(
+                        operation.activityId,
+                        "finalized",
+                        "Files were moved but the library could not be updated. Rescan to refresh."
+                    );
                 } else {
                     pushToast("No images were deleted.", { tone: "warning" });
                     updateDeleteHistory(
@@ -570,7 +630,7 @@ function AppContent() {
                     pushToast(
                         `Skipped ${result.blocked_protected} protected image${
                             result.blocked_protected === 1 ? "" : "s"
-                        }. Unlock or unfavorite them first.`,
+                        }. Unlock them first.`,
                         { tone: "warning", durationMs: 4200 }
                     );
                 }
@@ -674,57 +734,37 @@ function AppContent() {
     const scheduleDelete = useCallback(
         async (
             ids: number[],
-            confirmMessage: string,
+            mode: DeleteMode,
             fallbackViewerImageId: number | null = null
         ) => {
             const requestedIds = Array.from(new Set(ids));
-            if (requestedIds.length === 0 || isDeletingImages || isMovingImages) {
+            if (requestedIds.length === 0) {
+                return;
+            }
+            if (isDeletingImages || isMovingImages) {
+                pushToast("Another operation is still running.", { tone: "info" });
                 return;
             }
             await flushPendingDelete();
-            if (!window.confirm(confirmMessage)) {
-                return;
-            }
 
             const requestedSet = new Set(requestedIds);
             const protectedRecords = images.filter(
-                (image) =>
-                    requestedSet.has(image.id) &&
-                    (image.is_locked || image.is_favorite)
+                (image) => requestedSet.has(image.id) && image.is_locked
             );
             const protectedIds = protectedRecords
                 .map((image) => image.id);
             const protectedSet = new Set(protectedIds);
             const deletableIds = requestedIds.filter((id) => !protectedSet.has(id));
 
-            if (protectedRecords.length > 0) {
-                const lockedOnly = protectedRecords.filter(
-                    (image) => image.is_locked && !image.is_favorite
-                ).length;
-                const favoriteOnly = protectedRecords.filter(
-                    (image) => image.is_favorite && !image.is_locked
-                ).length;
-                const lockedAndFavorite = protectedRecords.filter(
-                    (image) => image.is_locked && image.is_favorite
-                ).length;
-                const reasons: string[] = [];
-                if (lockedOnly > 0) {
-                    reasons.push(`${lockedOnly} locked`);
-                }
-                if (favoriteOnly > 0) {
-                    reasons.push(`${favoriteOnly} favorited`);
-                }
-                if (lockedAndFavorite > 0) {
-                    reasons.push(`${lockedAndFavorite} locked+favorited`);
-                }
-                pushToast(
-                    `Skipped ${protectedRecords.length} protected image${
-                        protectedRecords.length === 1 ? "" : "s"
-                    } (${reasons.join(", ")}).`,
-                    { tone: "warning", durationMs: 4200 }
-                );
-            }
             if (deletableIds.length === 0) {
+                if (protectedRecords.length > 0) {
+                    pushToast(
+                        `Skipped ${protectedRecords.length} locked image${
+                            protectedRecords.length === 1 ? "" : "s"
+                        }. Unlock to delete.`,
+                        { tone: "warning", durationMs: 4200 }
+                    );
+                }
                 return;
             }
 
@@ -765,9 +805,9 @@ function AppContent() {
                 void finalizeDeleteOperation(pending);
             }, DELETE_UNDO_WINDOW_MS);
 
-            const actionPrefix = deleteMode === "trash" ? "Move to Trash" : "Delete";
+            const actionPrefix = mode === "trash" ? "Move to Trash" : "Delete permanently";
             const activityId = appendDeleteHistory(
-                deleteMode,
+                mode,
                 deletableIds.length,
                 `${actionPrefix} ${deletableIds.length} image${
                     deletableIds.length === 1 ? "" : "s"
@@ -780,30 +820,31 @@ function AppContent() {
                 removedItems,
                 selectedBefore,
                 selectedImageIdBefore,
-                mode: deleteMode,
+                mode,
                 timerId,
             };
 
-            pushToast(
-                `${
-                    deleteMode === "trash"
-                        ? `Queued ${deletableIds.length} image${
-                              deletableIds.length === 1 ? "" : "s"
-                          } for Trash.`
-                        : `Queued ${deletableIds.length} image${
-                              deletableIds.length === 1 ? "" : "s"
-                          } for permanent deletion.`
-                }`,
-                {
-                    tone: "warning",
-                    durationMs: DELETE_UNDO_WINDOW_MS,
-                    actionLabel: "Undo",
-                    onAction: undoPendingDelete,
-                }
-            );
+            const count = deletableIds.length;
+            const imageWord = count === 1 ? "image" : "images";
+            const mainPart =
+                mode === "trash"
+                    ? `Moving ${count} ${imageWord} to Trash…`
+                    : `Deleting ${count} ${imageWord} permanently…`;
+            const skippedPart =
+                protectedRecords.length > 0
+                    ? ` ${protectedRecords.length} locked image${
+                          protectedRecords.length === 1 ? "" : "s"
+                      } were skipped.`
+                    : "";
+
+            pushToast(`${mainPart}${skippedPart}`, {
+                tone: "warning",
+                durationMs: DELETE_UNDO_WINDOW_MS,
+                actionLabel: "Undo",
+                onAction: undoPendingDelete,
+            });
         },
         [
-            deleteMode,
             finalizeDeleteOperation,
             flushPendingDelete,
             isDeletingImages,
@@ -827,26 +868,46 @@ function AppContent() {
         };
     }, []);
 
-    const handleDeleteSelected = useCallback(async () => {
-        if (selectedIds.size === 0) {
-            pushToast("Select images to delete first.", { tone: "warning" });
-            return;
-        }
-        const ids = Array.from(selectedIds);
-        const actionLabel =
-            deleteMode === "trash" ? "move to Trash" : "permanently delete";
-        await scheduleDelete(
-            ids,
-            `${
-                deleteMode === "trash" ? "Move" : "Delete"
-            } ${ids.length} selected image${
-                ids.length === 1 ? "" : "s"
-            } from disk (${actionLabel})?`,
-        );
-    }, [deleteMode, pushToast, scheduleDelete, selectedIds]);
+    const handleDeleteSelected = useCallback(
+        async (mode: DeleteMode = "trash") => {
+            if (selectedIds.size === 0) {
+                pushToast("Select images to delete first.", { tone: "warning" });
+                return;
+            }
+            const ids = Array.from(selectedIds);
+            if (mode === "permanent") {
+                const selectedImages = timelineFilteredImages.filter((im) =>
+                    selectedIds.has(im.id)
+                );
+                const filenames = selectedImages.map((im) => im.filename);
+                setConfirmDeleteTarget({
+                    ids,
+                    filenames,
+                    mode: "permanent",
+                    fallbackViewerImageId: null,
+                });
+                return;
+            }
+            if (needsBulkTrashConfirm(ids.length)) {
+                const selectedImages = timelineFilteredImages.filter((im) =>
+                    selectedIds.has(im.id)
+                );
+                const filenames = selectedImages.map((im) => im.filename);
+                setConfirmDeleteTarget({
+                    ids,
+                    filenames,
+                    mode: "trash",
+                    fallbackViewerImageId: null,
+                });
+                return;
+            }
+            await scheduleDelete(ids, "trash");
+        },
+        [pushToast, scheduleDelete, selectedIds, timelineFilteredImages]
+    );
 
     const handleDeleteImageFromViewer = useCallback(
-        async (image: GalleryImageRecord) => {
+        async (image: GalleryImageRecord, mode: DeleteMode = "trash") => {
             const viewerImages = viewerImageState.viewerImages;
             const index = viewerImages.findIndex((entry) => entry.id === image.id);
             let fallbackViewerImageId: number | null = null;
@@ -856,17 +917,19 @@ function AppContent() {
                 fallbackViewerImageId = viewerImages[fallbackIndex]?.id ?? null;
             }
 
-            const actionLabel =
-                deleteMode === "trash" ? "move to Trash" : "permanently delete";
-            await scheduleDelete(
-                [image.id],
-                `${
-                    deleteMode === "trash" ? "Move" : "Delete"
-                } ${image.filename} from disk (${actionLabel})?`,
-                fallbackViewerImageId
-            );
+            if (mode === "permanent") {
+                setConfirmDeleteTarget({
+                    ids: [image.id],
+                    filenames: [image.filename],
+                    mode: "permanent",
+                    fallbackViewerImageId,
+                });
+                return;
+            }
+
+            await scheduleDelete([image.id], "trash", fallbackViewerImageId);
         },
-        [deleteMode, scheduleDelete, viewerImageState]
+        [scheduleDelete, viewerImageState]
     );
 
     const handleMoveSelectedToFolder = useCallback(async () => {
@@ -1308,6 +1371,77 @@ function AppContent() {
         setBooruTagFilterInput("");
     }, []);
 
+    const removeTagFilter = useCallback((tag: string) => {
+        setIncludeTags((prev) => prev.filter((value) => value !== tag));
+        setExcludeTags((prev) => prev.filter((value) => value !== tag));
+        setBooruTagFilterInput("");
+    }, []);
+
+    const handleClearAllFilters = useCallback(() => {
+        setSearchQuery("");
+        handleClearTagFilters();
+        setSelectedModelFilter("");
+        setSelectedLoraFilter("");
+        setGenerationTypeFilter("all");
+        clearCheckpointFamilyFilters();
+        setTimelineRange(null);
+    }, [
+        clearCheckpointFamilyFilters,
+        handleClearTagFilters,
+        setGenerationTypeFilter,
+        setSelectedLoraFilter,
+        setSelectedModelFilter,
+    ]);
+
+    const activeFilters = useMemo<ActiveFilterChip[]>(() => {
+        const chips: ActiveFilterChip[] = [];
+        if (searchQuery.trim()) {
+            chips.push({ id: "search", label: `“${searchQuery.trim()}”`, onRemove: () => setSearchQuery("") });
+        }
+        for (const tag of includeTags) {
+            chips.push({ id: `include:${tag}`, label: `Tag: ${tag}`, onRemove: () => removeTagFilter(tag) });
+        }
+        for (const tag of excludeTags) {
+            chips.push({ id: `exclude:${tag}`, label: `Not: ${tag}`, onRemove: () => removeTagFilter(tag) });
+        }
+        if (selectedModelFilter) {
+            chips.push({ id: "model", label: `Model: ${selectedModelFilter}`, onRemove: () => setSelectedModelFilter("") });
+        }
+        if (selectedLoraFilter) {
+            chips.push({
+                id: "lora",
+                label: `LoRA: ${selectedLoraFilter.replace(/^lora:/, "")}`,
+                onRemove: () => setSelectedLoraFilter(""),
+            });
+        }
+        if (generationTypeFilter !== "all") {
+            chips.push({ id: "type", label: `Type: ${generationTypeFilter}`, onRemove: () => setGenerationTypeFilter("all") });
+        }
+        for (const family of selectedCheckpointFamilies) {
+            const label = CHECKPOINT_FAMILY_OPTIONS.find((option) => option.value === family)?.label ?? family;
+            chips.push({ id: `family:${family}`, label: `Family: ${label}`, onRemove: () => toggleCheckpointFamilyFilter(family) });
+        }
+        if (timelineRange) {
+            const day = new Date(timelineRange.start * 1000).toISOString().slice(0, 10);
+            chips.push({ id: "timeline", label: `Date: ${day}`, onRemove: () => setTimelineRange(null) });
+        }
+        return chips;
+    }, [
+        excludeTags,
+        generationTypeFilter,
+        includeTags,
+        removeTagFilter,
+        searchQuery,
+        selectedCheckpointFamilies,
+        selectedLoraFilter,
+        selectedModelFilter,
+        setGenerationTypeFilter,
+        setSelectedLoraFilter,
+        setSelectedModelFilter,
+        timelineRange,
+        toggleCheckpointFamilyFilter,
+    ]);
+
     const handleExportSelected = useCallback(
         async (format: "json" | "csv") => {
             if (selectedIds.size === 0) {
@@ -1390,52 +1524,7 @@ function AppContent() {
         }
     }, [forge.forgeApiKey, forge.forgeBaseUrl, pushToast]);
 
-    const handleForgeSendSelected = useCallback(async () => {
-        if (selectedIds.size === 0) {
-            pushToast("No images selected for Forge queue.", { tone: "warning" });
-            return;
-        }
-
-        const parsedLoraWeight = forge.forgeLoraWeight.trim()
-            ? Number(forge.forgeLoraWeight)
-            : null;
-        if (
-            parsedLoraWeight != null &&
-            (!Number.isFinite(parsedLoraWeight) ||
-                parsedLoraWeight < 0 ||
-                parsedLoraWeight > 2)
-        ) {
-            pushToast("LoRA weight must be between 0 and 2 before queueing.", {
-                tone: "error",
-            });
-            return;
-        }
-
-        setIsSendingForgeBatch(true);
-        pushToast(
-            `Queueing ${selectedIds.size} image${selectedIds.size === 1 ? "" : "s"}...`,
-            { tone: "info", durationMs: 1800 }
-        );
-        try {
-            const result = await forgeSendToImages(
-                Array.from(selectedIds),
-                forge.forgeBaseUrl,
-                forge.forgeApiKey.trim() ? forge.forgeApiKey : null,
-                forge.forgeOutputDir.trim() ? forge.forgeOutputDir : null,
-                forge.forgeIncludeSeed,
-                forge.forgeAdetailerFaceEnabled,
-                forge.forgeAdetailerFaceModel.trim() ? forge.forgeAdetailerFaceModel : null,
-                forge.forgeSelectedLoras.length > 0 ? forge.forgeSelectedLoras : null,
-                parsedLoraWeight,
-                null
-            );
-            pushToast(result.message, { tone: result.failed > 0 ? "warning" : "success" });
-        } catch (error) {
-            pushToast(`Forge queue failed: ${String(error)}`, { tone: "error" });
-        } finally {
-            setIsSendingForgeBatch(false);
-        }
-    }, [forge, pushToast, selectedIds]);
+    const comparePins = useCompareLabStore((s) => s.pins);
 
     const handleNavigateViewer = useCallback(
         (index: number) => {
@@ -1483,38 +1572,230 @@ function AppContent() {
         selectedModelFilter.trim().length > 0 ||
         selectedLoraFilter.trim().length > 0 ||
         selectedCheckpointFamilies.length > 0;
-    const hasAnyFilters = hasSearchQuery || hasSidebarTagFilters || hasFilterControls;
+    const hasAnyFilters =
+        hasSearchQuery || hasSidebarTagFilters || hasFilterControls || timelineRange != null;
 
     const galleryEmptyState = useMemo(() => {
         if (totalCount === 0) {
             return {
-                title: "No images loaded",
-                message: "Select a folder to scan for AI-generated images.",
-            };
-        }
-
-        if (hasSearchQuery) {
-            return {
-                title: "No images match your search",
-                message: "Try broader keywords or clear search terms.",
+                title: "No images yet",
+                message: "Pick a folder of AI-generated images. ForgeMetaLink reads their prompts and settings so you can search them.",
+                action: isScanning
+                    ? undefined
+                    : { label: "Scan a folder", onClick: () => void handlePickFolderToScan() },
             };
         }
 
         if (hasAnyFilters) {
             return {
-                title: "No images match current filters",
-                message: "Clear tags or model filters to widen results.",
+                title: hasSearchQuery && activeFilters.length === 1
+                    ? "No images match your search"
+                    : "No images match these filters",
+                message: "Remove a filter above or clear them all.",
+                action: { label: "Clear all filters", onClick: handleClearAllFilters },
             };
         }
 
         return {
             title: "No images available",
             message: "Rescan your folder if images should appear here.",
+            action: isScanning
+                ? undefined
+                : { label: "Scan a folder", onClick: () => void handlePickFolderToScan() },
         };
-    }, [hasAnyFilters, hasSearchQuery, totalCount]);
+    }, [
+        activeFilters.length,
+        handleClearAllFilters,
+        handlePickFolderToScan,
+        hasAnyFilters,
+        hasSearchQuery,
+        isScanning,
+        totalCount,
+    ]);
+
+    const selectedImageIdList = useMemo(() => [...selectedIds], [selectedIds]);
 
     const isGalleryMutationInFlight =
         isDeletingImages || isMovingImages || isUpdatingSelectionMarks;
+
+    useEffect(() => {
+        const isTypingTarget = (target: EventTarget | null): boolean => {
+            if (!(target instanceof HTMLElement)) return false;
+            const tag = target.tagName.toLowerCase();
+            return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
+        };
+        const handleGlobalKey = (event: KeyboardEvent) => {
+            if (isTypingTarget(event.target)) return;
+            if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
+                event.preventDefault();
+                setIsHelpOpen((prev) => !prev);
+                return;
+            }
+            if (isHelpOpen) {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    setIsHelpOpen(false);
+                }
+                return;
+            }
+            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey) {
+                event.preventDefault();
+                if (pendingDeleteRef.current) {
+                    undoPendingDelete();
+                }
+                return;
+            }
+            const isViewerOpen = selectedImageIndex >= 0;
+            if (isViewerOpen) {
+                const current = viewerImageState.viewerImages[selectedImageIndex];
+                if (!current) return;
+                const lower = event.key.toLowerCase();
+                if (lower === "j") {
+                    event.preventDefault();
+                    const next = Math.min(selectedImageIndex + 1, viewerImageState.viewerImages.length - 1);
+                    if (next !== selectedImageIndex) handleNavigateViewer(next);
+                    return;
+                }
+                if (lower === "k") {
+                    event.preventDefault();
+                    const prev = Math.max(selectedImageIndex - 1, 0);
+                    if (prev !== selectedImageIndex) handleNavigateViewer(prev);
+                    return;
+                }
+                if (lower === "f" && !event.ctrlKey && !event.metaKey) {
+                    event.preventDefault();
+                    void handleToggleFavorite(current);
+                    return;
+                }
+                if (event.key === "Delete" && !event.ctrlKey && !event.metaKey) {
+                    event.preventDefault();
+                    const mode: DeleteMode = event.shiftKey ? "permanent" : "trash";
+                    void handleDeleteImageFromViewer(current, mode);
+                    return;
+                }
+                if (["1", "2", "3", "4"].includes(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+                    event.preventDefault();
+                    const slot = Number(event.key) - 1;
+                    const ok = useCompareLabStore.getState().pinToSlot(current, slot);
+                    pushToast(ok ? `Pinned to Compare Lab slot ${slot + 1}` : "Compare Lab pin failed", { tone: ok ? "success" : "warning", durationMs: 2200 });
+                    return;
+                }
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    setSelectedImageId(null);
+                    return;
+                }
+            } else {
+                if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+                    event.preventDefault();
+                    selectAll();
+                    return;
+                }
+                if (timelineFilteredImages.length === 0) return;
+                const lower = event.key.toLowerCase();
+                if (lower === "j") {
+                    event.preventDefault();
+                    const idx = selectedImageId != null ? timelineFilteredImages.findIndex((img) => img.id === selectedImageId) : -1;
+                    const nextIdx = idx >= 0 ? (idx + 1) % timelineFilteredImages.length : 0;
+                    const next = timelineFilteredImages[nextIdx];
+                    if (next) setSelectedImageId(next.id);
+                    return;
+                }
+                if (lower === "k") {
+                    event.preventDefault();
+                    const idx = timelineFilteredImages.findIndex((img) => img.id === selectedImageId);
+                    const prevIdx = idx > 0 ? idx - 1 : idx === 0 ? timelineFilteredImages.length - 1 : 0;
+                    const prev = timelineFilteredImages[prevIdx];
+                    if (prev) setSelectedImageId(prev.id);
+                    return;
+                }
+                if (lower === "f" && !event.ctrlKey && !event.metaKey) {
+                    event.preventDefault();
+                    const focusedEl = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-image-id]");
+                    const rawId = focusedEl?.dataset.imageId;
+                    const focusedId = rawId ? Number(rawId) : null;
+                    const target = resolveGalleryKeyTarget({ focusedId, selectedIds, key: "f" });
+                    if (target.kind === "focused") {
+                        const img = timelineFilteredImages.find((im) => im.id === target.id);
+                        if (img) void handleToggleFavorite(img);
+                    } else if (target.kind === "selection") {
+                        const selectedImages = timelineFilteredImages.filter((img) => selectedIds.has(img.id));
+                        const allFavorite = selectedImages.length > 0 && selectedImages.every((img) => img.is_favorite);
+                        void handleBulkFavoriteSelected(!allFavorite);
+                    } else {
+                        pushToast("Select or focus an image first.", { tone: "info" });
+                    }
+                    return;
+                }
+                if (event.key === "Delete" && !event.ctrlKey && !event.metaKey) {
+                    event.preventDefault();
+                    const mode: DeleteMode = event.shiftKey ? "permanent" : "trash";
+                    if (selectedIds.size > 0) {
+                        void handleDeleteSelected(mode);
+                    } else {
+                        const focusedEl = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-image-id]");
+                        const rawId = focusedEl?.dataset.imageId;
+                        const focusedId = rawId ? Number(rawId) : null;
+                        if (focusedId != null && !Number.isNaN(focusedId)) {
+                            const img = timelineFilteredImages.find((im) => im.id === focusedId);
+                            if (img) {
+                                if (mode === "permanent") {
+                                    setConfirmDeleteTarget({
+                                        ids: [img.id],
+                                        filenames: [img.filename],
+                                        mode: "permanent",
+                                        fallbackViewerImageId: null,
+                                    });
+                                } else {
+                                    void scheduleDelete([img.id], "trash");
+                                }
+                            }
+                        } else {
+                            pushToast("Select or focus an image first.", { tone: "info" });
+                        }
+                    }
+                    return;
+                }
+                if (["1", "2", "3", "4"].includes(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+                    event.preventDefault();
+                    const focusedEl = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-image-id]");
+                    const rawId = focusedEl?.dataset.imageId;
+                    const focusedId = rawId ? Number(rawId) : null;
+                    const target = resolveGalleryKeyTarget({ focusedId, selectedIds, key: event.key });
+                    if (target.kind === "focused") {
+                        const img = timelineFilteredImages.find((im) => im.id === target.id);
+                        if (img) {
+                            const slot = Number(event.key) - 1;
+                            const ok = useCompareLabStore.getState().pinToSlot(img, slot);
+                            pushToast(ok ? `Pinned to Compare Lab slot ${slot + 1}` : "Compare Lab pin failed", { tone: ok ? "success" : "warning", durationMs: 2200 });
+                        }
+                    } else {
+                        pushToast("Select or focus an image first.", { tone: "info" });
+                    }
+                    return;
+                }
+            }
+        };
+        window.addEventListener("keydown", handleGlobalKey);
+        return () => window.removeEventListener("keydown", handleGlobalKey);
+    }, [
+        selectedImageIndex,
+        viewerImageState,
+        timelineFilteredImages,
+        selectedImageId,
+        selectedIds,
+        isHelpOpen,
+        handleToggleFavorite,
+        handleBulkFavoriteSelected,
+        handleDeleteImageFromViewer,
+        handleDeleteSelected,
+        scheduleDelete,
+        setConfirmDeleteTarget,
+        undoPendingDelete,
+        handleNavigateViewer,
+        pushToast,
+        selectAll,
+    ]);
 
     return (
         <div className="app-layout">
@@ -1523,67 +1804,17 @@ function AppContent() {
                 onToggleCollapsed={() =>
                     setIsSidebarCollapsed((previous) => !previous)
                 }
-                onScan={handleScan}
+                onPickFolderToScan={() => void handlePickFolderToScan()}
                 isScanning={isScanning}
                 scanProgress={scanProgress}
                 scanResult={scanResult}
-                includeTags={includeTags}
-                excludeTags={excludeTags}
                 topTags={topTags}
                 onAddIncludeTag={(tag) => addTag("include", tag)}
-                booruTagFilterInput={booruTagFilterInput}
-                onBooruTagFilterInputChange={setBooruTagFilterInput}
-                onApplyBooruTagFilter={handleApplyBooruTagFilter}
-                onClearTagFilters={handleClearTagFilters}
-                checkpointFamilyFilters={selectedCheckpointFamilies}
-                onToggleCheckpointFamilyFilter={toggleCheckpointFamilyFilter}
-                onClearCheckpointFamilyFilters={clearCheckpointFamilyFilters}
-                selectedCount={selectedIds.size}
-                onExportSelected={handleExportSelected}
-                onExportAsFiles={handleExportAsFiles}
-                onMoveSelectedToFolder={handleMoveSelectedToFolder}
-                isMovingSelected={isMovingImages}
-                onBulkFavoriteSelected={() => handleBulkFavoriteSelected(true)}
-                onBulkUnfavoriteSelected={() => handleBulkFavoriteSelected(false)}
-                onBulkLockSelected={() => handleBulkLockSelected(true)}
-                onBulkUnlockSelected={() => handleBulkLockSelected(false)}
-                isApplyingSelectionActions={isGalleryMutationInFlight}
-                autoLockFavorites={autoLockFavorites}
-                onAutoLockFavoritesChange={setAutoLockFavorites}
                 recentDeleteHistory={deleteHistory}
                 onClearDeleteHistory={clearDeleteHistory}
-                forgeBaseUrl={forge.forgeBaseUrl}
-                forgeApiKey={forge.forgeApiKey}
-                onForgeBaseUrlChange={forge.setForgeBaseUrl}
-                onForgeApiKeyChange={forge.setForgeApiKey}
-                forgeOutputDir={forge.forgeOutputDir}
-                onForgeOutputDirChange={forge.setForgeOutputDir}
-                forgeModelsPath={forge.forgeModelsPath}
-                onForgeModelsPathChange={forge.setForgeModelsPath}
-                forgeModelsScanSubfolders={forge.forgeModelsScanSubfolders}
-                onForgeModelsScanSubfoldersChange={forge.setForgeModelsScanSubfolders}
-                forgeLoraPath={forge.forgeLoraPath}
-                onForgeLoraPathChange={forge.setForgeLoraPath}
-                forgeLoraScanSubfolders={forge.forgeLoraScanSubfolders}
-                onForgeLoraScanSubfoldersChange={forge.setForgeLoraScanSubfolders}
-                forgeIncludeSeed={forge.forgeIncludeSeed}
-                onForgeIncludeSeedChange={forge.setForgeIncludeSeed}
-                forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
-                onForgeAdetailerFaceEnabledChange={forge.setForgeAdetailerFaceEnabled}
-                forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}
-                onForgeAdetailerFaceModelChange={forge.setForgeAdetailerFaceModel}
-                onForgeTestConnection={handleForgeTestConnection}
-                onForgeSendSelected={handleForgeSendSelected}
-                isTestingForge={isTestingForge}
-                isSendingForgeBatch={isSendingForgeBatch}
                 columnCount={columnCount}
                 onColumnCountChange={setColumnCount}
-                storageProfile={storageProfile}
-                onStorageProfileChange={handleStorageProfileChange}
-                onPrecacheAllThumbnails={handlePrecacheAllThumbnails}
-                isPrecachingThumbnails={isPrecachingThumbnails}
-                thumbnailCacheProgress={thumbnailCacheProgress}
-                thumbnailCacheResult={thumbnailCacheResult}
+                onOpenSettings={() => setSettingsSection("library")}
             />
 
             <main className="main-content">
@@ -1591,24 +1822,55 @@ function AppContent() {
                     searchValue={searchQuery}
                     onSearch={handleSearch}
                     totalCount={totalCount}
-                    resultCount={images.length}
+                    resultCount={timelineFilteredImages.length}
+                    hasMoreResults={hasNextPage ?? false}
                     sortBy={sortBy}
                     onSortChange={setSortBy}
                     generationTypeFilter={generationTypeFilter}
                     onGenerationTypeChange={setGenerationTypeFilter}
                     selectedCount={selectedIds.size}
                     onSelectAll={selectAll}
-                    onDeselectAll={clearSelection}
-                    onDeleteSelected={handleDeleteSelected}
-                    isDeletingSelected={isGalleryMutationInFlight}
-                    deleteMode={deleteMode}
-                    onDeleteModeChange={setDeleteMode}
                     modelFilter={selectedModelFilter}
                     modelOptions={modelFilterOptions}
                     onModelFilterChange={setSelectedModelFilter}
                     loraFilter={selectedLoraFilter}
                     loraOptions={loraFilterOptions}
                     onLoraFilterChange={setSelectedLoraFilter}
+                    tagFilterInput={booruTagFilterInput}
+                    onTagFilterInputChange={setBooruTagFilterInput}
+                    onApplyTagFilter={handleApplyBooruTagFilter}
+                    checkpointFamilyFilters={selectedCheckpointFamilies}
+                    onToggleCheckpointFamilyFilter={toggleCheckpointFamilyFilter}
+                    activeFilters={activeFilters}
+                    onClearAllFilters={handleClearAllFilters}
+                />
+                <TimelineHeatmap
+                    clusterQuery={searchQuery}
+                    onClusterQueryChange={handleSearch}
+                    onBucketSelect={handleTimelineSelect}
+                    selectedRange={timelineRange}
+                />
+
+                {comparePins.length > 0 && <CompareLab />}
+
+                <SelectionActionBar
+                    selectedCount={selectedIds.size}
+                    loadedCount={timelineFilteredImages.length}
+                    selectedImageIds={selectedImageIdList}
+                    onSelectAll={selectAll}
+                    onClearSelection={clearSelection}
+                    isBusy={isGalleryMutationInFlight}
+                    isMovingSelected={isMovingImages}
+                    onFavorite={() => handleBulkFavoriteSelected(true)}
+                    onUnfavorite={() => handleBulkFavoriteSelected(false)}
+                    onLock={() => handleBulkLockSelected(true)}
+                    onUnlock={() => handleBulkLockSelected(false)}
+                    onMoveToFolder={handleMoveSelectedToFolder}
+                    onExportMetadata={handleExportSelected}
+                    onExportImages={handleExportAsFiles}
+                    onDeleteSelected={handleDeleteSelected}
+                    forge={forge}
+                    onShowToast={pushToast}
                 />
 
                 {isLoading && images.length === 0 ? (
@@ -1618,11 +1880,12 @@ function AppContent() {
                     </div>
                 ) : (
                     <Gallery
-                        images={images}
+                        images={timelineFilteredImages}
                         onSelect={(image) => setSelectedImageId(image.id)}
                         selectedId={selectedImageId}
                         selectedIds={selectedIds}
                         onToggleSelected={toggleSelected}
+                        onAddToSelection={addToSelection}
                         onSelectAll={selectAll}
                         onClearSelection={clearSelection}
                         onDeleteSelected={handleDeleteSelected}
@@ -1649,14 +1912,9 @@ function AppContent() {
                     forgeOutputDir={forge.forgeOutputDir}
                     forgeModelsPath={forge.forgeModelsPath}
                     forgeModelsScanSubfolders={forge.forgeModelsScanSubfolders}
-                    onForgeModelsPathChange={forge.setForgeModelsPath}
-                    onForgeModelsScanSubfoldersChange={
-                        forge.setForgeModelsScanSubfolders
-                    }
                     forgeLoraPath={forge.forgeLoraPath}
                     forgeLoraScanSubfolders={forge.forgeLoraScanSubfolders}
-                    onForgeLoraPathChange={forge.setForgeLoraPath}
-                    onForgeLoraScanSubfoldersChange={forge.setForgeLoraScanSubfolders}
+                    onOpenForgeSettings={() => setSettingsSection("forge")}
                     forgeSelectedLoras={forge.forgeSelectedLoras}
                     onForgeSelectedLorasChange={forge.setForgeSelectedLoras}
                     forgeLoraWeight={forge.forgeLoraWeight}
@@ -1667,14 +1925,77 @@ function AppContent() {
                     onSearchBySeed={handleSearchBySeed}
                     onDeleteCurrentImage={handleDeleteImageFromViewer}
                     isDeletingCurrentImage={isGalleryMutationInFlight}
-                    deleteMode={deleteMode}
                     onToggleFavorite={handleToggleFavorite}
                     onToggleLocked={handleToggleLocked}
                     onShowToast={pushToast}
                 />
             )}
 
-            <ToastHost toast={toast} onDismiss={clearToast} />
+            {settingsSection != null && (
+                <SettingsDialog
+                    initialSection={settingsSection}
+                    onClose={() => setSettingsSection(null)}
+                    onShowToast={pushToast}
+                    storageProfile={storageProfile}
+                    onStorageProfileChange={handleStorageProfileChange}
+                    onPrecacheAllThumbnails={handlePrecacheAllThumbnails}
+                    isPrecachingThumbnails={isPrecachingThumbnails}
+                    isScanning={isScanning}
+                    thumbnailCacheProgress={thumbnailCacheProgress}
+                    thumbnailCacheResult={thumbnailCacheResult}
+                    autoLockFavorites={autoLockFavorites}
+                    onAutoLockFavoritesChange={setAutoLockFavorites}
+                    forgeBaseUrl={forge.forgeBaseUrl}
+                    onForgeBaseUrlChange={forge.setForgeBaseUrl}
+                    forgeApiKey={forge.forgeApiKey}
+                    onForgeApiKeyChange={forge.setForgeApiKey}
+                    forgeApiKeyError={forge.forgeApiKeyError}
+                    isForgeApiKeyLoaded={forge.isForgeApiKeyLoaded}
+                    forgeOutputDir={forge.forgeOutputDir}
+                    onForgeOutputDirChange={forge.setForgeOutputDir}
+                    forgeModelsPath={forge.forgeModelsPath}
+                    onForgeModelsPathChange={forge.setForgeModelsPath}
+                    forgeModelsScanSubfolders={forge.forgeModelsScanSubfolders}
+                    onForgeModelsScanSubfoldersChange={forge.setForgeModelsScanSubfolders}
+                    forgeLoraPath={forge.forgeLoraPath}
+                    onForgeLoraPathChange={forge.setForgeLoraPath}
+                    forgeLoraScanSubfolders={forge.forgeLoraScanSubfolders}
+                    onForgeLoraScanSubfoldersChange={forge.setForgeLoraScanSubfolders}
+                    forgeIncludeSeed={forge.forgeIncludeSeed}
+                    onForgeIncludeSeedChange={forge.setForgeIncludeSeed}
+                    forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
+                    onForgeAdetailerFaceEnabledChange={forge.setForgeAdetailerFaceEnabled}
+                    forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}
+                    onForgeAdetailerFaceModelChange={forge.setForgeAdetailerFaceModel}
+                    onForgeTestConnection={handleForgeTestConnection}
+                    isTestingForge={isTestingForge}
+                />
+            )}
+
+            {confirmDeleteTarget && (
+                <ConfirmDialog
+                    count={confirmDeleteTarget.ids.length}
+                    filenames={confirmDeleteTarget.filenames}
+                    mode={confirmDeleteTarget.mode}
+                    onCancel={() => setConfirmDeleteTarget(null)}
+                    onConfirm={() => {
+                        const target = confirmDeleteTarget;
+                        setConfirmDeleteTarget(null);
+                        void scheduleDelete(
+                            target.ids,
+                            target.mode,
+                            target.fallbackViewerImageId
+                        );
+                    }}
+                />
+            )}
+
+            <ToastHost
+                toasts={toasts}
+                onDismiss={clearToast}
+                onDismissToast={dismissToast}
+            />
+            {isHelpOpen && <HelpOverlay onClose={() => setIsHelpOpen(false)} />}
         </div>
     );
 }

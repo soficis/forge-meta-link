@@ -9,6 +9,7 @@
 pub fn precache_all_thumbnails(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    force: Option<bool>,
 ) -> Result<(), String> {
     if state
         .thumbnail_precache_running
@@ -18,6 +19,7 @@ pub fn precache_all_thumbnails(
         return Err("Thumbnail cache warmup is already running".to_string());
     }
 
+    let force_rebuild = force.unwrap_or(false);
     let db = state.db.clone();
     let cache_dir = state.cache_dir.clone();
     let thumbnail_index = state.thumbnail_index.clone();
@@ -29,8 +31,8 @@ pub fn precache_all_thumbnails(
         .unwrap_or(StorageProfile::Hdd);
     let app_handle = app.clone();
     let running_flag = state.thumbnail_precache_running.clone();
-    let running_flag_for_worker = running_flag.clone();
 
+    let thread_running_flag = running_flag.clone();
     std::thread::Builder::new()
         .name("thumbnail-precache".into())
         .spawn(move || {
@@ -46,7 +48,7 @@ pub fn precache_all_thumbnails(
             }
 
             let _running_guard = RunningGuard {
-                flag: running_flag_for_worker,
+                flag: thread_running_flag,
             };
 
             if let Err(error) = image_processing::prepare_cache_dir(&cache_dir) {
@@ -63,38 +65,16 @@ pub fn precache_all_thumbnails(
                 return;
             }
 
-            let all_filepaths = match db.get_all_image_filepaths_desc() {
-                Ok(filepaths) => filepaths,
-                Err(error) => {
-                    log::error!("Thumbnail pre-cache failed to read filepaths: {}", error);
-                    let _ = app_handle.emit(
-                        "thumbnail-cache-complete",
-                        ThumbnailPrecacheComplete {
-                            total: 0,
-                            generated: 0,
-                            skipped: 0,
-                            failed: 0,
-                        },
-                    );
-                    return;
-                }
-            };
-
-            let total = all_filepaths.len();
-            let mut generated = 0usize;
-            let mut skipped = 0usize;
-            let mut failed = 0usize;
-            let mut pending_paths = Vec::<PathBuf>::new();
-            let mut discovered_thumb_paths = Vec::<String>::new();
+            let total = db.get_total_count().unwrap_or(0) as usize;
 
             let _ = app_handle.emit(
                 "thumbnail-cache-progress",
                 ThumbnailPrecacheProgress {
                     current: 0,
                     total,
-                    generated,
-                    skipped,
-                    failed,
+                    generated: 0,
+                    skipped: 0,
+                    failed: 0,
                     phase: "preparing".into(),
                 },
             );
@@ -104,9 +84,9 @@ pub fn precache_all_thumbnails(
                     "thumbnail-cache-complete",
                     ThumbnailPrecacheComplete {
                         total,
-                        generated,
-                        skipped,
-                        failed,
+                        generated: 0,
+                        skipped: 0,
+                        failed: 0,
                     },
                 );
                 return;
@@ -116,92 +96,135 @@ pub fn precache_all_thumbnails(
                 .read()
                 .map(|index| index.clone())
                 .unwrap_or_default();
-            for (idx, filepath) in all_filepaths.into_iter().enumerate() {
-                let source = Path::new(&filepath);
-                let primary_path = image_processing::get_thumbnail_cache_path(source, &cache_dir);
-                let primary_key = primary_path.to_string_lossy().to_string();
 
-                // Skip if current-format thumbnail exists.
-                if index_snapshot.contains(&primary_key) {
-                    skipped += 1;
-                } else if primary_path.exists() {
-                    skipped += 1;
-                    discovered_thumb_paths.push(primary_key);
-                } else {
-                    pending_paths.push(PathBuf::from(filepath));
+            const DB_BATCH_LIMIT: u32 = 1024;
+            let mut last_filepath: Option<String> = None;
+            let mut generated = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            let mut processed = 0usize;
+            let mut emitted_preparing = 0usize;
+            let chunk_size = precache_chunk_size(storage_profile).max(1);
+
+            loop {
+
+                let batch = match db.get_image_filepaths_batch_after(
+                    last_filepath.as_deref(),
+                    DB_BATCH_LIMIT,
+                ) {
+                    Ok(b) => b,
+                    Err(error) => {
+                        log::error!("Thumbnail precache batch fetch failed: {}", error);
+                        break;
+                    }
+                };
+
+                if batch.is_empty() {
+                    break;
                 }
 
-                let current = idx + 1;
-                if current % 1_024 == 0 || current == total {
+                let mut pending_batch: Vec<PathBuf> = Vec::new();
+                let mut discovered_batch: Vec<String> = Vec::new();
+
+                for filepath in &batch {
+                    let source = Path::new(filepath);
+                    let primary_path =
+                        image_processing::get_thumbnail_cache_path(source, &cache_dir);
+                    let primary_key = primary_path.to_string_lossy().to_string();
+
+                    if force_rebuild {
+                        pending_batch.push(PathBuf::from(filepath));
+                    } else if index_snapshot.contains(&primary_key) {
+                        skipped += 1;
+                    } else if primary_path.exists() {
+                        skipped += 1;
+                        discovered_batch.push(primary_key);
+                    } else {
+                        pending_batch.push(PathBuf::from(filepath));
+                    }
+                    processed += 1;
+                    emitted_preparing += 1;
+                    if emitted_preparing.is_multiple_of(1_024) {
+                        let _ = app_handle.emit(
+                            "thumbnail-cache-progress",
+                            ThumbnailPrecacheProgress {
+                                current: processed,
+                                total,
+                                generated,
+                                skipped,
+                                failed,
+                                phase: "preparing".into(),
+                            },
+                        );
+                    }
+                }
+
+                if !discovered_batch.is_empty() {
+                    if let Ok(mut index) = thumbnail_index.write() {
+                        for thumb_path in discovered_batch {
+                            index.insert(thumb_path);
+                        }
+                    }
+                }
+
+                for chunk in pending_batch.chunks(chunk_size) {
+
+                    let generated_chunk = image_processing::generate_thumbnails_ext(
+                        chunk,
+                        &cache_dir,
+                        storage_profile,
+                        force_rebuild,
+                    );
+                    generated += generated_chunk.len();
+                    let failed_in_chunk = chunk.len().saturating_sub(generated_chunk.len());
+                    failed += failed_in_chunk;
+
+                    if !generated_chunk.is_empty() {
+                        if let Ok(mut index) = thumbnail_index.write() {
+                            for (_, thumb_path) in &generated_chunk {
+                                index.insert(thumb_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+
+                    if let Ok(mut failed_set) = failed_thumbnail_sources.write() {
+                        let generated_sources: std::collections::HashSet<String> =
+                            generated_chunk
+                                .iter()
+                                .map(|(source_path, _)| {
+                                    source_path.to_string_lossy().to_string()
+                                })
+                                .collect();
+                        for source_path in chunk {
+                            let source_key = source_path.to_string_lossy().to_string();
+                            if generated_sources.contains(&source_key) {
+                                failed_set.remove(&source_key);
+                            } else {
+                                failed_set.insert(source_key);
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+
                     let _ = app_handle.emit(
                         "thumbnail-cache-progress",
                         ThumbnailPrecacheProgress {
-                            current,
+                            current: processed,
                             total,
                             generated,
                             skipped,
                             failed,
-                            phase: "preparing".into(),
+                            phase: "generating".into(),
                         },
                     );
                 }
-            }
 
-            if !discovered_thumb_paths.is_empty() {
-                if let Ok(mut index) = thumbnail_index.write() {
-                    for thumb_path in discovered_thumb_paths {
-                        index.insert(thumb_path);
-                    }
+                last_filepath = batch.last().cloned();
+
+                if batch.len() < DB_BATCH_LIMIT as usize {
+                    break;
                 }
-            }
-
-            let chunk_size = precache_chunk_size(storage_profile).max(1);
-            let mut processed = skipped;
-
-            for chunk in pending_paths.chunks(chunk_size) {
-                let generated_chunk =
-                    image_processing::generate_thumbnails(chunk, &cache_dir, storage_profile);
-                generated += generated_chunk.len();
-                processed += chunk.len();
-
-                let failed_in_chunk = chunk.len().saturating_sub(generated_chunk.len());
-                failed += failed_in_chunk;
-
-                if !generated_chunk.is_empty() {
-                    if let Ok(mut index) = thumbnail_index.write() {
-                        for (_, thumb_path) in &generated_chunk {
-                            index.insert(thumb_path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-
-                if let Ok(mut failed_set) = failed_thumbnail_sources.write() {
-                    let generated_sources: std::collections::HashSet<String> = generated_chunk
-                        .iter()
-                        .map(|(source_path, _)| source_path.to_string_lossy().to_string())
-                        .collect();
-
-                    for source_path in chunk {
-                        let source_key = source_path.to_string_lossy().to_string();
-                        if generated_sources.contains(&source_key) {
-                            failed_set.remove(&source_key);
-                        } else {
-                            failed_set.insert(source_key);
-                        }
-                    }
-                }
-
-                let _ = app_handle.emit(
-                    "thumbnail-cache-progress",
-                    ThumbnailPrecacheProgress {
-                        current: processed,
-                        total,
-                        generated,
-                        skipped,
-                        failed,
-                        phase: "generating".into(),
-                    },
-                );
             }
 
             let _ = app_handle.emit(
@@ -263,7 +286,12 @@ pub async fn get_display_image_path(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let cache_dir = state.cache_dir.clone();
+    let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if !is_allowed_path(&filepath, &db, &cache_dir) {
+            return Err(format!("Access denied: path is not indexed or in cache: {}", filepath));
+        }
+
         let source = PathBuf::from(&filepath);
         if !source.exists() {
             return Err(format!("File not found: {}", filepath));
@@ -342,15 +370,34 @@ pub async fn get_display_image_path(
     .map_err(|error| error.to_string())?
 }
 
+const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
 /// Returns base64-encoded bytes + detected mime for clipboard-safe image loading.
 #[tauri::command]
 pub async fn get_image_clipboard_payload(
     filepath: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardImagePayload, String> {
+    let db = state.db.clone();
+    let cache_dir = state.cache_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if !is_allowed_path(&filepath, &db, &cache_dir) {
+            return Err(format!("Access denied: path is not indexed or in cache: {}", filepath));
+        }
+
         let path = PathBuf::from(&filepath);
         if !path.exists() || !path.is_file() {
             return Err(format!("File not found: {}", filepath));
+        }
+
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("Failed to read metadata for {}: {}", path.display(), error))?;
+        if metadata.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            return Err(format!(
+                "Image too large for clipboard ({} bytes > {} max)",
+                metadata.len(),
+                MAX_CLIPBOARD_IMAGE_BYTES
+            ));
         }
 
         let bytes = std::fs::read(&path)

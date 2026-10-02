@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
     exportImages,
     exportImagesAsFiles,
     forgeGetOptions,
-    forgeSendToImage,
     getDisplayImagePath,
     getImageClipboardPayload,
     getImageDetail,
+    getLineageCursor,
     getSidecarData,
     getThumbnailPath,
     getThumbnailPaths,
     openFileLocation,
     saveSidecarTags,
+    setLineageOverride,
 } from "../services/commands";
 import {
     copyJpegImageToClipboard,
@@ -22,14 +23,17 @@ import {
     formatBytes,
 } from "../utils/imageClipboard";
 import type {
-    DeleteMode,
     ForgePayloadOverrides,
     GalleryImageRecord,
     ImageExportFormat,
     ImageRecord,
+    LineageCursor,
+    LineageEdge,
 } from "../types/metadata";
 import { usePersistedState } from "../hooks/usePersistedState";
 import type { ShowToastOptions } from "../hooks/useToast";
+import { useCompareLabStore } from "../store/compareLabStore";
+import { ForgeRequeueButton } from "./ForgeRequeueButton";
 
 interface PhotoViewerProps {
     images: GalleryImageRecord[];
@@ -41,12 +45,10 @@ interface PhotoViewerProps {
     forgeOutputDir: string;
     forgeModelsPath: string;
     forgeModelsScanSubfolders: boolean;
-    onForgeModelsPathChange: (value: string) => void;
-    onForgeModelsScanSubfoldersChange: (value: boolean) => void;
     forgeLoraPath: string;
     forgeLoraScanSubfolders: boolean;
-    onForgeLoraPathChange: (value: string) => void;
-    onForgeLoraScanSubfoldersChange: (value: boolean) => void;
+    /** Opens Settings at the Forge section; folder paths are edited only there. */
+    onOpenForgeSettings: () => void;
     forgeSelectedLoras: string[];
     onForgeSelectedLorasChange: (values: string[]) => void;
     forgeLoraWeight: string;
@@ -57,7 +59,6 @@ interface PhotoViewerProps {
     onSearchBySeed: (seed: string) => void;
     onDeleteCurrentImage: (image: GalleryImageRecord) => void;
     isDeletingCurrentImage: boolean;
-    deleteMode: DeleteMode;
     onToggleFavorite: (image: GalleryImageRecord) => void;
     onToggleLocked: (image: GalleryImageRecord) => void;
     onShowToast: (message: string, options?: ShowToastOptions) => void;
@@ -269,6 +270,15 @@ function createEmptyForgeOverrides(): ForgePayloadOverrides {
     };
 }
 
+function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 function createForgeOverrides(
     image: GalleryImageRecord | null,
     detail: ImageRecord | null
@@ -301,12 +311,9 @@ export function PhotoViewer({
     forgeOutputDir,
     forgeModelsPath,
     forgeModelsScanSubfolders,
-    onForgeModelsPathChange,
-    onForgeModelsScanSubfoldersChange,
     forgeLoraPath,
     forgeLoraScanSubfolders,
-    onForgeLoraPathChange,
-    onForgeLoraScanSubfoldersChange,
+    onOpenForgeSettings,
     forgeSelectedLoras,
     onForgeSelectedLorasChange,
     forgeLoraWeight,
@@ -317,7 +324,6 @@ export function PhotoViewer({
     onSearchBySeed,
     onDeleteCurrentImage,
     isDeletingCurrentImage,
-    deleteMode,
     onToggleFavorite,
     onToggleLocked,
     onShowToast,
@@ -326,7 +332,6 @@ export function PhotoViewer({
     const [currentDetail, setCurrentDetail] = useState<ImageRecord | null>(null);
     const [isDetailLoading, setIsDetailLoading] = useState(false);
 
-    const [isSendingToForge, setIsSendingToForge] = useState(false);
     const [isSavingSidecar, setIsSavingSidecar] = useState(false);
 
     const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(null);
@@ -375,7 +380,14 @@ export function PhotoViewer({
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isPanning, setIsPanning] = useState(false);
     const [isInfoOpen, setIsInfoOpen] = useState(true);
-    const [infoPanelTab, setInfoPanelTab] = useState<"info" | "forge">("info");
+    const [infoPanelTab, setInfoPanelTab] = useState<"info" | "forge" | "lineage">("info");
+    const [lineageCursor, setLineageCursor] = useState<LineageCursor | null>(null);
+    const [isLineageLoading, setIsLineageLoading] = useState(false);
+    const [lineageThumbs, setLineageThumbs] = useState<Record<string, string>>({});
+    const [linkParentInput, setLinkParentInput] = useState("");
+    const [linkRelationInput, setLinkRelationInput] = useState("seed_walk");
+    const [isLineageMutating, setIsLineageMutating] = useState(false);
+    const lineageRequestRef = useRef(0);
     const [isSlideshow, setIsSlideshow] = useState(false);
     const [slideshowIntervalMs, setSlideshowIntervalMs] = usePersistedState(
         "viewerSlideshowIntervalMs",
@@ -751,7 +763,7 @@ export function PhotoViewer({
         forgeOverridesImageIdRef.current = currentImage.id;
     }, [currentDetail, currentImage]);
 
-    useEffect(() => {
+    const refreshForgeOptions = useCallback(async () => {
         if (!forgeBaseUrl.trim()) {
             setForgeModelOptions([]);
             setForgeLoraOptions([]);
@@ -761,50 +773,34 @@ export function PhotoViewer({
             return;
         }
 
-        let cancelled = false;
         setIsLoadingForgeOptions(true);
         setForgeOptionsWarning(null);
 
-        forgeGetOptions(
-            forgeBaseUrl,
-            forgeApiKey.trim() ? forgeApiKey : null,
-            forgeModelsPath.trim() ? forgeModelsPath : null,
-            forgeModelsScanSubfolders,
-            forgeLoraPath.trim() ? forgeLoraPath : null,
-            forgeLoraScanSubfolders
-        )
-            .then((options) => {
-                if (cancelled) {
-                    return;
-                }
-                setForgeModelOptions(options.models);
-                setForgeLoraOptions(options.loras);
-                setForgeSamplerOptions(options.samplers);
-                setForgeSchedulerOptions(options.schedulers);
-                setForgeOptionsWarning(
-                    options.warnings.length > 0 ? options.warnings.join(" | ") : null
-                );
-            })
-            .catch((error) => {
-                if (cancelled) {
-                    return;
-                }
-                setForgeModelOptions([]);
-                setForgeLoraOptions([]);
-                setForgeSamplerOptions([]);
-                setForgeSchedulerOptions([]);
-                setForgeOptionsWarning(`Forge options unavailable: ${String(error)}`);
-            })
-            .finally(() => {
-                if (cancelled) {
-                    return;
-                }
-                setIsLoadingForgeOptions(false);
-            });
-
-        return () => {
-            cancelled = true;
-        };
+        try {
+            const options = await forgeGetOptions(
+                forgeBaseUrl,
+                forgeApiKey.trim() ? forgeApiKey : null,
+                forgeModelsPath.trim() ? forgeModelsPath : null,
+                forgeModelsScanSubfolders,
+                forgeLoraPath.trim() ? forgeLoraPath : null,
+                forgeLoraScanSubfolders
+            );
+            setForgeModelOptions(options.models);
+            setForgeLoraOptions(options.loras);
+            setForgeSamplerOptions(options.samplers);
+            setForgeSchedulerOptions(options.schedulers);
+            setForgeOptionsWarning(
+                options.warnings.length > 0 ? options.warnings.join(" | ") : null
+            );
+        } catch (error) {
+            setForgeModelOptions([]);
+            setForgeLoraOptions([]);
+            setForgeSamplerOptions([]);
+            setForgeSchedulerOptions([]);
+            setForgeOptionsWarning(`Forge options unavailable: ${String(error)}`);
+        } finally {
+            setIsLoadingForgeOptions(false);
+        }
     }, [
         forgeApiKey,
         forgeBaseUrl,
@@ -813,6 +809,16 @@ export function PhotoViewer({
         forgeModelsPath,
         forgeModelsScanSubfolders,
     ]);
+
+    useEffect(() => {
+        void refreshForgeOptions();
+    }, [refreshForgeOptions]);
+
+    useEffect(() => {
+        if (infoPanelTab === "forge" && (forgeOptionsWarning != null || forgeModelOptions.length === 0)) {
+            void refreshForgeOptions();
+        }
+    }, [infoPanelTab, forgeOptionsWarning, forgeModelOptions.length, refreshForgeOptions]);
 
     useEffect(() => {
         if (!forgeModelOptions.length) {
@@ -849,6 +855,53 @@ export function PhotoViewer({
             window.removeEventListener("mousedown", handleOutsideClick);
         };
     }, [isLoraDropdownOpen]);
+
+    useEffect(() => {
+        if (!currentImage?.filepath) {
+            setLineageCursor(null);
+            setLineageThumbs({});
+            setIsLineageLoading(false);
+            return;
+        }
+        let cancelled = false;
+        const reqId = lineageRequestRef.current + 1;
+        lineageRequestRef.current = reqId;
+        setIsLineageLoading(true);
+        getLineageCursor(currentImage.filepath)
+            .then((cursor) => {
+                if (cancelled || lineageRequestRef.current !== reqId) return;
+                setLineageCursor(cursor);
+                const allPaths = [
+                    ...cursor.ancestors.map((e) => e.parent_filepath),
+                    ...cursor.children.map((e) => e.child_filepath),
+                ];
+                if (allPaths.length === 0) {
+                    setLineageThumbs({});
+                    return;
+                }
+                return getThumbnailPaths(allPaths)
+                    .then((mappings) => {
+                        if (cancelled || lineageRequestRef.current !== reqId) return;
+                        const next: Record<string, string> = {};
+                        for (const m of mappings) {
+                            if (m.thumbnail_path !== m.filepath) next[m.filepath] = m.thumbnail_path;
+                        }
+                        setLineageThumbs(next);
+                    })
+                    .catch(() => {});
+            })
+            .catch(() => {
+                if (cancelled || lineageRequestRef.current !== reqId) return;
+                setLineageCursor({ ancestors: [], children: [] });
+            })
+            .finally(() => {
+                if (cancelled || lineageRequestRef.current !== reqId) return;
+                setIsLineageLoading(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [currentImage?.filepath]);
 
     useEffect(() => {
         if (zoom <= 1) {
@@ -943,28 +996,6 @@ export function PhotoViewer({
         setForgeOverrides((prev) => ({ ...prev, width, height }));
     }, []);
 
-    const handleSelectForgeModelsFolder = useCallback(async () => {
-        const selected = await open({
-            directory: true,
-            multiple: false,
-            title: "Select Forge models directory",
-        });
-        if (selected && typeof selected === "string") {
-            onForgeModelsPathChange(selected);
-        }
-    }, [onForgeModelsPathChange]);
-
-    const handleSelectForgeLoraFolder = useCallback(async () => {
-        const selected = await open({
-            directory: true,
-            multiple: false,
-            title: "Select Forge LoRA directory",
-        });
-        if (selected && typeof selected === "string") {
-            onForgeLoraPathChange(selected);
-        }
-    }, [onForgeLoraPathChange]);
-
     const toggleLoraSelection = useCallback(
         (loraToken: string) => {
             const token = loraToken.trim();
@@ -1000,6 +1031,112 @@ export function PhotoViewer({
             onShowToast(message, { tone, durationMs });
         },
         [onShowToast]
+    );
+
+    const handleLineageJump = useCallback(
+        (filepath: string) => {
+            const idx = images.findIndex((img) => img.filepath === filepath);
+            if (idx === -1) {
+                showViewerToast("Image not in current gallery view.", "warning");
+                return;
+            }
+            onNavigate(idx);
+        },
+        [images, onNavigate, showViewerToast]
+    );
+
+    const refreshLineage = useCallback(async () => {
+        if (!currentImage?.filepath) return;
+        const reqId = lineageRequestRef.current + 1;
+        lineageRequestRef.current = reqId;
+        setIsLineageLoading(true);
+        try {
+            const cursor = await getLineageCursor(currentImage.filepath);
+            if (lineageRequestRef.current !== reqId) return;
+            setLineageCursor(cursor);
+            const allPaths = [
+                ...cursor.ancestors.map((e) => e.parent_filepath),
+                ...cursor.children.map((e) => e.child_filepath),
+            ];
+            if (allPaths.length > 0) {
+                try {
+                    const mappings = await getThumbnailPaths(allPaths);
+                    const next: Record<string, string> = {};
+                    for (const m of mappings) {
+                        if (m.thumbnail_path !== m.filepath) next[m.filepath] = m.thumbnail_path;
+                    }
+                    setLineageThumbs(next);
+                } catch (_e) {
+                    void _e;
+                }
+            } else {
+                setLineageThumbs({});
+            }
+        } catch (_e) {
+            void _e;
+            setLineageCursor({ ancestors: [], children: [] });
+        } finally {
+            if (lineageRequestRef.current === reqId) setIsLineageLoading(false);
+        }
+    }, [currentImage?.filepath]);
+
+    const handleLineageUnlink = useCallback(
+        async (edge: LineageEdge, direction: "ancestor" | "child") => {
+            if (!currentImage) return;
+            const child = direction === "ancestor" ? currentImage.filepath : edge.child_filepath;
+            const parent = direction === "ancestor" ? edge.parent_filepath : currentImage.filepath;
+            setIsLineageMutating(true);
+            try {
+                await setLineageOverride(child, parent, edge.relation, edge.confidence, "unlink");
+                showViewerToast("Unlinked.", "success", 2200);
+                await refreshLineage();
+            } catch (e) {
+                showViewerToast(`Unlink failed: ${String(e)}`, "error");
+            } finally {
+                setIsLineageMutating(false);
+            }
+        },
+        [currentImage, refreshLineage, showViewerToast]
+    );
+
+    const handleLineageLink = useCallback(async () => {
+        if (!currentImage) return;
+        const parent = linkParentInput.trim();
+        if (!parent) {
+            showViewerToast("Enter parent filepath to link.", "warning");
+            return;
+        }
+        const relation = linkRelationInput.trim() || "seed_walk";
+        setIsLineageMutating(true);
+        try {
+            await setLineageOverride(currentImage.filepath, parent, relation, 1.0, "link");
+            showViewerToast("Linked.", "success", 2200);
+            setLinkParentInput("");
+            await refreshLineage();
+        } catch (e) {
+            showViewerToast(`Link failed: ${String(e)}`, "error");
+        } finally {
+            setIsLineageMutating(false);
+        }
+    }, [currentImage, linkParentInput, linkRelationInput, refreshLineage, showViewerToast]);
+
+    const handlePinCurrentToCompare = useCallback(() => {
+        if (!currentImage) return;
+        const ok = useCompareLabStore.getState().pin(currentImage);
+        showViewerToast(ok ? "Pinned to Compare Lab." : "Compare Lab full (4 max).", ok ? "success" : "warning", 2200);
+    }, [currentImage, showViewerToast]);
+
+    const handlePinLineageToCompare = useCallback(
+        (filepath: string) => {
+            const found = images.find((img) => img.filepath === filepath);
+            if (!found) {
+                showViewerToast("Image not in current gallery view.", "warning");
+                return;
+            }
+            const ok = useCompareLabStore.getState().pin(found);
+            showViewerToast(ok ? `Pinned ${found.filename}` : "Compare Lab full (4 max).", ok ? "success" : "warning", 2200);
+        },
+        [images, showViewerToast]
     );
 
     const applyForgePayloadPreset = useCallback(
@@ -1158,9 +1295,9 @@ export function PhotoViewer({
         if (!currentImage || isDeletingCurrentImage) {
             return;
         }
-        if (currentImage.is_locked || currentImage.is_favorite) {
+        if (currentImage.is_locked) {
             showViewerToast(
-                "This image is protected. Unlock or unfavorite it first.",
+                "This image is locked. Unlock it to delete.",
                 "warning"
             );
             return;
@@ -1250,64 +1387,6 @@ export function PhotoViewer({
         currentImage,
         singleImageExportFormat,
         singleImageExportQuality,
-        showViewerToast,
-    ]);
-
-    const handleSendToForge = useCallback(async () => {
-        if (!currentImage) {
-            return;
-        }
-        if (!hasValidForgeUrl) {
-            showViewerToast(
-                forgeUrlValidationError ?? "Forge URL is invalid.",
-                "error"
-            );
-            return;
-        }
-        if (hasForgeValidationErrors) {
-            showViewerToast(
-                "Fix invalid Forge payload fields before sending.",
-                "error"
-            );
-            return;
-        }
-
-        setIsSendingToForge(true);
-        try {
-            const result = await forgeSendToImage(
-                currentImage.id,
-                forgeBaseUrl,
-                forgeApiKey.trim() ? forgeApiKey : null,
-                forgeOutputDir.trim() ? forgeOutputDir : null,
-                sendSeedForCurrentRequest,
-                useAdetailerForCurrentRequest,
-                adetailerFaceModelForCurrentRequest.trim()
-                    ? adetailerFaceModelForCurrentRequest
-                    : null,
-                forgeSelectedLoras.length > 0 ? forgeSelectedLoras : null,
-                forgeLoraWeight.trim() ? Number(forgeLoraWeight) : null,
-                forgeOverrides
-            );
-            showViewerToast(result.message, result.ok ? "success" : "warning");
-        } catch (error) {
-            showViewerToast(`Forge send failed: ${String(error)}`, "error");
-        } finally {
-            setIsSendingToForge(false);
-        }
-    }, [
-        currentImage,
-        forgeApiKey,
-        forgeBaseUrl,
-        forgeOutputDir,
-        forgeSelectedLoras,
-        forgeLoraWeight,
-        sendSeedForCurrentRequest,
-        useAdetailerForCurrentRequest,
-        adetailerFaceModelForCurrentRequest,
-        forgeOverrides,
-        forgeUrlValidationError,
-        hasValidForgeUrl,
-        hasForgeValidationErrors,
         showViewerToast,
     ]);
 
@@ -1710,7 +1789,7 @@ export function PhotoViewer({
                             {isInfoOpen ? "Hide Info" : "Show Info"}
                         </button>
                         <button
-                            className="viewer-control-button danger"
+                            className="viewer-control-button viewer-close-button"
                             onClick={onClose}
                             type="button"
                             aria-label="Close viewer"
@@ -1926,13 +2005,23 @@ export function PhotoViewer({
                                     type="button"
                                     className={`photo-viewer-tab ${infoPanelTab === "info" ? "active" : ""}`}
                                     onClick={() => setInfoPanelTab("info")}
+                                    data-testid="viewer-tab-info"
                                 >
                                     Info
                                 </button>
                                 <button
                                     type="button"
+                                    className={`photo-viewer-tab ${infoPanelTab === "lineage" ? "active" : ""}`}
+                                    onClick={() => setInfoPanelTab("lineage")}
+                                    data-testid="viewer-tab-lineage"
+                                >
+                                    Lineage
+                                </button>
+                                <button
+                                    type="button"
                                     className={`photo-viewer-tab ${infoPanelTab === "forge" ? "active" : ""}`}
                                     onClick={() => setInfoPanelTab("forge")}
+                                    data-testid="viewer-tab-forge"
                                 >
                                     Forge
                                 </button>
@@ -1946,9 +2035,9 @@ export function PhotoViewer({
                                         copyText(currentDetail.raw_metadata, "Raw metadata copied")
                                     }
                                     disabled={!currentDetail || isDetailLoading}
-                                    title="Copy Metadata"
+                                    title="Copy all metadata as text"
                                 >
-                                    Meta
+                                    Copy metadata
                                 </button>
                                 <button
                                     className="viewer-toolbar-btn"
@@ -1957,47 +2046,24 @@ export function PhotoViewer({
                                         copyText(currentDetail.prompt, "Prompt copied")
                                     }
                                     disabled={!currentDetail || isDetailLoading}
-                                    title="Copy Prompt"
+                                    title="Copy the positive prompt"
                                 >
-                                    Prompt
+                                    Copy prompt
                                 </button>
                                 <button
                                     className="viewer-toolbar-btn"
                                     onClick={handleOpenFileLocation}
-                                    title="Open file in Explorer"
+                                    title="Open the folder containing this file"
                                 >
-                                    Locate
-                                </button>
-                                <button
-                                    className="viewer-toolbar-btn danger"
-                                    onClick={handleDeleteCurrentImage}
-                                    disabled={
-                                        isDeletingCurrentImage ||
-                                        Boolean(
-                                            currentImage?.is_locked || currentImage?.is_favorite
-                                        )
-                                    }
-                                    title={
-                                        currentImage?.is_locked || currentImage?.is_favorite
-                                            ? "Protected image: unlock or unfavorite first"
-                                            : deleteMode === "trash"
-                                              ? "Move this image to Trash"
-                                              : "Permanently delete this image"
-                                    }
-                                >
-                                    {isDeletingCurrentImage
-                                        ? "Deleting..."
-                                        : deleteMode === "trash"
-                                          ? "Trash"
-                                          : "Delete"}
+                                    Show in folder
                                 </button>
                                 <button
                                     className="viewer-toolbar-btn"
                                     onClick={handleSearchSameSeed}
                                     disabled={!currentSeed || isDeletingCurrentImage}
-                                    title="Find Same Seed"
+                                    title="Search for other images with this seed"
                                 >
-                                    Seed
+                                    Same seed
                                 </button>
                             </div>
 
@@ -2010,8 +2076,8 @@ export function PhotoViewer({
                                     disabled={!currentImage || isDeletingCurrentImage}
                                     title={
                                         currentImage?.is_favorite
-                                            ? "Remove favorite protection"
-                                            : "Mark as favorite (protected from delete)"
+                                            ? "Remove from favorites"
+                                            : "Add to favorites"
                                     }
                                 >
                                     {currentImage?.is_favorite ? "★ Favorited" : "☆ Favorite"}
@@ -2029,6 +2095,24 @@ export function PhotoViewer({
                                     }
                                 >
                                     {currentImage?.is_locked ? "🔒 Locked" : "🔓 Lock"}
+                                </button>
+                                <span className="viewer-toolbar-spacer" aria-hidden="true" />
+                                <button
+                                    className="viewer-toolbar-btn danger"
+                                    onClick={handleDeleteCurrentImage}
+                                    disabled={
+                                        isDeletingCurrentImage ||
+                                        Boolean(currentImage?.is_locked)
+                                    }
+                                    title={
+                                        currentImage?.is_locked
+                                            ? "Locked image: unlock to delete"
+                                            : "Move this image to Trash"
+                                    }
+                                >
+                                    {isDeletingCurrentImage
+                                        ? "Deleting..."
+                                        : "Trash"}
                                 </button>
                             </div>
 
@@ -2086,6 +2170,18 @@ export function PhotoViewer({
                                             </div>
                                         </div>
                                     </section>
+
+                                    {currentDetail?.raw_metadata && (
+                                        <section className="photo-viewer-section">
+                                            <h4>Raw Metadata</h4>
+                                            <pre
+                                                className="viewer-raw-metadata"
+                                                style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+                                            >
+                                                {escapeHtml(currentDetail.raw_metadata)}
+                                            </pre>
+                                        </section>
+                                    )}
 
                                     <section className="photo-viewer-section">
                                         <h4>Sidecar</h4>
@@ -2214,7 +2310,26 @@ export function PhotoViewer({
                                             <div className="photo-viewer-note">Loading Forge options...</div>
                                         )}
                                         {forgeOptionsWarning && (
-                                            <div className="photo-viewer-note">{forgeOptionsWarning}</div>
+                                            <div
+                                                className="photo-viewer-note"
+                                                style={{
+                                                    display: "flex",
+                                                    justifyContent: "space-between",
+                                                    alignItems: "center",
+                                                    gap: "8px",
+                                                }}
+                                            >
+                                                <span>{forgeOptionsWarning}</span>
+                                                <button
+                                                    type="button"
+                                                    className="viewer-link-button"
+                                                    onClick={() => void refreshForgeOptions()}
+                                                    disabled={isLoadingForgeOptions}
+                                                    style={{ flexShrink: 0, padding: "2px 6px", fontSize: "11px" }}
+                                                >
+                                                    {isLoadingForgeOptions ? "Checking…" : "↻ Retry connection"}
+                                                </button>
+                                            </div>
                                         )}
                                         <div className="viewer-form-label">Preset Manager</div>
                                         <select
@@ -2271,66 +2386,29 @@ export function PhotoViewer({
                                                 Delete
                                             </button>
                                         </div>
-                                        <div className="viewer-form-label">Models Folder</div>
-                                        <div className="viewer-form-grid">
-                                            <input
-                                                className="viewer-input"
-                                                value={forgeModelsPath}
-                                                onChange={(event) =>
-                                                    onForgeModelsPathChange(event.target.value)
-                                                }
-                                                placeholder="Select Forge models folder"
-                                            />
+                                        <div className="viewer-forge-folders">
+                                            <div className="viewer-key-value-row">
+                                                <span>Models folder</span>
+                                                <strong className="viewer-path" title={forgeModelsPath || undefined}>
+                                                    {forgeModelsPath || "Not set"}
+                                                    {forgeModelsPath && forgeModelsScanSubfolders ? " (+ subfolders)" : ""}
+                                                </strong>
+                                            </div>
+                                            <div className="viewer-key-value-row">
+                                                <span>LoRA folder</span>
+                                                <strong className="viewer-path" title={forgeLoraPath || undefined}>
+                                                    {forgeLoraPath || "Not set"}
+                                                    {forgeLoraPath && forgeLoraScanSubfolders ? " (+ subfolders)" : ""}
+                                                </strong>
+                                            </div>
                                             <button
-                                                className="viewer-control-button"
-                                                onClick={handleSelectForgeModelsFolder}
                                                 type="button"
+                                                className="viewer-control-button"
+                                                onClick={onOpenForgeSettings}
                                             >
-                                                Browse
+                                                Change in Settings…
                                             </button>
                                         </div>
-                                        <label className="viewer-toggle-row">
-                                            <input
-                                                type="checkbox"
-                                                checked={forgeModelsScanSubfolders}
-                                                onChange={(event) =>
-                                                    onForgeModelsScanSubfoldersChange(
-                                                        event.target.checked
-                                                    )
-                                                }
-                                            />
-                                            Scan model subfolders
-                                        </label>
-                                        <div className="viewer-form-label">LoRA Folder</div>
-                                        <div className="viewer-form-grid">
-                                            <input
-                                                className="viewer-input"
-                                                value={forgeLoraPath}
-                                                onChange={(event) =>
-                                                    onForgeLoraPathChange(event.target.value)
-                                                }
-                                                placeholder="Select Forge LoRA folder"
-                                            />
-                                            <button
-                                                className="viewer-control-button"
-                                                onClick={handleSelectForgeLoraFolder}
-                                                type="button"
-                                            >
-                                                Browse
-                                            </button>
-                                        </div>
-                                        <label className="viewer-toggle-row">
-                                            <input
-                                                type="checkbox"
-                                                checked={forgeLoraScanSubfolders}
-                                                onChange={(event) =>
-                                                    onForgeLoraScanSubfoldersChange(
-                                                        event.target.checked
-                                                    )
-                                                }
-                                            />
-                                            Scan LoRA subfolders
-                                        </label>
                                         <div className="viewer-form-label">
                                             LoRA Multi-Select
                                         </div>
@@ -2453,16 +2531,54 @@ export function PhotoViewer({
                                             placeholder="Negative prompt"
                                             rows={3}
                                         />
-                                        <label className="viewer-toggle-row">
-                                            <input
-                                                type="checkbox"
-                                                checked={sendSeedForCurrentRequest}
-                                                onChange={(event) =>
-                                                    setSendSeedForCurrentRequest(event.target.checked)
-                                                }
-                                            />
-                                            Send seed with request
-                                        </label>
+                                        <div
+                                            style={{
+                                                display: "flex",
+                                                alignItems: "center",
+                                                justifyContent: "space-between",
+                                                gap: "8px",
+                                                margin: "6px 0",
+                                            }}
+                                        >
+                                            <label className="viewer-toggle-row" style={{ margin: 0 }}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={sendSeedForCurrentRequest}
+                                                    onChange={(event) =>
+                                                        setSendSeedForCurrentRequest(event.target.checked)
+                                                    }
+                                                />
+                                                Send seed with request
+                                            </label>
+                                            <div style={{ display: "flex", gap: "4px" }}>
+                                                <button
+                                                    type="button"
+                                                    className="viewer-ghost-button"
+                                                    title="Send with random seed (-1)"
+                                                    onClick={() => {
+                                                        setSendSeedForCurrentRequest(true);
+                                                        updateForgeOverride("seed", "-1");
+                                                    }}
+                                                    style={{ padding: "2px 6px", fontSize: "11px" }}
+                                                >
+                                                    🎲 Random (-1)
+                                                </button>
+                                                {currentSeed && (
+                                                    <button
+                                                        type="button"
+                                                        className="viewer-ghost-button"
+                                                        title={`Restore original seed (${currentSeed})`}
+                                                        onClick={() => {
+                                                            setSendSeedForCurrentRequest(true);
+                                                            updateForgeOverride("seed", currentSeed);
+                                                        }}
+                                                        style={{ padding: "2px 6px", fontSize: "11px" }}
+                                                    >
+                                                        Original
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
                                         <label className="viewer-toggle-row">
                                             <input
                                                 type="checkbox"
@@ -2581,15 +2697,33 @@ export function PhotoViewer({
                                                 placeholder="CFG Scale"
                                                 aria-invalid={cfgScaleValidationError != null}
                                             />
-                                            <input
-                                                className="viewer-input"
-                                                value={forgeOverrides.seed}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("seed", event.target.value)
-                                                }
-                                                placeholder="Seed"
-                                                disabled={!sendSeedForCurrentRequest}
-                                            />
+                                            <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+                                                <input
+                                                    className="viewer-input"
+                                                    style={{ flex: 1 }}
+                                                    value={forgeOverrides.seed}
+                                                    onChange={(event) =>
+                                                        updateForgeOverride("seed", event.target.value)
+                                                    }
+                                                    placeholder="Seed (-1 for random)"
+                                                    disabled={!sendSeedForCurrentRequest}
+                                                />
+                                                <button
+                                                    type="button"
+                                                    className="viewer-ghost-button"
+                                                    title="Generate random seed"
+                                                    disabled={!sendSeedForCurrentRequest}
+                                                    onClick={() =>
+                                                        updateForgeOverride(
+                                                            "seed",
+                                                            String(Math.floor(Math.random() * 4294967295))
+                                                        )
+                                                    }
+                                                    style={{ padding: "6px 8px", fontSize: "12px" }}
+                                                >
+                                                    🎲
+                                                </button>
+                                            </div>
                                             <input
                                                 className="viewer-input"
                                                 value={forgeOverrides.width}
@@ -2640,20 +2774,161 @@ export function PhotoViewer({
                                                     Current image model is not in detected checkpoint scan.
                                                 </div>
                                             )}
-                                        <button
-                                            className="viewer-action-button primary"
-                                            onClick={handleSendToForge}
-                                            disabled={
-                                                isSendingToForge ||
-                                                !hasValidForgeUrl ||
-                                                hasForgeValidationErrors ||
-                                                isDetailLoading ||
-                                                !currentDetail
-                                            }
-                                            style={{ marginTop: 6 }}
-                                        >
-                                            {isSendingToForge ? "Sending..." : "Send to Forge"}
-                                        </button>
+                                        <div style={{ marginTop: 6 }}>
+                                            <ForgeRequeueButton
+                                                imageId={currentImage?.id}
+                                                baseUrl={forgeBaseUrl}
+                                                apiKey={forgeApiKey}
+                                                outputDir={
+                                                    forgeOutputDir.trim() ? forgeOutputDir : null
+                                                }
+                                                includeSeed={sendSeedForCurrentRequest}
+                                                adetailerEnabled={useAdetailerForCurrentRequest}
+                                                adetailerModel={
+                                                    adetailerFaceModelForCurrentRequest.trim()
+                                                        ? adetailerFaceModelForCurrentRequest
+                                                        : null
+                                                }
+                                                loraTokens={
+                                                    forgeSelectedLoras.length > 0
+                                                        ? forgeSelectedLoras
+                                                        : null
+                                                }
+                                                loraWeight={
+                                                    forgeLoraWeight.trim()
+                                                        ? Number(forgeLoraWeight)
+                                                        : null
+                                                }
+                                                overrides={forgeOverrides}
+                                                disabled={
+                                                    !hasValidForgeUrl ||
+                                                    hasForgeValidationErrors ||
+                                                    isDetailLoading ||
+                                                    !currentDetail
+                                                }
+                                                validate={() => {
+                                                    if (!hasValidForgeUrl) {
+                                                        return (
+                                                            forgeUrlValidationError ??
+                                                            "Forge URL is invalid."
+                                                        );
+                                                    }
+                                                    if (hasForgeValidationErrors) {
+                                                        return "Fix invalid Forge payload fields before sending.";
+                                                    }
+                                                    return null;
+                                                }}
+                                                onQueued={(_queueId, result) => {
+                                                    showViewerToast(result.message, "success");
+                                                    void refreshForgeOptions();
+                                                }}
+                                                onError={(message) =>
+                                                    showViewerToast(message, "error")
+                                                }
+                                                label="Send to Forge"
+                                                className="viewer-action-button primary"
+                                            />
+                                        </div>
+                                    </section>
+                                </>
+                            )}
+
+                            {infoPanelTab === "lineage" && (
+                                <>
+                                    <section className="photo-viewer-section" data-testid="lineage-tab">
+                                        <h4>Lineage</h4>
+                                        {isLineageLoading && (
+                                            <div className="photo-viewer-note"><span className="spinner small" /> Loading lineage…</div>
+                                        )}
+                                        {!isLineageLoading && lineageCursor && (
+                                            <>
+                                                <div className="viewer-form-label">Ancestors ({lineageCursor.ancestors.length}/3)</div>
+                                                {lineageCursor.ancestors.length === 0 ? (
+                                                    <div className="photo-viewer-note">No ancestors.</div>
+                                                ) : (
+                                                    <div className="viewer-lineage-list" data-testid="lineage-ancestors">
+                                                        {lineageCursor.ancestors.map((edge) => {
+                                                            const thumb = lineageThumbs[edge.parent_filepath];
+                                                            const label = edge.parent_filepath.split(/[/\\]/).pop() ?? edge.parent_filepath;
+                                                            return (
+                                                                <div key={`${edge.child_filepath}|${edge.parent_filepath}`} className="viewer-lineage-row" data-testid="lineage-ancestor-row">
+                                                                    <button
+                                                                        type="button"
+                                                                        className="viewer-lineage-thumb-btn"
+                                                                        onClick={() => handleLineageJump(edge.parent_filepath)}
+                                                                        title={`Jump to ${label}`}
+                                                                        data-testid="lineage-jump-ancestor"
+                                                                    >
+                                                                        {thumb ? (
+                                                                            <img src={toAssetSrc(thumb)} alt={label} loading="lazy" decoding="async" />
+                                                                        ) : (
+                                                                            <span className="viewer-lineage-thumb-placeholder">—</span>
+                                                                        )}
+                                                                    </button>
+                                                                    <div className="viewer-lineage-meta">
+                                                                        <span className="viewer-lineage-filename" title={edge.parent_filepath}>{label}</span>
+                                                                        <span className="viewer-lineage-relation">{edge.relation} • {edge.confidence.toFixed(2)}</span>
+                                                                    </div>
+                                                                    <div className="viewer-lineage-actions">
+                                                                        <button type="button" className="viewer-control-button" onClick={() => handleLineageJump(edge.parent_filepath)} data-testid="lineage-jump-btn">Jump</button>
+                                                                        <button type="button" className="viewer-control-button" onClick={() => handlePinLineageToCompare(edge.parent_filepath)} data-testid="lineage-pin-btn">Pin</button>
+                                                                        <button type="button" className="viewer-control-button danger" onClick={() => handleLineageUnlink(edge, "ancestor")} disabled={isLineageMutating} data-testid="lineage-unlink-btn">Unlink</button>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
+                                                <div className="viewer-form-label">Children ({lineageCursor.children.length}/2)</div>
+                                                {lineageCursor.children.length === 0 ? (
+                                                    <div className="photo-viewer-note">No children.</div>
+                                                ) : (
+                                                    <div className="viewer-lineage-list" data-testid="lineage-children">
+                                                        {lineageCursor.children.map((edge) => {
+                                                            const thumb = lineageThumbs[edge.child_filepath];
+                                                            const label = edge.child_filepath.split(/[/\\]/).pop() ?? edge.child_filepath;
+                                                            return (
+                                                                <div key={`${edge.child_filepath}|${edge.parent_filepath}`} className="viewer-lineage-row" data-testid="lineage-child-row">
+                                                                    <button
+                                                                        type="button"
+                                                                        className="viewer-lineage-thumb-btn"
+                                                                        onClick={() => handleLineageJump(edge.child_filepath)}
+                                                                        title={`Jump to ${label}`}
+                                                                        data-testid="lineage-jump-child"
+                                                                    >
+                                                                        {thumb ? (
+                                                                            <img src={toAssetSrc(thumb)} alt={label} loading="lazy" decoding="async" />
+                                                                        ) : (
+                                                                            <span className="viewer-lineage-thumb-placeholder">—</span>
+                                                                        )}
+                                                                    </button>
+                                                                    <div className="viewer-lineage-meta">
+                                                                        <span className="viewer-lineage-filename" title={edge.child_filepath}>{label}</span>
+                                                                        <span className="viewer-lineage-relation">{edge.relation} • {edge.confidence.toFixed(2)}</span>
+                                                                    </div>
+                                                                    <div className="viewer-lineage-actions">
+                                                                        <button type="button" className="viewer-control-button" onClick={() => handleLineageJump(edge.child_filepath)} data-testid="lineage-jump-btn">Jump</button>
+                                                                        <button type="button" className="viewer-control-button" onClick={() => handlePinLineageToCompare(edge.child_filepath)} data-testid="lineage-pin-btn">Pin</button>
+                                                                        <button type="button" className="viewer-control-button danger" onClick={() => handleLineageUnlink(edge, "child")} disabled={isLineageMutating} data-testid="lineage-unlink-btn">Unlink</button>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
+                                                <div className="viewer-form-label">Manual Link</div>
+                                                <div className="viewer-form-grid">
+                                                    <input className="viewer-input" value={linkParentInput} onChange={(e) => setLinkParentInput(e.target.value)} placeholder="Parent filepath" data-testid="lineage-link-parent" />
+                                                    <input className="viewer-input" value={linkRelationInput} onChange={(e) => setLinkRelationInput(e.target.value)} placeholder="relation" data-testid="lineage-link-relation" />
+                                                </div>
+                                                <button type="button" className="viewer-action-button primary" onClick={handleLineageLink} disabled={isLineageMutating || !linkParentInput.trim()} data-testid="lineage-link-btn">{isLineageMutating ? "Saving…" : "Link"}</button>
+                                                <div className="viewer-form-label">Compare Lab</div>
+                                                <button type="button" className="viewer-action-button" onClick={handlePinCurrentToCompare} data-testid="lineage-pin-current">Pin current to Compare Lab</button>
+                                            </>
+                                        )}
+                                        {!isLineageLoading && !lineageCursor && (
+                                            <div className="photo-viewer-note">No lineage data.</div>
+                                        )}
                                     </section>
                                 </>
                             )}

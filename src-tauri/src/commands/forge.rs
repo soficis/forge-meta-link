@@ -199,6 +199,7 @@ fn normalize_forge_send_options(
         return Err("Invalid LoRA weight value".to_string());
     }
 
+    let _ = forge_api::validate_base_url(&options.base_url)?;
     let output_dir = resolve_forge_output_dir(options.output_dir.as_deref(), default_output_base)?;
 
     Ok(NormalizedForgeSendOptions {
@@ -294,7 +295,7 @@ fn merge_unique_strings(primary: Vec<String>, secondary: Vec<String>) -> Vec<Str
     let mut merged = Vec::with_capacity(primary.len() + secondary.len());
     let mut seen = std::collections::BTreeSet::new();
 
-    for value in primary.into_iter().chain(secondary.into_iter()) {
+    for value in primary.into_iter().chain(secondary) {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             continue;
@@ -413,6 +414,9 @@ pub async fn forge_get_options(
     };
 
     let mut warnings = Vec::new();
+    if let Ok(Some(warning)) = forge_api::validate_base_url(&base_url) {
+        warnings.push(warning);
+    }
 
     let api_models = match forge_api::list_models(&base_url, api_key.as_deref()).await {
         Ok(values) => values,
@@ -784,6 +788,7 @@ fn build_payload_for_image(
     let negative_prompt = override_negative_prompt.unwrap_or(image.negative_prompt.as_str());
     let steps = override_steps.or(image.steps.as_deref());
     let sampler = override_sampler.or(image.sampler.as_deref());
+    // Note: ImageRecord does not store a separate scheduler column in DB; scheduler is populated from overrides if present.
     let scheduler = override_scheduler;
     let cfg_scale = override_cfg_scale.or(image.cfg_scale.as_deref());
     let seed = override_seed.or(image.seed.as_deref());
@@ -1044,8 +1049,132 @@ async fn send_image_record_to_forge(
     })
 }
 
+async fn ingest_forge_saved_paths(
+    saved_paths: &[String],
+    state: &AppState,
+    app: Option<&tauri::AppHandle>,
+) {
+    if saved_paths.is_empty() {
+        return;
+    }
+
+    if let Some(app_handle) = app {
+        for path_str in saved_paths {
+            let path = Path::new(path_str);
+            if let Some(parent) = path.parent() {
+                if parent.exists() {
+                    let _ = app_handle.asset_protocol_scope().allow_directory(parent, true);
+                }
+            }
+        }
+    }
+
+    let paths_clone = saved_paths.to_vec();
+    let db = state.db.clone();
+    let cache_dir = state.cache_dir.clone();
+    let thumbnail_index = state.thumbnail_index.clone();
+    let storage_profile = state
+        .storage_profile
+        .read()
+        .map(|p| *p)
+        .unwrap_or(StorageProfile::Hdd);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut records = Vec::with_capacity(paths_clone.len());
+        let mut pathbufs = Vec::with_capacity(paths_clone.len());
+
+        for path_str in &paths_clone {
+            let path = PathBuf::from(path_str);
+            if !path.exists() {
+                continue;
+            }
+            let (file_size, file_mtime) = match path.metadata() {
+                Ok(m) => {
+                    let size = m.len() as i64;
+                    let mtime = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (size, mtime)
+                }
+                Err(_) => (0, 0),
+            };
+
+            let raw_metadata = extract_parameters_metadata(&path, None);
+            let params = if raw_metadata.trim().is_empty() {
+                parser::GenerationParams {
+                    raw_metadata: String::new(),
+                    ..Default::default()
+                }
+            } else {
+                parser::parse_generation_metadata(&raw_metadata)
+            };
+            let mut tags = parser::extract_tags(&params.prompt);
+            if let Some(sidecar_data) = sidecar::read_sidecar(&path) {
+                tags.extend(sidecar_data.tags);
+            }
+
+            let quick_hash = scanner::compute_quick_hash(&path, Some(file_size));
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let directory = path
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .to_string();
+
+            records.push(BulkRecord {
+                filepath: path_str.clone(),
+                filename,
+                directory,
+                params,
+                file_mtime: Some(file_mtime),
+                file_size: Some(file_size),
+                quick_hash,
+                tags,
+            });
+            pathbufs.push(path);
+        }
+
+        if !records.is_empty() {
+            if let Err(e) = db.bulk_upsert_with_tags(&records) {
+                log::error!("Failed to ingest Forge generated images into database: {}", e);
+            } else {
+                log::info!("Successfully ingested {} Forge generated image(s)", records.len());
+            }
+        }
+
+        if !pathbufs.is_empty() {
+            let generated = image_processing::generate_thumbnails(
+                &pathbufs,
+                &cache_dir,
+                storage_profile,
+            );
+            if !generated.is_empty() {
+                if let Ok(mut idx) = thumbnail_index.write() {
+                    for (_, thumb_path) in generated {
+                        idx.insert(thumb_path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .ok();
+
+    if let Some(app) = app {
+        let _ = app.emit("forge-images-ingested", saved_paths);
+    }
+}
+
 #[tauri::command]
 pub async fn forge_send_to_image(
+    app: tauri::AppHandle,
     request: ForgeSendToImageRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<ForgeSendOutput, String> {
@@ -1071,11 +1200,16 @@ pub async fn forge_send_to_image(
         overrides: normalized.overrides.as_ref(),
     };
 
-    send_image_record_to_forge(&image, &context).await
+    let result = send_image_record_to_forge(&image, &context).await?;
+    if !result.saved_paths.is_empty() {
+        ingest_forge_saved_paths(&result.saved_paths, &state, Some(&app)).await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn forge_send_to_images(
+    app: tauri::AppHandle,
     request: ForgeSendToImagesRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<ForgeBatchSendOutput, String> {
@@ -1084,7 +1218,7 @@ pub async fn forge_send_to_images(
         return Err("No selected images for Forge queue".to_string());
     }
 
-    let _queue_guard = state.forge_send_queue.lock().await;
+    state.forge_cancel.store(false, Ordering::SeqCst);
     let default_output_base = default_forge_output_base_dir(&state.cache_dir);
     let normalized = normalize_forge_send_options(options, &default_output_base)?;
     let output_dir_display = normalized.output_dir.to_string_lossy().to_string();
@@ -1105,6 +1239,19 @@ pub async fn forge_send_to_images(
     };
 
     for image_id in image_ids {
+        if state.forge_cancel.load(Ordering::SeqCst) {
+            log::info!("Forge batch cancelled by user at image_id {}", image_id);
+            items.push(ForgeBatchItemOutput {
+                image_id,
+                filename: "<cancelled>".to_string(),
+                ok: false,
+                message: "Batch queue cancelled".to_string(),
+                generated_count: 0,
+                saved_paths: Vec::new(),
+            });
+            break;
+        }
+
         let image = match state
             .db
             .get_image_by_id(image_id)
@@ -1124,13 +1271,21 @@ pub async fn forge_send_to_images(
             }
         };
 
-        match send_image_record_to_forge(&image, &context).await {
+        let send_res = {
+            let _queue_guard = state.forge_send_queue.lock().await;
+            send_image_record_to_forge(&image, &context).await
+        };
+
+        match send_res {
             Ok(result) => {
                 if result.ok {
                     succeeded += 1;
                 }
+                if !result.saved_paths.is_empty() {
+                    ingest_forge_saved_paths(&result.saved_paths, &state, Some(&app)).await;
+                }
                 items.push(ForgeBatchItemOutput {
-                    image_id: image.id,
+                    image_id,
                     filename: image.filename.clone(),
                     ok: result.ok,
                     message: result.message,
@@ -1140,7 +1295,7 @@ pub async fn forge_send_to_images(
             }
             Err(error) => {
                 items.push(ForgeBatchItemOutput {
-                    image_id: image.id,
+                    image_id,
                     filename: image.filename.clone(),
                     ok: false,
                     message: error,
@@ -1165,5 +1320,90 @@ pub async fn forge_send_to_images(
         output_dir: output_dir_display,
         message,
         items,
+    })
+}
+
+#[tauri::command]
+pub fn forge_cancel_queue(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.forge_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeRequeueRequest {
+    pub image_id: i64,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub include_seed: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn forge_requeue_image(
+    app: tauri::AppHandle,
+    request: ForgeRequeueRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<ForgeSendOutput, String> {
+    let ForgeRequeueRequest {
+        image_id,
+        base_url,
+        api_key,
+        include_seed,
+    } = request;
+    let _queue_guard = state.forge_send_queue.lock().await;
+    let effective_api_key = api_key.or_else(|| {
+        state
+            .forge_api_key
+            .read()
+            .ok()
+            .map(|k| k.clone())
+            .filter(|k| !k.trim().is_empty())
+    });
+    let default_output_base = default_forge_output_base_dir(&state.cache_dir);
+    let output_dir = resolve_forge_output_dir(None, &default_output_base)?;
+    let image = state
+        .db
+        .get_image_by_id(image_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Image not found: {}", image_id))?;
+    let params = crate::parser::GenerationParams {
+        prompt: image.prompt.clone(),
+        negative_prompt: image.negative_prompt.clone(),
+        steps: image.steps.clone(),
+        sampler: image.sampler.clone(),
+        schedule_type: None,
+        cfg_scale: image.cfg_scale.clone(),
+        seed: image.seed.clone(),
+        width: image.width,
+        height: image.height,
+        model_hash: image.model_hash.clone(),
+        model_name: image.model_name.clone(),
+        generation_type: None,
+        extra_params: std::collections::HashMap::new(),
+        raw_metadata: image.raw_metadata.clone(),
+    };
+    let api_result = forge_api::forge_requeue_image(
+        &params,
+        &base_url,
+        effective_api_key.as_deref(),
+        include_seed.unwrap_or(true),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !api_result.ok {
+        return Err(api_result.message);
+    }
+    let saved_paths =
+        save_generated_images(&api_result.images, &output_dir, &image.filename, None)?;
+    if !saved_paths.is_empty() {
+        ingest_forge_saved_paths(&saved_paths, &state, Some(&app)).await;
+    }
+    let message = api_result.message.clone();
+    Ok(ForgeSendOutput {
+        ok: true,
+        message,
+        output_dir: output_dir.to_string_lossy().to_string(),
+        generated_count: saved_paths.len(),
+        saved_paths,
     })
 }

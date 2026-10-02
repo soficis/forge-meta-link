@@ -27,7 +27,7 @@ pub struct FilterImagesCursorRequest {
 }
 
 /// Cursor-based pagination for infinite scroll with optional sorting.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_images_cursor(
     cursor: Option<String>,
     limit: u32,
@@ -67,7 +67,7 @@ pub fn get_images_cursor(
 }
 
 /// Cursor-based search.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_images_cursor(
     request: SearchImagesCursorRequest,
     state: tauri::State<AppState>,
@@ -142,7 +142,7 @@ pub fn search_images_cursor(
 }
 
 /// Cursor-based filtering.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn filter_images_cursor(
     request: FilterImagesCursorRequest,
     state: tauri::State<AppState>,
@@ -196,7 +196,7 @@ pub fn filter_images_cursor(
 
 // ────────────────────────── Tag queries ──────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tags(
     prefix: Option<String>,
     limit: u32,
@@ -220,7 +220,7 @@ pub fn list_tags(
     result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_top_tags(limit: u32, state: tauri::State<AppState>) -> Result<Vec<TagCount>, String> {
     let started = std::time::Instant::now();
     let result = state.db.get_top_tags(limit).map_err(|e| e.to_string());
@@ -236,12 +236,12 @@ pub fn get_top_tags(limit: u32, state: tauri::State<AppState>) -> Result<Vec<Tag
     result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_image_tags(id: i64, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     state.db.get_tags_for_image(id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_image_detail(
     id: i64,
     state: tauri::State<AppState>,
@@ -249,7 +249,7 @@ pub fn get_image_detail(
     state.db.get_image_by_id(id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_total_count(state: tauri::State<AppState>) -> Result<u32, String> {
     state.db.get_total_count().map_err(|e| e.to_string())
 }
@@ -257,13 +257,42 @@ pub fn get_total_count(state: tauri::State<AppState>) -> Result<u32, String> {
 // ────────────────────────── Group-by queries ──────────────────────────
 
 /// Returns unique directories with image counts for group-by view.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_directories(state: tauri::State<AppState>) -> Result<Vec<DirectoryEntry>, String> {
     state.db.get_unique_directories().map_err(|e| e.to_string())
 }
 
 /// Returns unique model names with image counts for group-by view.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_models(state: tauri::State<AppState>) -> Result<Vec<ModelEntry>, String> {
     state.db.get_unique_models().map_err(|e| e.to_string())
+}
+
+/// Returns groups of images sharing the same quick_hash (exact duplicates).
+#[tauri::command(async)]
+pub fn get_duplicate_groups(
+    limit: Option<u32>,
+    offset: Option<u32>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<DuplicateGroup>, String> {
+    let lim = limit.unwrap_or(100).clamp(1, 500);
+    let off = offset.unwrap_or(0);
+    let started = std::time::Instant::now();
+    let result = state.db.get_duplicate_groups(lim, off).map_err(|e| e.to_string());
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match &result {
+        Ok(groups) => log::info!(
+            "Query get_duplicate_groups returned {} groups in {:.1} ms (limit={}, offset={})",
+            groups.len(),
+            elapsed_ms,
+            lim,
+            off
+        ),
+        Err(error) => log::warn!(
+            "Query get_duplicate_groups failed in {:.1} ms: {}",
+            elapsed_ms,
+            error
+        ),
+    }
+    result
 }

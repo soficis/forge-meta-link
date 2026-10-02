@@ -1,18 +1,28 @@
 // ── Sidecar Commands ──────────────────────────────────────────────────
 
-#[tauri::command]
-pub fn get_sidecar_data(filepath: String) -> Option<sidecar::SidecarData> {
+#[tauri::command(async)]
+pub fn get_sidecar_data(
+    filepath: String,
+    state: tauri::State<AppState>,
+) -> Result<Option<sidecar::SidecarData>, String> {
+    if !is_allowed_path(&filepath, &state.db, &state.cache_dir) {
+        return Err(format!("Access denied: path is not indexed or in cache: {}", filepath));
+    }
     let path = Path::new(&filepath);
-    sidecar::read_sidecar(path)
+    Ok(sidecar::read_sidecar(path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_sidecar_tags(
     filepath: String,
     tags: Vec<String>,
     notes: Option<String>,
     state: tauri::State<AppState>,
 ) -> Result<String, String> {
+    if !is_allowed_path(&filepath, &state.db, &state.cache_dir) {
+        return Err(format!("Access denied: path is not indexed or in cache: {}", filepath));
+    }
+
     let file_path = PathBuf::from(&filepath);
     if !file_path.exists() {
         return Err(format!("File not found: {}", filepath));

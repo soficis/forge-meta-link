@@ -31,13 +31,13 @@ impl Database {
 
         let mut sql = if sort.field == "id" {
             String::from(
-                "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked
+                "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime
                  FROM images
                  WHERE 1=1",
             )
         } else {
             format!(
-                "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, {} AS sort_value
+                "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime, {} AS sort_value
                  FROM images
                  WHERE 1=1",
                 sort.sort_expr()
@@ -68,7 +68,7 @@ impl Database {
             }
         }
         sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        par.push(Value::Integer(limit as i64));
+        par.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         let mut items = Vec::new();
@@ -84,7 +84,7 @@ impl Database {
             let rows = stmt.query_map(params_from_iter(par), |row| {
                 Ok((
                     gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
             let mut last_cursor = None::<(i64, String)>;
@@ -147,7 +147,7 @@ impl Database {
         let mut sql = if sort.field == "id" {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
                  FROM images
                  JOIN images_fts ON images.id = images_fts.rowid
                  WHERE images_fts MATCH ?",
@@ -155,7 +155,7 @@ impl Database {
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, {} AS sort_value
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images
                  JOIN images_fts ON images.id = images_fts.rowid
                  WHERE images_fts MATCH ?",
@@ -192,7 +192,7 @@ impl Database {
         }
 
         sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
+        params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         if sort.field == "id" {
@@ -210,7 +210,7 @@ impl Database {
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok((
                     gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
 
@@ -268,7 +268,7 @@ impl Database {
         let mut sql = if sort.field == "id" {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
                  FROM images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
@@ -276,7 +276,7 @@ impl Database {
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, {} AS sort_value
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
@@ -312,7 +312,7 @@ impl Database {
             }
         }
         sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
+        params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         if sort.field == "id" {
@@ -330,7 +330,7 @@ impl Database {
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok((
                     gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
             let mut items = Vec::new();
@@ -407,14 +407,14 @@ impl Database {
         let mut sql = if sort.field == "id" {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
                  FROM images{}",
                 fts_join
             )
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, {} AS sort_value
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images{}",
                 sort.sort_expr(),
                 fts_join
@@ -445,23 +445,45 @@ impl Database {
         );
 
         for tag in include_tags {
+            let clean = tag.trim().to_ascii_lowercase();
+            let clean_space = clean.replace('_', " ");
+            let clean_under = clean.replace(' ', "_");
+            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
-                " AND EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
+                " AND (
+                    EXISTS (
+                        SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                        WHERE it.image_id = images.id AND (t.tag = ? OR t.tag = ?)
+                    )
+                    OR images.id IN (
+                        SELECT rowid FROM images_fts WHERE images_fts MATCH ?
+                    )
                 )",
             );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
+            params_vec.push(Value::Text(clean_space));
+            params_vec.push(Value::Text(clean_under));
+            params_vec.push(Value::Text(fts_phrase));
         }
 
         for tag in exclude_tags {
+            let clean = tag.trim().to_ascii_lowercase();
+            let clean_space = clean.replace('_', " ");
+            let clean_under = clean.replace(' ', "_");
+            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
+                " AND NOT (
+                    EXISTS (
+                        SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                        WHERE it.image_id = images.id AND (t.tag = ? OR t.tag = ?)
+                    )
+                    OR images.id IN (
+                        SELECT rowid FROM images_fts WHERE images_fts MATCH ?
+                    )
                 )",
             );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
+            params_vec.push(Value::Text(clean_space));
+            params_vec.push(Value::Text(clean_under));
+            params_vec.push(Value::Text(fts_phrase));
         }
 
         if let Some(cid) = cursor_id {
@@ -485,7 +507,7 @@ impl Database {
         }
 
         sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
+        params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         if sort.field == "id" {
@@ -503,7 +525,7 @@ impl Database {
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok((
                     gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
             let mut items = Vec::new();
@@ -561,7 +583,7 @@ impl Database {
         let mut sql = if sort.field == "id" {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
                  FROM images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
@@ -569,7 +591,7 @@ impl Database {
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
-                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, {} AS sort_value
+                        images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
@@ -611,27 +633,49 @@ impl Database {
         }
 
         for tag in include_tags {
+            let clean = tag.trim().to_ascii_lowercase();
+            let clean_space = clean.replace('_', " ");
+            let clean_under = clean.replace(' ', "_");
+            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
-                " AND EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
+                " AND (
+                    EXISTS (
+                        SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                        WHERE it.image_id = images.id AND (t.tag = ? OR t.tag = ?)
+                    )
+                    OR images.id IN (
+                        SELECT rowid FROM images_fts_tri WHERE images_fts_tri MATCH ?
+                    )
                 )",
             );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
+            params_vec.push(Value::Text(clean_space));
+            params_vec.push(Value::Text(clean_under));
+            params_vec.push(Value::Text(fts_phrase));
         }
 
         for tag in exclude_tags {
+            let clean = tag.trim().to_ascii_lowercase();
+            let clean_space = clean.replace('_', " ");
+            let clean_under = clean.replace(' ', "_");
+            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
-                " AND NOT EXISTS (
-                    SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
-                    WHERE it.image_id = images.id AND t.tag = ?
+                " AND NOT (
+                    EXISTS (
+                        SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                        WHERE it.image_id = images.id AND (t.tag = ? OR t.tag = ?)
+                    )
+                    OR images.id IN (
+                        SELECT rowid FROM images_fts_tri WHERE images_fts_tri MATCH ?
+                    )
                 )",
             );
-            params_vec.push(Value::Text(tag.trim().to_ascii_lowercase()));
+            params_vec.push(Value::Text(clean_space));
+            params_vec.push(Value::Text(clean_under));
+            params_vec.push(Value::Text(fts_phrase));
         }
 
         sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
-        params_vec.push(Value::Integer(limit as i64));
+        params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         if sort.field == "id" {
@@ -649,7 +693,7 @@ impl Database {
             let rows = stmt.query_map(params_from_iter(params_vec), |row| {
                 Ok((
                     gallery_image_record_from_row(row)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })?;
             let mut items = Vec::new();

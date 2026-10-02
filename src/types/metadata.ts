@@ -11,6 +11,7 @@ export interface GalleryImageRecord {
     model_name: string | null;
     is_favorite: boolean;
     is_locked: boolean;
+    file_mtime: number | null;
 }
 
 export interface ImageRecord extends GalleryImageRecord {
@@ -58,6 +59,7 @@ export interface DeleteImagesResult {
     blocked_protected: number;
     blocked_protected_ids: number[];
     failed_paths: string[];
+    db_error?: string | null;
 }
 
 export type DeleteMode = "trash" | "permanent";
@@ -116,10 +118,15 @@ export interface ForgePayload {
     negative_prompt: string;
     steps?: number;
     sampler_name?: string;
+    scheduler?: string;
     cfg_scale?: number;
     seed?: number;
     width?: number;
     height?: number;
+    override_settings?: Record<string, unknown>;
+    alwayson_scripts?: Record<string, unknown>;
+    send_images?: boolean;
+    save_images?: boolean;
 }
 
 export interface ForgeStatus {
@@ -176,6 +183,8 @@ export interface ForgePayloadOverrides {
     model_name: string;
 }
 
+export type ForgePayloadOverridesPartial = Partial<ForgePayloadOverrides>;
+
 export interface ModelEntry {
     model_name: string;
     count: number;
@@ -197,3 +206,24 @@ export type SortOption =
     | "model"
     | "generation_type";
 export type StorageProfile = "hdd" | "ssd";
+
+export interface LineageEdge {
+    child_filepath: string;
+    parent_filepath: string;
+    relation: string;
+    confidence: number;
+    created_at: number;
+}
+
+export interface LineageCursor {
+    ancestors: LineageEdge[];
+    children: LineageEdge[];
+}
+
+export interface TagProvenance {
+    tag: string;
+    count: number;
+    first_seen: number | null;
+    last_seen: number | null;
+    sample_filepaths: string[];
+}

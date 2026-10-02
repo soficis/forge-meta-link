@@ -23,17 +23,11 @@
             "assetProtocol": {
                 "enable": true,
                 "scope": [
-                    "$APPDATA/**",
-                    "$RESOURCE/**",
-                    "$HOME/**",
-                    "**/*",
-                    "?:/**",
-                    "?:\\**",
-                    "[A-Za-z]:/**",
-                    "[A-Za-z]:\\**"
+                    "$APPDATA/**"
                 ]
             },
-            "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+            "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self'; font-src 'self'; script-src 'self'",
+            "devCsp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ws://localhost:5173 http://localhost:5173 ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'"
         }
     },
     "bundle": {

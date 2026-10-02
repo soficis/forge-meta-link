@@ -5,7 +5,13 @@ import {
     numberStorage,
     stringArrayStorage,
 } from "./usePersistedState";
-import type { DeleteMode, GenerationType, SortOption } from "../types/metadata";
+import type { GenerationType, SortOption } from "../types/metadata";
+
+try {
+    localStorage.removeItem("deleteMode");
+} catch {
+    // Ignore environments where localStorage is unavailable
+}
 
 const SORT_OPTIONS = new Set<SortOption>([
     "newest",
@@ -40,12 +46,6 @@ const generationTypeStorage = {
             : undefined,
 };
 
-const deleteModeStorage = {
-    serialize: (value: DeleteMode) => value,
-    deserialize: (raw: string): DeleteMode | undefined =>
-        raw === "trash" || raw === "permanent" ? raw : undefined,
-};
-
 export interface AppSettings {
     columnCount: number;
     setColumnCount: Dispatch<SetStateAction<number>>;
@@ -61,8 +61,6 @@ export interface AppSettings {
     setSelectedLoraFilter: Dispatch<SetStateAction<string>>;
     selectedCheckpointFamilies: string[];
     setSelectedCheckpointFamilies: Dispatch<SetStateAction<string[]>>;
-    deleteMode: DeleteMode;
-    setDeleteMode: Dispatch<SetStateAction<DeleteMode>>;
     autoLockFavorites: boolean;
     setAutoLockFavorites: Dispatch<SetStateAction<boolean>>;
 }
@@ -101,11 +99,6 @@ export function useAppSettings(): AppSettings {
             [],
             stringArrayStorage
         );
-    const [deleteMode, setDeleteMode] = usePersistedState<DeleteMode>(
-        "deleteMode",
-        "trash",
-        deleteModeStorage
-    );
     const [autoLockFavorites, setAutoLockFavorites] = usePersistedState(
         "autoLockFavorites",
         true,
@@ -127,8 +120,6 @@ export function useAppSettings(): AppSettings {
         setSelectedLoraFilter,
         selectedCheckpointFamilies,
         setSelectedCheckpointFamilies,
-        deleteMode,
-        setDeleteMode,
         autoLockFavorites,
         setAutoLockFavorites,
     };

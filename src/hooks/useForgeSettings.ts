@@ -33,9 +33,16 @@ export interface ForgeSettings {
     setForgeAdetailerFaceEnabled: (value: boolean) => void;
     forgeAdetailerFaceModel: string;
     setForgeAdetailerFaceModel: (value: string) => void;
+    isForgeApiKeyLoaded: boolean;
+    forgeApiKeyError: string | null;
 }
 
-/** Extracts Forge settings (API key stored in Rust-side app data; others in localStorage). */
+export function resolveForgeApiKeyForRequest(apiKey: string): string | null {
+    const trimmed = apiKey.trim();
+    return trimmed ? trimmed : null;
+}
+
+/** Extracts Forge settings (API key stored via SEC-02 OS keyring in Rust; others in localStorage). */
 export function useForgeSettings(): ForgeSettings {
     const [forgeBaseUrl, setForgeBaseUrl] = usePersistedState(
         "forgeBaseUrl",
@@ -43,6 +50,8 @@ export function useForgeSettings(): ForgeSettings {
     );
     const [forgeApiKey, setForgeApiKeyState] = useState("");
     const [isForgeApiKeyLoaded, setIsForgeApiKeyLoaded] = useState(false);
+    const [forgeApiKeyError, setForgeApiKeyError] = useState<string | null>(null);
+    const isForgeApiKeyDirtyRef = useRef(false);
     const [forgeOutputDir, setForgeOutputDir] = usePersistedState(
         "forgeOutputDir",
         ""
@@ -88,17 +97,21 @@ export function useForgeSettings(): ForgeSettings {
                 const resolvedApiKey = storedApiKey || legacyApiKey;
 
                 if (!storedApiKey && legacyApiKey.trim()) {
+                    isForgeApiKeyDirtyRef.current = true;
                     await setForgeApiKeyCommand(legacyApiKey);
                 }
 
                 if (!cancelled) {
                     setForgeApiKeyState(resolvedApiKey);
                     setIsForgeApiKeyLoaded(true);
+                    setForgeApiKeyError(null);
                 }
             } catch (error) {
                 if (!cancelled) {
-                    setForgeApiKeyState(legacyApiKey);
-                    setIsForgeApiKeyLoaded(true);
+                    setIsForgeApiKeyLoaded(false);
+                    setForgeApiKeyError(
+                        error instanceof Error ? error.message : "Could not read saved Forge API key."
+                    );
                 }
                 console.warn("Failed to load Forge API key from backend:", error);
             } finally {
@@ -113,7 +126,7 @@ export function useForgeSettings(): ForgeSettings {
     }, []);
 
     useEffect(() => {
-        if (!isForgeApiKeyLoaded) {
+        if (!isForgeApiKeyDirtyRef.current) {
             return;
         }
 
@@ -124,9 +137,11 @@ export function useForgeSettings(): ForgeSettings {
             .catch((error) => {
                 console.warn("Failed to persist Forge API key to backend:", error);
             });
-    }, [forgeApiKey, isForgeApiKeyLoaded]);
+    }, [forgeApiKey]);
 
     const setForgeApiKey = (value: string) => {
+        isForgeApiKeyDirtyRef.current = true;
+        setForgeApiKeyError(null);
         setForgeApiKeyState(value);
     };
 
@@ -135,6 +150,8 @@ export function useForgeSettings(): ForgeSettings {
         setForgeBaseUrl,
         forgeApiKey,
         setForgeApiKey,
+        isForgeApiKeyLoaded,
+        forgeApiKeyError,
         forgeOutputDir,
         setForgeOutputDir,
         forgeModelsPath,

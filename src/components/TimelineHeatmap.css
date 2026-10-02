@@ -1,0 +1,110 @@
+.timeline-heatmap {
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 12px 6px;
+}
+.timeline-heatmap-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.timeline-heatmap-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+}
+.timeline-heatmap-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.timeline-heatmap-cluster-input {
+    width: 200px;
+    padding: 4px 6px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 11px;
+}
+.timeline-heatmap-cluster-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+}
+.timeline-heatmap-clear {
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+}
+.timeline-heatmap-clear:hover {
+    border-color: var(--accent-secondary);
+    color: var(--text-primary);
+}
+.timeline-heatmap-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 72px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    padding-bottom: 2px;
+}
+.timeline-heatmap-bar-wrap {
+    flex: 1 1 0;
+    min-width: 8px;
+    max-width: 36px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    cursor: pointer;
+}
+.timeline-heatmap-bar {
+    border-radius: 3px 3px 0 0;
+    transition: filter 0.15s, transform 0.1s;
+    min-height: 2px;
+}
+.timeline-heatmap-bar-wrap:hover .timeline-heatmap-bar {
+    filter: brightness(1.2);
+    transform: translateY(-1px);
+}
+.timeline-heatmap-bar-wrap.selected .timeline-heatmap-bar {
+    outline: 1px solid var(--accent-secondary);
+    outline-offset: 1px;
+}
+.timeline-heatmap-bar-label {
+    font-size: 7px;
+    color: var(--text-tertiary);
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.timeline-heatmap-bar-count {
+    font-size: 7px;
+    color: var(--text-secondary);
+    text-align: center;
+}
+.timeline-heatmap-empty {
+    height: 72px;
+    display: grid;
+    place-items: center;
+    color: var(--text-tertiary);
+    font-size: 11px;
+}
+.timeline-heatmap-meta {
+    margin-top: 4px;
+    display: flex;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+}

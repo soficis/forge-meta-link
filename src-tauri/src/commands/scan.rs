@@ -1,4 +1,10 @@
-// ────────────────────────── Scan ──────────────────────────
+struct ScanRunningGuard(Arc<AtomicBool>);
+
+impl Drop for ScanRunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// High-performance directory scanner.
 ///
@@ -20,6 +26,18 @@ pub async fn scan_directory(
         return Err(format!("Invalid directory: {}", directory));
     }
 
+    if state
+        .scan_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("A scan is already running".to_string());
+    }
+
+    if let Err(error) = app.asset_protocol_scope().allow_directory(&dir_path, true) {
+        log::warn!("Failed to allow directory {} in asset protocol scope: {}", dir_path.display(), error);
+    }
+
     let db = state.db.clone();
     let cache_dir = state.cache_dir.clone();
     let thumbnail_index = state.thumbnail_index.clone();
@@ -30,9 +48,13 @@ pub async fn scan_directory(
         .map(|profile| *profile)
         .unwrap_or(StorageProfile::Hdd);
     let app_handle = app.clone();
+    let scan_running = state.scan_running.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let total_timer = std::time::Instant::now();
+        let _guard = ScanRunningGuard(scan_running);
+
+        let run_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let total_timer = std::time::Instant::now();
 
         // ── Stage 1: Walk filesystem ─────────────────────────────────
         let discovery_timer = std::time::Instant::now();
@@ -46,7 +68,8 @@ pub async fn scan_directory(
             },
         );
 
-        let image_files = scanner::scan_directory(&dir_path);
+        let image_files =
+            scanner::scan_directory_with_profile(&dir_path, storage_profile);
         let total_files = image_files.len();
         let discovery_elapsed = discovery_timer.elapsed();
 
@@ -147,7 +170,7 @@ pub async fn scan_directory(
                             );
                         }
 
-                        let raw_metadata = extract_parameters_metadata(&pending.path);
+                        let raw_metadata = extract_parameters_metadata(&pending.path, Some(&error_counter));
                         let params = if raw_metadata.trim().is_empty() {
                             parser::GenerationParams {
                                 raw_metadata: String::new(),
@@ -297,6 +320,33 @@ pub async fn scan_directory(
             },
         );
 
+        if indexed > 0 {
+            let db_lineage = db.clone();
+            let app_handle_lineage = app_handle.clone();
+            let newly_indexed_paths: Vec<String> = files_to_process
+                .iter()
+                .map(|p| p.path.to_string_lossy().to_string())
+                .collect();
+            tauri::async_runtime::spawn_blocking(move || {
+                let total_images = db_lineage.get_total_count().unwrap_or(0);
+                let result = if total_images <= 20_000 {
+                    db_lineage.infer_lineage()
+                } else {
+                    db_lineage.infer_lineage_for_files(Some(&newly_indexed_paths))
+                };
+                match result {
+                    Ok(count) => {
+                        log::info!("Post-scan lineage inference complete: {} edges", count);
+                        let _ = app_handle_lineage
+                            .emit("lineage-updated", serde_json::json!({ "edges": count }));
+                    }
+                    Err(e) => {
+                        log::warn!("Post-scan lineage inference failed: {}", e);
+                    }
+                }
+            });
+        }
+
         log::info!(
             "Scan complete: {} total, {} indexed, {} errors, {} skipped (unchanged)",
             total_files,
@@ -368,16 +418,32 @@ pub async fn scan_directory(
                     );
                 });
         }
+        }));
+
+        if run_res.is_err() {
+            log::error!("Scan panicked unexpectedly");
+            let _ = app_handle.emit(
+                "scan-complete",
+                ScanResult {
+                    total_files: 0,
+                    indexed: 0,
+                    errors: 1,
+                },
+            );
+        }
     });
 
     Ok(())
 }
 
-fn extract_parameters_metadata(path: &Path) -> String {
+fn extract_parameters_metadata(path: &Path, error_counter: Option<&AtomicUsize>) -> String {
     match scanner::extract_metadata(path) {
         Ok(Some(parameters)) => parameters,
         Ok(None) => read_sidecar_txt(path),
         Err(err) => {
+            if let Some(counter) = error_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             log::warn!("PNG metadata read failed for {}: {}", path.display(), err);
             read_sidecar_txt(path)
         }

@@ -30,111 +30,121 @@ impl Database {
         }
 
         let mut conn = self.pool.get().map_err(pool_error)?;
-        let tx = conn.transaction()?;
-        let mut count = 0usize;
-        {
-            let mut upsert_image_stmt = tx.prepare_cached(
-                "INSERT INTO images
-                    (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
-                     schedule_type, cfg_scale, seed, width, height, model_hash, model_name,
-                     generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
-                 ON CONFLICT(filepath) DO UPDATE SET
-                     filename=excluded.filename,
-                     directory=excluded.directory,
-                     prompt=excluded.prompt,
-                     negative_prompt=excluded.negative_prompt,
-                     steps=excluded.steps,
-                     sampler=excluded.sampler,
-                     schedule_type=excluded.schedule_type,
-                     cfg_scale=excluded.cfg_scale,
-                     seed=excluded.seed,
-                     width=excluded.width,
-                     height=excluded.height,
-                     model_hash=excluded.model_hash,
-                     model_name=excluded.model_name,
-                     generation_type=excluded.generation_type,
-                     raw_metadata=excluded.raw_metadata,
-                     extra_params=excluded.extra_params,
-                     file_mtime=excluded.file_mtime,
-                     file_size=excluded.file_size,
-                     quick_hash=excluded.quick_hash
-                 RETURNING id",
-            )?;
-            let mut delete_image_tags_stmt =
-                tx.prepare_cached("DELETE FROM image_tags WHERE image_id = ?1")?;
-            let mut upsert_tag_stmt = tx.prepare_cached(
-                "INSERT INTO tags(tag) VALUES (?1)
-                 ON CONFLICT(tag) DO UPDATE SET tag=excluded.tag
-                 RETURNING id",
-            )?;
-            let mut insert_image_tag_stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
-            )?;
-            let mut tag_id_cache: HashMap<String, i64> = HashMap::with_capacity(4096);
+        let mut total = 0usize;
+        let mut tag_id_cache: HashMap<String, i64> = HashMap::with_capacity(4096);
 
-            for record in records {
-                let extra = serde_json::to_string(&record.params.extra_params).unwrap_or_default();
-                let generation_type = record
-                    .params
-                    .generation_type
-                    .clone()
-                    .unwrap_or_else(|| infer_generation_type(&record.params.raw_metadata));
-
-                let id: i64 = upsert_image_stmt.query_row(
-                    params![
-                        record.filepath,
-                        record.filename,
-                        record.directory,
-                        record.params.prompt,
-                        record.params.negative_prompt,
-                        record.params.steps,
-                        record.params.sampler,
-                        record.params.schedule_type,
-                        record.params.cfg_scale,
-                        record.params.seed,
-                        record.params.width,
-                        record.params.height,
-                        record.params.model_hash,
-                        record.params.model_name,
-                        generation_type,
-                        record.params.raw_metadata,
-                        extra,
-                        record.file_mtime,
-                        record.file_size,
-                        record.quick_hash,
-                    ],
-                    |row| row.get::<_, i64>(0),
+        for chunk in records.chunks(500) {
+            let tx = conn.transaction()?;
+            {
+                let mut upsert_image_stmt = tx.prepare_cached(
+                    "INSERT INTO images
+                        (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
+                         schedule_type, cfg_scale, seed, seed_int, width, height, model_hash, model_name,
+                         generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                     ON CONFLICT(filepath) DO UPDATE SET
+                         filename=excluded.filename,
+                         directory=excluded.directory,
+                         prompt=excluded.prompt,
+                         negative_prompt=excluded.negative_prompt,
+                         steps=excluded.steps,
+                         sampler=excluded.sampler,
+                         schedule_type=excluded.schedule_type,
+                         cfg_scale=excluded.cfg_scale,
+                         seed=excluded.seed,
+                         seed_int=excluded.seed_int,
+                         width=excluded.width,
+                         height=excluded.height,
+                         model_hash=excluded.model_hash,
+                         model_name=excluded.model_name,
+                         generation_type=excluded.generation_type,
+                         raw_metadata=excluded.raw_metadata,
+                         extra_params=excluded.extra_params,
+                         file_mtime=excluded.file_mtime,
+                         file_size=excluded.file_size,
+                         quick_hash=excluded.quick_hash
+                     RETURNING id",
+                )?;
+                let mut delete_image_tags_stmt =
+                    tx.prepare_cached("DELETE FROM image_tags WHERE image_id = ?1")?;
+                let mut upsert_tag_stmt = tx.prepare_cached(
+                    "INSERT INTO tags(tag) VALUES (?1)
+                     ON CONFLICT(tag) DO UPDATE SET tag=excluded.tag
+                     RETURNING id",
+                )?;
+                let mut insert_image_tag_stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
                 )?;
 
-                // Replace tags within the same transaction
-                delete_image_tags_stmt.execute(params![id])?;
-                let mut seen_tags: HashSet<String> = HashSet::with_capacity(record.tags.len());
+                for record in chunk {
+                    let extra =
+                        serde_json::to_string(&record.params.extra_params).unwrap_or_default();
+                    let generation_type = record
+                        .params
+                        .generation_type
+                        .clone()
+                        .unwrap_or_else(|| infer_generation_type(&record.params.raw_metadata));
+                    let seed_int: Option<i64> =
+                        record.params.seed.as_deref().and_then(parse_seed_int);
 
-                for tag in &record.tags {
-                    let normalized = tag.trim().to_ascii_lowercase();
-                    if normalized.is_empty() || !seen_tags.insert(normalized.clone()) {
-                        continue;
+                    let id: i64 = upsert_image_stmt.query_row(
+                        params![
+                            record.filepath,
+                            record.filename,
+                            record.directory,
+                            record.params.prompt,
+                            record.params.negative_prompt,
+                            record.params.steps,
+                            record.params.sampler,
+                            record.params.schedule_type,
+                            record.params.cfg_scale,
+                            record.params.seed,
+                            seed_int,
+                            record.params.width,
+                            record.params.height,
+                            record.params.model_hash,
+                            record.params.model_name,
+                            generation_type,
+                            record.params.raw_metadata,
+                            extra,
+                            record.file_mtime,
+                            record.file_size,
+                            record.quick_hash,
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+
+                    delete_image_tags_stmt.execute(params![id])?;
+                    let mut seen_tags: HashSet<String> = HashSet::with_capacity(record.tags.len());
+
+                    for tag in &record.tags {
+                        let normalized = tag.trim().to_ascii_lowercase();
+                        if normalized.is_empty() || !seen_tags.insert(normalized.clone()) {
+                            continue;
+                        }
+
+                        let tag_id = if let Some(existing) = tag_id_cache.get(&normalized) {
+                            *existing
+                        } else {
+                            let created_or_existing: i64 = upsert_tag_stmt
+                                .query_row(params![normalized.as_str()], |row| {
+                                    row.get::<_, i64>(0)
+                                })?;
+                            tag_id_cache.insert(normalized.clone(), created_or_existing);
+                            created_or_existing
+                        };
+
+                        insert_image_tag_stmt.execute(params![id, tag_id])?;
                     }
 
-                    let tag_id = if let Some(existing) = tag_id_cache.get(&normalized) {
-                        *existing
-                    } else {
-                        let created_or_existing: i64 = upsert_tag_stmt
-                            .query_row(params![normalized.as_str()], |row| row.get::<_, i64>(0))?;
-                        tag_id_cache.insert(normalized, created_or_existing);
-                        created_or_existing
-                    };
-
-                    insert_image_tag_stmt.execute(params![id, tag_id])?;
+                    total += 1;
                 }
-
-                count += 1;
             }
+
+            tx.commit()?;
         }
 
-        tx.commit()?;
-        Ok(count)
+        Ok(total)
     }
 
     // ────────────────────────────── Writes ──────────────────────────────
@@ -155,12 +165,14 @@ impl Database {
             .clone()
             .unwrap_or_else(|| infer_generation_type(&params.raw_metadata));
 
+        let seed_int: Option<i64> = params.seed.as_deref().and_then(parse_seed_int);
+
         conn.query_row(
             "INSERT INTO images
                 (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
-                 schedule_type, cfg_scale, seed, width, height, model_hash, model_name,
+                 schedule_type, cfg_scale, seed, seed_int, width, height, model_hash, model_name,
                  generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
              ON CONFLICT(filepath) DO UPDATE SET
                  filename=excluded.filename,
                  directory=excluded.directory,
@@ -171,6 +183,7 @@ impl Database {
                  schedule_type=excluded.schedule_type,
                  cfg_scale=excluded.cfg_scale,
                  seed=excluded.seed,
+                 seed_int=excluded.seed_int,
                  width=excluded.width,
                  height=excluded.height,
                  model_hash=excluded.model_hash,
@@ -193,6 +206,7 @@ impl Database {
                 params.schedule_type,
                 params.cfg_scale,
                 params.seed,
+                seed_int,
                 params.width,
                 params.height,
                 params.model_hash,
@@ -296,6 +310,74 @@ impl Database {
         }
     }
 
+    /// Returns true if the given filepath is indexed in the images table.
+    pub fn is_indexed_path(&self, filepath: &str) -> bool {
+        let Ok(conn) = self.pool.get() else {
+            return false;
+        };
+
+        // 1. Direct query
+        if conn
+            .query_row(
+                "SELECT 1 FROM images WHERE filepath = ?1 LIMIT 1",
+                params![filepath],
+                |_| Ok(()),
+            )
+            .is_ok()
+        {
+            return true;
+        }
+
+        // 2. Query with alternate slash separators
+        let alt = if filepath.contains('\\') {
+            filepath.replace('\\', "/")
+        } else if filepath.contains('/') {
+            filepath.replace('/', "\\")
+        } else {
+            String::new()
+        };
+        if !alt.is_empty()
+            && conn
+                .query_row(
+                    "SELECT 1 FROM images WHERE filepath = ?1 LIMIT 1",
+                    params![alt],
+                    |_| Ok(()),
+                )
+                .is_ok()
+        {
+            return true;
+        }
+
+        // 3. Canonicalized path check if file exists
+        if let Ok(canon) = std::fs::canonicalize(filepath) {
+            let canon_str = canon.to_string_lossy().to_string();
+            let stripped = canon_str.strip_prefix(r"\\?\").unwrap_or(&canon_str);
+            if conn
+                .query_row(
+                    "SELECT 1 FROM images WHERE filepath = ?1 LIMIT 1",
+                    params![stripped],
+                    |_| Ok(()),
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            let stripped_slash = stripped.replace('\\', "/");
+            if conn
+                .query_row(
+                    "SELECT 1 FROM images WHERE filepath = ?1 LIMIT 1",
+                    params![stripped_slash],
+                    |_| Ok(()),
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn set_image_favorite(&self, image_id: i64, is_favorite: bool) -> SqlResult<()> {
         let conn = self.pool.get().map_err(pool_error)?;
         conn.execute(
@@ -355,13 +437,51 @@ impl Database {
         filename: &str,
         directory: &str,
     ) -> SqlResult<bool> {
-        let conn = self.pool.get().map_err(pool_error)?;
-        let updated = conn.execute(
+        use rusqlite::OptionalExtension;
+
+        let mut conn = self.pool.get().map_err(pool_error)?;
+        let tx = conn.transaction()?;
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+
+        let old_filepath: Option<String> = tx
+            .query_row(
+                "SELECT filepath FROM images WHERE id = ?1",
+                params![image_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(old_filepath) = old_filepath else {
+            return Ok(false);
+        };
+
+        let updated = tx.execute(
             "UPDATE images
              SET filepath = ?1, filename = ?2, directory = ?3
              WHERE id = ?4",
             params![filepath, filename, directory, image_id],
         )?;
+
+        if old_filepath != filepath {
+            tx.execute(
+                "UPDATE lineage SET child_filepath = ?1 WHERE child_filepath = ?2",
+                params![filepath, old_filepath],
+            )?;
+            tx.execute(
+                "UPDATE lineage SET parent_filepath = ?1 WHERE parent_filepath = ?2",
+                params![filepath, old_filepath],
+            )?;
+            tx.execute(
+                "UPDATE lineage_overrides SET child_filepath = ?1 WHERE child_filepath = ?2",
+                params![filepath, old_filepath],
+            )?;
+            tx.execute(
+                "UPDATE lineage_overrides SET parent_filepath = ?1 WHERE parent_filepath = ?2",
+                params![filepath, old_filepath],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(updated > 0)
     }
 }

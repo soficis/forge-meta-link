@@ -1,5 +1,6 @@
 pub mod database;
 pub mod forge_api;
+pub mod forge_keychain;
 pub mod image_decode;
 pub mod image_processing;
 pub mod parser;
@@ -10,13 +11,16 @@ mod commands;
 
 use commands::{
     delete_images, directory_exists, export_images, export_images_as_files, filter_images_cursor,
-    forge_get_options, forge_send_to_image, forge_send_to_images, forge_test_connection,
-    get_directories, get_display_image_path, get_forge_api_key, get_image_clipboard_payload,
-    get_image_detail, get_image_tags, get_images_cursor, get_models, get_sidecar_data,
-    get_storage_profile, get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count,
-    list_tags, move_images_to_directory, open_file_location, precache_all_thumbnails,
-    save_sidecar_tags, scan_directory, search_images_cursor, set_forge_api_key, set_image_favorite,
-    set_image_locked, set_images_favorite, set_images_locked, set_storage_profile,
+    forge_cancel_queue, forge_get_options, forge_requeue_image, forge_send_to_image,
+    forge_send_to_images, forge_test_connection, get_directories, get_display_image_path,
+    get_duplicate_groups, get_file_mtimes, get_file_mtimes_for_query, get_forge_api_key,
+    get_image_clipboard_payload, get_image_detail, get_image_tags, get_images_cursor,
+    get_lineage_cursor, get_models, get_seed_walk, get_sidecar_data, get_storage_profile,
+    get_tag_provenance, get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count,
+    infer_lineage, list_tags, move_images_to_directory, open_file_location,
+    precache_all_thumbnails, save_sidecar_tags, scan_directory, search_images_cursor,
+    set_forge_api_key, set_image_favorite, set_image_locked, set_images_favorite,
+    set_images_locked, set_lineage_override, set_storage_profile,
 };
 use database::Database;
 use serde::{Deserialize, Serialize};
@@ -25,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tauri::async_runtime::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const STORAGE_PROFILE_FILE: &str = "storage_profile.json";
 const FORGE_API_KEY_FILE: &str = "forge_api_key.json";
@@ -50,6 +54,8 @@ pub struct AppState {
     pub forge_api_key: Arc<RwLock<String>>,
     pub forge_api_key_path: PathBuf,
     pub forge_send_queue: Arc<Mutex<()>>,
+    pub scan_running: Arc<AtomicBool>,
+    pub forge_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +105,15 @@ pub fn run() {
             let storage_profile_value = load_storage_profile(&storage_profile_path);
             let storage_profile = Arc::new(RwLock::new(storage_profile_value));
             let forge_api_key_path = app_data.join(FORGE_API_KEY_FILE);
-            let forge_api_key = Arc::new(RwLock::new(load_forge_api_key(&forge_api_key_path)));
+            let initial_forge_api_key = match load_forge_api_key(&forge_api_key_path) {
+                Ok(Some(k)) => k,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    log::warn!("Could not read Forge API key on startup: {}", e);
+                    String::new()
+                }
+            };
+            let forge_api_key = Arc::new(RwLock::new(initial_forge_api_key));
 
             let db_path = app_data.join("ForgeMetaLink.db");
             let cache_dir = app_data.join("thumbnails");
@@ -108,10 +122,39 @@ pub fn run() {
             let failed_thumbnail_sources = Arc::new(RwLock::new(HashSet::new()));
             let thumbnail_precache_running = Arc::new(AtomicBool::new(false));
             let forge_send_queue = Arc::new(Mutex::new(()));
+            let scan_running = Arc::new(AtomicBool::new(false));
+            let forge_cancel = Arc::new(AtomicBool::new(false));
 
             // R2D2 pool created here
             let db = Database::new(&db_path, storage_profile_value)
                 .expect("Failed to initialize database");
+
+            let db_backfill = db.clone();
+            let app_handle_backfill = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                match db_backfill.run_lineage_migrations_if_needed() {
+                    Ok(Some(edges)) => {
+                        log::info!("Startup lineage migration completed: {} edges", edges);
+                        let _ = app_handle_backfill
+                            .emit("lineage-updated", serde_json::json!({ "edges": edges }));
+                    }
+                    Ok(None) => {
+                        log::debug!("Startup lineage migration already applied");
+                    }
+                    Err(e) => {
+                        log::warn!("Startup lineage migration failed: {}", e);
+                    }
+                }
+            });
+
+            if let Ok(dirs) = db.get_unique_directories() {
+                for entry in dirs {
+                    let dir = PathBuf::from(&entry.directory);
+                    if dir.exists() {
+                        let _ = app.asset_protocol_scope().allow_directory(&dir, true);
+                    }
+                }
+            }
             app.manage(AppState {
                 db,
                 cache_dir,
@@ -123,6 +166,8 @@ pub fn run() {
                 forge_api_key,
                 forge_api_key_path,
                 forge_send_queue,
+                scan_running,
+                forge_cancel,
             });
             Ok(())
         })
@@ -143,6 +188,7 @@ pub fn run() {
             precache_all_thumbnails,
             get_directories,
             get_models,
+            get_duplicate_groups,
             directory_exists,
             open_file_location,
             delete_images,
@@ -157,12 +203,21 @@ pub fn run() {
             forge_get_options,
             forge_send_to_image,
             forge_send_to_images,
+            forge_requeue_image,
+            forge_cancel_queue,
             get_forge_api_key,
             set_forge_api_key,
             get_sidecar_data,
             save_sidecar_tags,
             get_storage_profile,
             set_storage_profile,
+            get_file_mtimes,
+            get_file_mtimes_for_query,
+            get_lineage_cursor,
+            get_seed_walk,
+            get_tag_provenance,
+            infer_lineage,
+            set_lineage_override,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -184,20 +239,8 @@ fn load_storage_profile(path: &Path) -> StorageProfile {
         .unwrap_or_default()
 }
 
-fn load_forge_api_key(path: &Path) -> String {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return String::new(),
-    };
-
-    #[derive(Deserialize)]
-    struct ForgeApiKeyConfig {
-        api_key: String,
-    }
-
-    serde_json::from_str::<ForgeApiKeyConfig>(&content)
-        .map(|config| config.api_key)
-        .unwrap_or_default()
+pub(crate) fn load_forge_api_key(path: &Path) -> Result<Option<String>, String> {
+    forge_keychain::load_forge_api_key_with_migration(path)
 }
 
 pub(crate) fn persist_storage_profile(path: &Path, profile: StorageProfile) -> Result<(), String> {
@@ -219,31 +262,7 @@ pub(crate) fn persist_storage_profile(path: &Path, profile: StorageProfile) -> R
 }
 
 pub(crate) fn persist_forge_api_key(path: &Path, api_key: &str) -> Result<(), String> {
-    #[derive(Serialize)]
-    struct ForgeApiKeyConfig<'a> {
-        api_key: &'a str,
-    }
-
-    let payload = serde_json::to_string_pretty(&ForgeApiKeyConfig { api_key })
-        .map_err(|error| format!("Failed to serialize Forge API key: {}", error))?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create Forge API key directory {}: {}",
-                parent.display(),
-                error
-            )
-        })?;
-    }
-
-    std::fs::write(path, payload).map_err(|error| {
-        format!(
-            "Failed to save Forge API key to {}: {}",
-            path.display(),
-            error
-        )
-    })
+    forge_keychain::persist_forge_api_key_secure(path, api_key)
 }
 
 fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
@@ -285,36 +304,139 @@ fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
 mod tests {
     use super::{load_forge_api_key, persist_forge_api_key};
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_mutex() -> &'static Mutex<()> {
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_config_path() -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
+        let pid = std::process::id();
         std::env::temp_dir().join(format!(
-            "forge_meta_link_forge_api_key_test_{}.json",
-            timestamp
+            "forge_meta_link_forge_api_key_test_{}_{}.json",
+            pid, timestamp
         ))
     }
 
     #[test]
     fn forge_api_key_round_trip_persists_and_loads() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
         let path = temp_config_path();
         let key = "test-api-key-123";
         persist_forge_api_key(&path, key).expect("persist should succeed");
-        let loaded = load_forge_api_key(&path);
-        assert_eq!(loaded, key);
+        let loaded = load_forge_api_key(&path).expect("load should succeed");
+        assert_eq!(loaded, Some(key.to_string()));
         let _ = std::fs::remove_file(path);
+        crate::forge_keychain::clear_mock();
     }
 
     #[test]
     fn forge_api_key_load_defaults_when_file_missing() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
         let path = temp_config_path();
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
-        let loaded = load_forge_api_key(&path);
-        assert_eq!(loaded, "");
+        let loaded = load_forge_api_key(&path).expect("load should succeed");
+        assert_eq!(loaded, None);
+        crate::forge_keychain::clear_mock();
+    }
+
+    #[test]
+    fn forge_api_keychain_migrates_plaintext_and_deletes_file() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
+        let path = temp_config_path();
+        let key = "migrate-secret-xyz";
+        let payload = serde_json::json!({ "api_key": key }).to_string();
+        std::fs::write(&path, payload).expect("write plaintext");
+        assert!(path.exists());
+        let loaded = load_forge_api_key(&path).expect("load should succeed");
+        assert_eq!(
+            loaded,
+            Some(key.to_string()),
+            "migrated key must be loadable from keychain mock"
+        );
+        assert!(
+            !path.exists(),
+            "plaintext file must be deleted after migration, still exists at {}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&path);
+        crate::forge_keychain::clear_mock();
+    }
+
+    #[test]
+    fn forge_api_persist_writes_to_keychain_not_plaintext() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
+        let path = temp_config_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let key = "keychain-only-456";
+        persist_forge_api_key(&path, key).expect("persist should succeed");
+        assert!(
+            !path.exists(),
+            "persist must not leave plaintext file when keychain available, found {}",
+            path.display()
+        );
+        let loaded = load_forge_api_key(&path).expect("load should succeed");
+        assert_eq!(loaded, Some(key.to_string()));
+        let _ = std::fs::remove_file(&path);
+        crate::forge_keychain::clear_mock();
+    }
+
+    #[test]
+    fn forge_api_key_set_failure_preserves_plaintext_file() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
+        let path = temp_config_path();
+        let key = "important-api-key";
+        let payload = serde_json::json!({ "api_key": key }).to_string();
+        std::fs::write(&path, payload).expect("write plaintext");
+
+        // Simulate keyring_set failure
+        crate::forge_keychain::set_mock_fail_set(true);
+
+        let loaded = load_forge_api_key(&path).expect("should load from plaintext fallback");
+        assert_eq!(loaded, Some(key.to_string()));
+        assert!(
+            path.exists(),
+            "plaintext file must still exist after failed keyring_set"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        crate::forge_keychain::clear_mock();
+    }
+
+    #[test]
+    fn forge_api_key_get_failure_reports_error_and_deletes_nothing() {
+        let _guard = test_mutex().lock().unwrap();
+        crate::forge_keychain::clear_mock();
+        let path = temp_config_path();
+
+        // Simulate keyring_get failure
+        crate::forge_keychain::set_mock_fail_get(true);
+
+        let result = load_forge_api_key(&path);
+        assert!(
+            result.is_err(),
+            "load should report error on keyring failure"
+        );
+        assert!(
+            !path.exists(),
+            "no file should have been created or modified"
+        );
+
+        crate::forge_keychain::clear_mock();
     }
 }
