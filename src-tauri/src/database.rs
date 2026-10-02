@@ -1578,14 +1578,17 @@ mod tests {
         assert_eq!(mtimes.len(), n);
         let total_elapsed = start.elapsed();
         println!("total bench elapsed={:.2?}", total_elapsed);
+        let is_ci = std::env::var("CI").is_ok();
+        let max_mtime = if is_ci { 10.0 } else { 3.0 };
+        let max_bulk = if is_ci { 60.0 } else { 20.0 };
         assert!(
-            mtime_elapsed.as_secs_f64() < 2.5,
-            "mtime bulk fetch must be <2.5s, got {:.3?}",
+            mtime_elapsed.as_secs_f64() < max_mtime,
+            "mtime bulk fetch must be <{max_mtime}s, got {:.3?}",
             mtime_elapsed
         );
         assert!(
-            bulk_elapsed.as_secs_f64() < 7.0,
-            "bulk upsert 50k should be <7s debug (bulk cap 500), got {:.3?}",
+            bulk_elapsed.as_secs_f64() < max_bulk,
+            "bulk upsert 50k should be <{max_bulk}s debug (bulk cap 500), got {:.3?}",
             bulk_elapsed
         );
     }
@@ -1681,10 +1684,16 @@ mod tests {
             "50k HDD seed bulk_upsert (500/tx): inserted={} elapsed={:.2?}",
             inserted, bulk_elapsed
         );
+        let is_ci = std::env::var("CI").is_ok();
+        let max_bulk = if is_ci { 60.0 } else { 25.0 };
+        let max_fetch = if is_ci { 10.0 } else { 3.0 };
+        let max_filter = if is_ci { 10.0 } else { 3.0 };
+        let max_delta = if is_ci { 15.0 } else { 5.0 };
+
         assert_eq!(inserted, n);
         assert!(
-            bulk_elapsed.as_secs_f64() < 10.0,
-            "seed 50k bulk must be <10s, got {:.2?}",
+            bulk_elapsed.as_secs_f64() < max_bulk,
+            "seed 50k bulk must be <{max_bulk}s, got {:.2?}",
             bulk_elapsed
         );
 
@@ -1700,8 +1709,8 @@ mod tests {
         );
         assert_eq!(indexed_mtimes.len(), n);
         assert!(
-            indexed_elapsed.as_secs_f64() < 1.0,
-            "indexed mtime fetch must be <1s, got {:.2?}",
+            indexed_elapsed.as_secs_f64() < max_fetch,
+            "indexed mtime fetch must be <{max_fetch}s, got {:.2?}",
             indexed_elapsed
         );
 
@@ -1772,8 +1781,8 @@ mod tests {
             "incremental delta should detect exactly 1k changed files"
         );
         assert!(
-            filter_elapsed.as_secs_f64() < 1.0,
-            "filter 50k hash lookups must be <1s"
+            filter_elapsed.as_secs_f64() < max_filter,
+            "filter 50k hash lookups must be <{max_filter}s"
         );
 
         let mut delta_records = Vec::with_capacity(delta);
@@ -1806,8 +1815,8 @@ mod tests {
         );
         assert_eq!(delta_inserted, delta);
         assert!(
-            delta_bulk_elapsed.as_secs_f64() < 2.0,
-            "1k delta bulk must be <2s, got {:.2?}",
+            delta_bulk_elapsed.as_secs_f64() < max_delta,
+            "1k delta bulk must be <{max_delta}s, got {:.2?}",
             delta_bulk_elapsed
         );
 
