@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+const GALLERY_PATH = resolve(__dirname, "../Gallery.tsx");
+const THUMBNAILS_RS_PATH = resolve(
+    __dirname,
+    "../../../src-tauri/src/commands/thumbnails.rs"
+);
 
 function upsertLRU<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
     if (cache.has(key)) cache.delete(key);
@@ -28,10 +35,7 @@ function upsertThumbnailCache(
 
 describe("FV-02 Gallery virtualized thumb miss rate", () => {
     it("LRU limit 180 verified", () => {
-        const gallerySrc = readFileSync(
-            "V:/ForgeMetaLink/forge-meta-link/src/components/Gallery.tsx",
-            "utf-8"
-        );
+        const gallerySrc = readFileSync(GALLERY_PATH, "utf-8");
         expect(gallerySrc).toContain("LINEAGE_LRU_LIMIT = 180");
         expect(gallerySrc).toContain("LINEAGE_LRU_LIMIT");
         const m = new Map<string, number>();
@@ -45,14 +49,14 @@ describe("FV-02 Gallery virtualized thumb miss rate", () => {
     });
 
     it("virtualizer measureElement verified", () => {
-        const src = readFileSync("V:/ForgeMetaLink/forge-meta-link/src/components/Gallery.tsx", "utf-8");
+        const src = readFileSync(GALLERY_PATH, "utf-8");
         expect(src).toContain("measureElement");
         expect(src).toContain("ref={virtualizer.measureElement}");
         console.log("[thumb-cache-test] virtualizer measureElement verified");
     });
 
     it("on-demand batch getThumbnailPaths verified", () => {
-        const src = readFileSync("V:/ForgeMetaLink/forge-meta-link/src/components/Gallery.tsx", "utf-8");
+        const src = readFileSync(GALLERY_PATH, "utf-8");
         expect(src).toContain("getThumbnailPaths");
         const calls = (src.match(/getThumbnailPaths/g) || []).length;
         expect(calls).toBeGreaterThanOrEqual(2);
@@ -60,10 +64,7 @@ describe("FV-02 Gallery virtualized thumb miss rate", () => {
     });
 
     it("resume throttle 50ms verified in thumbnails.rs", () => {
-        const rs = readFileSync(
-            "V:/ForgeMetaLink/forge-meta-link/src-tauri/src/commands/thumbnails.rs",
-            "utf-8"
-        );
+        const rs = readFileSync(THUMBNAILS_RS_PATH, "utf-8");
         expect(rs).toContain("Duration::from_millis(50)");
         expect(rs).toContain("std::thread::sleep");
         console.log("[thumb-cache-test] resume throttle 50ms verified");

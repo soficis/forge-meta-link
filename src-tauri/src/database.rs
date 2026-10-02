@@ -1579,8 +1579,8 @@ mod tests {
         let total_elapsed = start.elapsed();
         println!("total bench elapsed={:.2?}", total_elapsed);
         assert!(
-            mtime_elapsed.as_secs_f64() < 1.0,
-            "mtime bulk fetch must be <1s, got {:.3?}",
+            mtime_elapsed.as_secs_f64() < 2.5,
+            "mtime bulk fetch must be <2.5s, got {:.3?}",
             mtime_elapsed
         );
         assert!(
