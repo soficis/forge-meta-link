@@ -2,7 +2,6 @@
   <h1>ForgeMetaLink</h1>
   <p><strong>Desktop gallery + metadata manager for large AI image libraries.</strong></p>
   <p>Scan folders, search instantly, curate safely, export cleanly, and send images back to Forge.</p>
-  <img src="public/forge-meta-link.jpg" alt="ForgeMetaLink screenshot" width="900" />
 </div>
 
 ForgeMetaLink is built with React + TypeScript + Tauri + Rust and stores runtime data locally in SQLite.
