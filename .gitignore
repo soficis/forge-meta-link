@@ -28,6 +28,7 @@ ForgeMetaLink-export.*
 ForgeMetaLink-images*.zip
 
 # Developer docs and local agent state
+.superpowers/
 codex-dev.md
 .serena/
 tmpclaude-*-cwd
