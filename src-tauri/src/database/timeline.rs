@@ -8,7 +8,7 @@ impl Database {
         let clamped_limit = limit.clamp(1, 50000) as i64;
         let clamped_offset = offset as i64;
         let mut stmt = conn.prepare(
-            "SELECT file_mtime FROM images WHERE file_mtime IS NOT NULL ORDER BY file_mtime ASC LIMIT ?1 OFFSET ?2",
+            "SELECT file_mtime FROM images_live WHERE file_mtime IS NOT NULL ORDER BY file_mtime ASC LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt.query_map(params![clamped_limit, clamped_offset], |row| {
             row.get::<_, i64>(0)
@@ -29,7 +29,7 @@ impl Database {
         // Try porter first
         if !sanitized.is_empty() {
             let mut stmt = conn.prepare(
-                "SELECT images.file_mtime FROM images JOIN images_fts ON images.id = images_fts.rowid WHERE images_fts MATCH ?1 AND images.file_mtime IS NOT NULL ORDER BY images.file_mtime ASC LIMIT ?2",
+                "SELECT images.file_mtime FROM images_live AS images JOIN images_fts ON images.id = images_fts.rowid WHERE images_fts MATCH ?1 AND images.file_mtime IS NOT NULL ORDER BY images.file_mtime ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![sanitized, clamped_limit], |row| {
                 row.get::<_, i64>(0)
@@ -49,7 +49,7 @@ impl Database {
         }
         let match_expr = format!("\"{}\"", trimmed.replace('"', "\"\""));
         let mut stmt = conn.prepare(
-            "SELECT images.file_mtime FROM images JOIN images_fts_tri ON images.id = images_fts_tri.rowid WHERE images_fts_tri MATCH ?1 AND images.file_mtime IS NOT NULL ORDER BY images.file_mtime ASC LIMIT ?2",
+            "SELECT images.file_mtime FROM images_live AS images JOIN images_fts_tri ON images.id = images_fts_tri.rowid WHERE images_fts_tri MATCH ?1 AND images.file_mtime IS NOT NULL ORDER BY images.file_mtime ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![match_expr, clamped_limit], |row| {
             row.get::<_, i64>(0)

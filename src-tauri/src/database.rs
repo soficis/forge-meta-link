@@ -221,6 +221,8 @@ impl Database {
                 file_mtime INTEGER,
                 file_size INTEGER,
                 quick_hash TEXT,
+                culled_at INTEGER,
+                ghost_recipe TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );",
         )?;
@@ -233,6 +235,60 @@ impl Database {
                 name TEXT PRIMARY KEY,
                 applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );",
+        )?;
+
+        // ── Migration: culled_at_v1 (G10/G11 tombstone & central view) ──
+        let culled_at_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'culled_at_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !culled_at_migrated {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_images_culled_at ON images(culled_at);
+                 DROP VIEW IF EXISTS images_live;
+                 CREATE VIEW images_live AS SELECT * FROM images WHERE culled_at IS NULL;
+                 INSERT OR IGNORE INTO app_migrations (name) VALUES ('culled_at_v1');",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE VIEW IF NOT EXISTS images_live AS SELECT * FROM images WHERE culled_at IS NULL;",
+        )?;
+
+        // ── Migration: lineage_edges_v1 (G9/G10 id-keyed lineage edges) ──
+        let lineage_edges_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'lineage_edges_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !lineage_edges_migrated {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS lineage_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    child_id INTEGER NOT NULL REFERENCES images(id),
+                    parent_id INTEGER NOT NULL,
+                    ops_json TEXT,
+                    source TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    UNIQUE(child_id, parent_id, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lineage_edges_child ON lineage_edges(child_id);
+                CREATE INDEX IF NOT EXISTS idx_lineage_edges_parent ON lineage_edges(parent_id);
+                INSERT OR IGNORE INTO app_migrations (name) VALUES ('lineage_edges_v1');",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lineage_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                child_id INTEGER NOT NULL REFERENCES images(id),
+                parent_id INTEGER NOT NULL,
+                ops_json TEXT,
+                source TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                UNIQUE(child_id, parent_id, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_lineage_edges_child ON lineage_edges(child_id);
+            CREATE INDEX IF NOT EXISTS idx_lineage_edges_parent ON lineage_edges(parent_id);",
         )?;
 
         // ── Migration: scope FTS update triggers to text columns ──
@@ -461,6 +517,8 @@ impl Database {
             ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
             ("is_locked", "INTEGER NOT NULL DEFAULT 0"),
             ("seed_int", "INTEGER"),
+            ("culled_at", "INTEGER"),
+            ("ghost_recipe", "TEXT"),
         ] {
             if existing_columns.contains(name) {
                 continue;

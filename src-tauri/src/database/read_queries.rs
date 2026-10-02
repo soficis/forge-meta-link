@@ -52,6 +52,7 @@ impl Database {
             "SELECT tags.tag, COUNT(*) as usage_count
              FROM tags
              JOIN image_tags ON image_tags.tag_id = tags.id
+             JOIN images_live ON images_live.id = image_tags.image_id
              GROUP BY tags.id, tags.tag
              ORDER BY usage_count DESC, tags.tag ASC
              LIMIT ?1",
@@ -78,6 +79,7 @@ impl Database {
             "SELECT tags.tag
              FROM image_tags
              JOIN tags ON tags.id = image_tags.tag_id
+             JOIN images_live ON images_live.id = image_tags.image_id
              WHERE image_tags.image_id = ?1
              ORDER BY tags.tag ASC",
         )?;
@@ -97,7 +99,7 @@ impl Database {
         let conn = self.pool.get().map_err(pool_error)?;
         let mut stmt = conn.prepare(
             "SELECT directory, COUNT(*) as cnt
-             FROM images
+             FROM images_live
              GROUP BY directory
              ORDER BY cnt DESC, directory ASC",
         )?;
@@ -121,7 +123,7 @@ impl Database {
         let conn = self.pool.get().map_err(pool_error)?;
         let mut stmt = conn.prepare(
             "SELECT COALESCE(model_name, 'Unknown') as model, COUNT(*) as cnt
-             FROM images
+             FROM images_live
              GROUP BY model
              ORDER BY cnt DESC, model ASC",
         )?;
@@ -150,7 +152,7 @@ impl Database {
 
         let mut stmt = conn.prepare(
             "SELECT quick_hash, COUNT(*) as cnt
-             FROM images
+             FROM images_live
              WHERE quick_hash IS NOT NULL
              GROUP BY quick_hash
              HAVING COUNT(*) > 1
@@ -169,7 +171,7 @@ impl Database {
         let mut groups: Vec<DuplicateGroup> = Vec::with_capacity(hashes.len());
         for (quick_hash, count) in hashes {
             let mut sample_stmt = conn.prepare(
-                "SELECT filepath FROM images
+                "SELECT filepath FROM images_live
                  WHERE quick_hash = ?1
                  ORDER BY file_mtime DESC
                  LIMIT 5",
@@ -203,7 +205,7 @@ impl Database {
             "SELECT id, filepath, filename, directory, prompt, negative_prompt,
                     steps, sampler, cfg_scale, seed, width, height,
                     model_hash, model_name, raw_metadata, is_favorite, is_locked
-             FROM images
+             FROM images_live
              WHERE id IN ({})
              ORDER BY id DESC",
             placeholders
@@ -223,7 +225,7 @@ impl Database {
     /// Returns total indexed image count.
     pub fn get_total_count(&self) -> SqlResult<u32> {
         let conn = self.pool.get().map_err(pool_error)?;
-        conn.query_row("SELECT COUNT(*) FROM images", [], |row| {
+        conn.query_row("SELECT COUNT(*) FROM images_live", [], |row| {
             row.get::<_, u32>(0)
         })
     }
@@ -231,7 +233,7 @@ impl Database {
     /// Returns all indexed source image paths ordered newest-first.
     pub fn get_all_image_filepaths_desc(&self) -> SqlResult<Vec<String>> {
         let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare("SELECT filepath FROM images ORDER BY id DESC")?;
+        let mut stmt = conn.prepare("SELECT filepath FROM images_live ORDER BY id DESC")?;
         let rows = stmt.query_map([], |row: &Row<'_>| row.get::<_, String>(0))?;
 
         let mut filepaths = Vec::new();
@@ -250,7 +252,7 @@ impl Database {
         let mut filepaths = Vec::new();
         if let Some(cursor) = after {
             let mut stmt = conn.prepare(
-                "SELECT filepath FROM images WHERE filepath > ?1 ORDER BY filepath ASC LIMIT ?2",
+                "SELECT filepath FROM images_live WHERE filepath > ?1 ORDER BY filepath ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![cursor, limit], |row| row.get::<_, String>(0))?;
             for row in rows {
@@ -258,7 +260,7 @@ impl Database {
             }
         } else {
             let mut stmt =
-                conn.prepare("SELECT filepath FROM images ORDER BY filepath ASC LIMIT ?1")?;
+                conn.prepare("SELECT filepath FROM images_live ORDER BY filepath ASC LIMIT ?1")?;
             let rows = stmt.query_map(params![limit], |row| row.get::<_, String>(0))?;
             for row in rows {
                 filepaths.push(row?);
@@ -274,7 +276,7 @@ impl Database {
             "SELECT id, filepath, filename, directory, prompt, negative_prompt,
                     steps, sampler, cfg_scale, seed, width, height,
                     model_hash, model_name, raw_metadata, is_favorite, is_locked
-             FROM images
+             FROM images_live
              WHERE id = ?1
              LIMIT 1",
         )?;
@@ -295,7 +297,7 @@ impl Database {
             .replace('_', "\\_");
         let pattern = format!("{}.%", escaped_stem);
         let mut stmt = conn.prepare_cached(
-            "SELECT filename FROM images WHERE directory = ?1 AND (filename = ?2 OR filename LIKE ?3 ESCAPE '\\')",
+            "SELECT filename FROM images_live WHERE directory = ?1 AND (filename = ?2 OR filename LIKE ?3 ESCAPE '\\')",
         )?;
         let rows = stmt.query_map(params![directory, stem, pattern], |row| {
             row.get::<_, String>(0)

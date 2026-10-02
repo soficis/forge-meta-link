@@ -32,13 +32,13 @@ impl Database {
         let mut sql = if sort.field == "id" {
             String::from(
                 "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime
-                 FROM images
+                 FROM images_live AS images
                  WHERE 1=1",
             )
         } else {
             format!(
                 "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime, {} AS sort_value
-                 FROM images
+                 FROM images_live AS images
                  WHERE 1=1",
                 sort.sort_expr()
             )
@@ -148,7 +148,7 @@ impl Database {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts ON images.id = images_fts.rowid
                  WHERE images_fts MATCH ?",
             )
@@ -156,7 +156,7 @@ impl Database {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts ON images.id = images_fts.rowid
                  WHERE images_fts MATCH ?",
                 sort.sort_expr()
@@ -269,7 +269,7 @@ impl Database {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
             )
@@ -277,7 +277,7 @@ impl Database {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
                 sort.sort_expr()
@@ -408,14 +408,14 @@ impl Database {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
-                 FROM images{}",
+                 FROM images_live AS images{}",
                 fts_join
             )
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
-                 FROM images{}",
+                 FROM images_live AS images{}",
                 sort.sort_expr(),
                 fts_join
             )
@@ -584,7 +584,7 @@ impl Database {
             String::from(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
             )
@@ -592,7 +592,7 @@ impl Database {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
-                 FROM images
+                 FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
                 sort.sort_expr()

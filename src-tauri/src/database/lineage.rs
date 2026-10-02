@@ -182,7 +182,7 @@ impl Database {
         if let Some(si) = seed_int {
             // Find first image with exact seed numeric
             let mut stmt = conn.prepare(
-                "SELECT model_hash, directory, file_mtime FROM images WHERE seed_int = ?1 LIMIT 1",
+                "SELECT model_hash, directory, file_mtime FROM images_live WHERE seed_int = ?1 LIMIT 1",
             )?;
             let result = stmt.query_row(params![si], |row| {
                 Ok((
@@ -199,7 +199,7 @@ impl Database {
             // Fallback: if not found via integer cast, try exact string match
             if ref_model_hash.is_none() && ref_directory.is_none() {
                 let mut stmt2 = conn.prepare(
-                    "SELECT model_hash, directory, file_mtime FROM images WHERE seed = ?1 LIMIT 1",
+                    "SELECT model_hash, directory, file_mtime FROM images_live WHERE seed = ?1 LIMIT 1",
                 )?;
                 if let Ok((mh, dir, mt)) = stmt2.query_row(params![seed_trim], |row| {
                     Ok((
@@ -216,7 +216,7 @@ impl Database {
         } else {
             // Non-numeric seed: use exact match reference
             let mut stmt = conn.prepare(
-                "SELECT model_hash, directory, file_mtime FROM images WHERE seed = ?1 LIMIT 1",
+                "SELECT model_hash, directory, file_mtime FROM images_live WHERE seed = ?1 LIMIT 1",
             )?;
             if let Ok((mh, dir, mt)) = stmt.query_row(params![seed_trim], |row| {
                 Ok((
@@ -249,7 +249,7 @@ impl Database {
         // Build SQL dynamically
         // Base select
         let mut sql = String::from(
-            "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime FROM images WHERE 1=1",
+            "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime FROM images_live WHERE 1=1",
         );
         let mut params_vec: Vec<Value> = Vec::new();
 
@@ -324,7 +324,7 @@ impl Database {
 
         let mut stmt = conn.prepare(
             "SELECT COUNT(*), MIN(images.file_mtime), MAX(images.file_mtime)
-             FROM images
+             FROM images_live AS images
              JOIN image_tags ON image_tags.image_id = images.id
              JOIN tags ON tags.id = image_tags.tag_id
              WHERE tags.tag = ?1",
@@ -338,7 +338,7 @@ impl Database {
         if count > 0 {
             let mut stmt2 = conn.prepare(
                 "SELECT images.filepath
-                 FROM images
+                 FROM images_live AS images
                  JOIN image_tags ON image_tags.image_id = images.id
                  JOIN tags ON tags.id = image_tags.tag_id
                  WHERE tags.tag = ?1
@@ -499,7 +499,7 @@ impl Database {
             for chunk in target_fps.chunks(500) {
                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
-                    "SELECT id, filepath, seed, model_hash, directory, file_mtime, prompt FROM images WHERE seed_int IS NOT NULL AND filepath IN ({})",
+                    "SELECT id, filepath, seed, model_hash, directory, file_mtime, prompt FROM images_live WHERE seed_int IS NOT NULL AND filepath IN ({})",
                     placeholders
                 );
                 let mut stmt = conn.prepare(&sql)?;
@@ -523,7 +523,7 @@ impl Database {
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, filepath, seed, model_hash, directory, file_mtime, prompt FROM images WHERE seed_int IS NOT NULL",
+                "SELECT id, filepath, seed, model_hash, directory, file_mtime, prompt FROM images_live WHERE seed_int IS NOT NULL",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(ChildRow {
@@ -585,7 +585,7 @@ impl Database {
             };
 
             let mut candidate_sql = String::from(
-                "SELECT filepath, prompt FROM images WHERE filepath != ? AND seed_int = ? AND directory = ? AND file_mtime BETWEEN ? AND ? AND (file_mtime < ? OR (file_mtime = ? AND id < ?))",
+                "SELECT filepath, prompt FROM images_live WHERE filepath != ? AND seed_int = ? AND directory = ? AND file_mtime BETWEEN ? AND ? AND (file_mtime < ? OR (file_mtime = ? AND id < ?))",
             );
             let mut candidate_params: Vec<Value> = vec![
                 Value::Text(child.filepath.clone()),
