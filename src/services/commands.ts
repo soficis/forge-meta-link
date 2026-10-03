@@ -384,6 +384,18 @@ export async function forgeGetOptions(
     });
 }
 
+/** Per-send options that are not part of the recorded generation params. */
+export interface ForgeSendExtras {
+    /** Weight per LoRA token; a token with no entry uses the default loraWeight. */
+    loraWeights?: Record<string, number> | null;
+    /** Images generated per request (Forge n_iter). */
+    batchCount?: number | null;
+    /** Also let Forge keep its own copy in its outputs folder. */
+    saveForgeCopy?: boolean;
+    /** User confirmation to send API key over unencrypted remote HTTP. */
+    confirmUnencrypted?: boolean | null;
+}
+
 export async function forgeSendToImage(
     imageId: number,
     baseUrl: string,
@@ -395,7 +407,8 @@ export async function forgeSendToImage(
     loraTokens: string[] | null,
     loraWeight: number | null,
     overrides: Partial<ForgePayloadOverrides> | null,
-    mutationOps: unknown | null = null
+    mutationOps: unknown | null = null,
+    extras: ForgeSendExtras = {}
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_send_to_image", {
         request: {
@@ -409,8 +422,12 @@ export async function forgeSendToImage(
                 adetailerFaceModel,
                 loraTokens,
                 loraWeight,
+                loraWeights: extras.loraWeights ?? null,
+                batchCount: extras.batchCount ?? null,
+                saveForgeCopy: extras.saveForgeCopy ?? false,
                 overrides,
                 mutationOps,
+                confirmUnencrypted: extras.confirmUnencrypted ?? null,
             },
         },
     });
@@ -427,7 +444,8 @@ export async function forgeSendToImages(
     loraTokens: string[] | null,
     loraWeight: number | null,
     overrides: Partial<ForgePayloadOverrides> | null,
-    mutationOps: unknown | null = null
+    mutationOps: unknown | null = null,
+    extras: ForgeSendExtras = {}
 ): Promise<ForgeBatchSendResult> {
     return invoke<ForgeBatchSendResult>("forge_send_to_images", {
         request: {
@@ -441,8 +459,12 @@ export async function forgeSendToImages(
                 adetailerFaceModel,
                 loraTokens,
                 loraWeight,
+                loraWeights: extras.loraWeights ?? null,
+                batchCount: extras.batchCount ?? null,
+                saveForgeCopy: extras.saveForgeCopy ?? false,
                 overrides,
                 mutationOps,
+                confirmUnencrypted: extras.confirmUnencrypted ?? null,
             },
         },
     });
@@ -452,11 +474,42 @@ export async function forgeRequeueImage(
     imageId: number,
     baseUrl: string,
     apiKey: string | null,
-    includeSeed = true
+    includeSeed = true,
+    confirmUnencrypted: boolean | null = null
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_requeue_image", {
-        request: { imageId, baseUrl, apiKey, includeSeed },
+        request: { imageId, baseUrl, apiKey, includeSeed, confirmUnencrypted },
     });
+}
+
+export interface ForgeUpscaleOptions {
+    imageId: number;
+    baseUrl: string;
+    apiKey: string | null;
+    upscaler: string;
+    scale: number;
+    outputDir?: string | null;
+}
+
+export interface ForgeUpscaleResult {
+    ok: boolean;
+    message: string;
+    childId: number | null;
+    savedPath: string | null;
+    outputDir: string;
+}
+
+export async function forgeGetUpscalers(
+    baseUrl: string,
+    apiKey: string | null
+): Promise<string[]> {
+    return invoke<string[]>("forge_get_upscalers", { baseUrl, apiKey });
+}
+
+export async function forgeUpscaleImage(
+    options: ForgeUpscaleOptions
+): Promise<ForgeUpscaleResult> {
+    return invoke<ForgeUpscaleResult>("forge_upscale_image", { request: options });
 }
 
 // ── Timeline (file_mtime histogram) ─────────────────────────────────────

@@ -3277,3 +3277,53 @@ body {
 }
 
 
+
+.viewer-lora-weight-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.viewer-lora-weight-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.viewer-lora-weight-name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-lora-weight-input {
+  text-align: right;
+}
+
+.viewer-form-hint {
+  font-weight: normal;
+  color: var(--text-muted);
+}
+
+.viewer-forge-send-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.viewer-batch-count-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.viewer-batch-count-input {
+  width: 56px;
+  text-align: right;
+}

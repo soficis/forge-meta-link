@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { PhotoViewer } from "../PhotoViewer";
@@ -53,16 +54,39 @@ function baseHandlers(extra: Handlers = {}): Handlers {
             schedulers: ["karras", "simple", "bong_tangent"],
             warnings: ["LoRA directory not configured"],
         }),
+        forge_get_upscalers: () => ["R-ESRGAN 4x+", "DAT-2"],
         ...extra,
     };
 }
 
-function viewer(index: number) {
+interface HarnessInit {
+    loras?: string[];
+    weights?: Record<string, string>;
+    defaultWeight?: string;
+    batch?: string;
+    saveCopy?: boolean;
+}
+
+/** Holds the Forge settings the real app keeps in useForgeSettings, so the controls are interactive. */
+function Harness({
+    index,
+    onNavigate,
+    init,
+}: {
+    index: number;
+    onNavigate: (index: number) => void;
+    init: HarnessInit;
+}) {
+    const [loras, setLoras] = useState(init.loras ?? []);
+    const [defaultWeight, setDefaultWeight] = useState(init.defaultWeight ?? "1.0");
+    const [weights, setWeights] = useState(init.weights ?? {});
+    const [batch, setBatch] = useState(init.batch ?? "1");
+    const [saveCopy, setSaveCopy] = useState(init.saveCopy ?? false);
     return (
         <PhotoViewer
             images={IMAGES}
             currentIndex={index}
-            onNavigate={vi.fn()}
+            onNavigate={onNavigate}
             onClose={() => {}}
             forgeBaseUrl="http://127.0.0.1:7860"
             forgeApiKey=""
@@ -72,10 +96,16 @@ function viewer(index: number) {
             forgeLoraPath=""
             forgeLoraScanSubfolders={false}
             onOpenForgeSettings={() => {}}
-            forgeSelectedLoras={[]}
-            onForgeSelectedLorasChange={() => {}}
-            forgeLoraWeight="1.0"
-            onForgeLoraWeightChange={() => {}}
+            forgeSelectedLoras={loras}
+            onForgeSelectedLorasChange={setLoras}
+            forgeLoraWeight={defaultWeight}
+            onForgeLoraWeightChange={setDefaultWeight}
+            forgeLoraWeights={weights}
+            onForgeLoraWeightsChange={setWeights}
+            forgeBatchCount={batch}
+            onForgeBatchCountChange={setBatch}
+            forgeSaveCopy={saveCopy}
+            onForgeSaveCopyChange={setSaveCopy}
             forgeIncludeSeed={true}
             forgeAdetailerFaceEnabled={false}
             forgeAdetailerFaceModel="face_yolov8n.pt"
@@ -87,6 +117,14 @@ function viewer(index: number) {
             onShowToast={() => {}}
         />
     );
+}
+
+function viewer(
+    index: number,
+    onNavigate: (index: number) => void = vi.fn(),
+    init: HarnessInit = {}
+) {
+    return <Harness index={index} onNavigate={onNavigate} init={init} />;
 }
 
 const promptBox = () => screen.getByPlaceholderText("Prompt") as HTMLTextAreaElement;
@@ -212,6 +250,31 @@ describe("PhotoViewer Forge panel", () => {
         expect(await screen.findByText(new RegExp(`Detected family: ${family}\\b`))).toBeTruthy();
         const option = screen.queryByRole("option", { name: "1376 x 768 (16:9)" });
         expect(option !== null).toBe(hasKreaPresets);
+    });
+
+    it("typing in a text field does not trigger viewer shortcuts (info, slideshow, zoom, navigation)", async () => {
+        mock = installTauriMock(baseHandlers());
+        const onNavigate = vi.fn();
+        render(viewer(0, onNavigate));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
+
+        const presetInput = screen.getByPlaceholderText("Preset name") as HTMLInputElement;
+        const infoToggle = () => screen.getByRole("button", { name: /^(Show|Hide) info panel$/i });
+        expect(infoToggle().textContent).toBe("Hide Info");
+        presetInput.focus();
+        // "i" would close the info panel, "s" starts a slideshow, "-"/"=" zoom, "0" resets and
+        // the arrows change the image.
+        for (const key of ["i", "s", "-", "=", "0", "ArrowRight", "ArrowLeft"]) {
+            fireEvent.keyDown(presetInput, { key });
+        }
+        expect(infoToggle().textContent).toBe("Hide Info");
+        expect(onNavigate).not.toHaveBeenCalled();
+
+        // Control: the same key outside a field still toggles the info panel.
+        presetInput.blur();
+        fireEvent.keyDown(document.body, { key: "i" });
+        await waitFor(() => expect(infoToggle().textContent).toBe("Show Info"));
     });
 
     it("never offers a scheduler Forge rejects (bong_tangent)", async () => {
@@ -551,3 +614,164 @@ describe("PhotoViewer: Lineage trace ghost row accessibility", () => {
         expect(screen.queryByTestId("lineage-trace-ghost-details-99")).toBeNull();
     });
 });
+
+describe("PhotoViewer Forge send options", () => {
+    const sendOk = {
+        ok: true,
+        message: "Saved 1 generated image to out",
+        output_dir: "out",
+        generated_count: 1,
+        saved_paths: [],
+        children: [],
+    };
+
+    function sendHandlers(extra: Handlers = {}): Handlers {
+        return baseHandlers({
+            forge_test_connection: () => ({ ok: true, message: "ok" }),
+            forge_send_to_image: () => sendOk,
+            ...extra,
+        });
+    }
+
+    async function openForgeTab(init: HarnessInit) {
+        render(viewer(0, vi.fn(), init));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
+    }
+
+    const sendButton = () => screen.getByRole("button", { name: "Send to Forge" }) as HTMLButtonElement;
+    const sendOptions = () =>
+        (mock.argsOf("forge_send_to_image")[0].request as { options: Record<string, unknown> }).options;
+
+    it("sends each selected LoRA with its own weight and the default for the rest", async () => {
+        mock = installTauriMock(sendHandlers());
+        await openForgeTab({ loras: ["styles/a", "b"], defaultWeight: "0.8" });
+
+        fireEvent.change(screen.getByLabelText("Weight for styles/a"), { target: { value: "0.55" } });
+        expect((screen.getByLabelText("Weight for b") as HTMLInputElement).placeholder).toBe("0.8");
+
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(1));
+        const options = sendOptions();
+        expect(options.loraTokens).toEqual(["styles/a", "b"]);
+        expect(options.loraWeight).toBe(0.8);
+        expect(options.loraWeights).toEqual({ "styles/a": 0.55 });
+    });
+
+    it("rejects an out-of-range LoRA weight and drops a removed LoRA's weight", async () => {
+        mock = installTauriMock(sendHandlers());
+        await openForgeTab({ loras: ["a", "b"], weights: { a: "0.5", b: "0.7" } });
+
+        fireEvent.change(screen.getByLabelText("Weight for a"), { target: { value: "5" } });
+        expect(await screen.findByText(/Weight for a must be between/)).toBeTruthy();
+        expect(sendButton().disabled).toBe(true);
+
+        fireEvent.change(screen.getByLabelText("Weight for a"), { target: { value: "0.5" } });
+        fireEvent.click(screen.getByRole("button", { name: "Remove b" }));
+        await waitFor(() => expect(screen.queryByLabelText("Weight for b")).toBeNull());
+
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(1));
+        expect(sendOptions().loraTokens).toEqual(["a"]);
+        expect(sendOptions().loraWeights).toEqual({ a: 0.5 });
+    });
+
+    it("sends the batch count and the save-a-copy flag, and blocks an invalid count", async () => {
+        mock = installTauriMock(sendHandlers());
+        await openForgeTab({});
+
+        fireEvent.change(screen.getByLabelText("Images per send"), { target: { value: "0" } });
+        expect(await screen.findByText(/whole number from 1 to 64/)).toBeTruthy();
+        expect(sendButton().disabled).toBe(true);
+
+        fireEvent.change(screen.getByLabelText("Images per send"), { target: { value: "4" } });
+        fireEvent.click(screen.getByLabelText("Also let Forge save its own copy"));
+        await waitFor(() => expect(sendButton().disabled).toBe(false));
+
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(1));
+        expect(sendOptions().batchCount).toBe(4);
+        expect(sendOptions().saveForgeCopy).toBe(true);
+    });
+
+    it("defaults to one image, no Forge-side copy and no per-LoRA overrides", async () => {
+        mock = installTauriMock(sendHandlers());
+        await openForgeTab({});
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(1));
+        expect(sendOptions().batchCount).toBe(1);
+        expect(sendOptions().saveForgeCopy).toBe(false);
+        expect(sendOptions().loraWeights).toBeNull();
+    });
+
+    it("keeps Send to Forge usable while a send is running and shows how many are queued", async () => {
+        const releases: Array<() => void> = [];
+        mock = installTauriMock(
+            sendHandlers({
+                forge_send_to_image: () =>
+                    new Promise((resolve) => {
+                        releases.push(() => resolve(sendOk));
+                    }),
+            })
+        );
+        await openForgeTab({});
+
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(1));
+        expect(await screen.findByText("Sending…")).toBeTruthy();
+        expect(sendButton().disabled).toBe(false);
+
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(mock.count("forge_send_to_image")).toBe(2));
+        expect(await screen.findByText("Sending · 1 queued")).toBeTruthy();
+
+        await act(async () => {
+            releases.forEach((release) => release());
+        });
+        await waitFor(() => expect(screen.queryByTestId("forge-pending-count")).toBeNull());
+    });
+
+    it("fetches upscalers, toggles scale factor, and dispatches upscale request", async () => {
+        let capturedUpscaleRequest: unknown = null;
+        mock = installTauriMock(
+            baseHandlers({
+                forge_get_upscalers: () => ["R-ESRGAN 4x+", "DAT-2"],
+                forge_upscale_image: ({ request }) => {
+                    capturedUpscaleRequest = request;
+                    return {
+                        ok: true,
+                        message: "Upscaled successfully",
+                        childId: 10,
+                        savedPath: "/outputs/lighthouse_upscale.png",
+                        outputDir: "/outputs",
+                    };
+                },
+            })
+        );
+        render(viewer(0));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+
+        const upscaleDetails = await screen.findByTestId("forge-section-upscale");
+        fireEvent(upscaleDetails, new Event("toggle"));
+
+        // Wait for upscaler option
+        expect(await screen.findByRole("option", { name: "R-ESRGAN 4x+" })).toBeTruthy();
+        expect(screen.getByRole("option", { name: "DAT-2" })).toBeTruthy();
+
+        // Click 4x scale button
+        const button4x = screen.getByRole("button", { name: "4x" });
+        fireEvent.click(button4x);
+
+        // Click upscale button
+        const upscaleButton = screen.getByRole("button", { name: "Upscale with Forge (4x)" });
+        fireEvent.click(upscaleButton);
+
+        await waitFor(() => expect(mock.count("forge_upscale_image")).toBe(1));
+        expect(capturedUpscaleRequest).toMatchObject({
+            imageId: 1,
+            upscaler: "R-ESRGAN 4x+",
+            scale: 4,
+        });
+    });
+});
+

@@ -21,6 +21,7 @@ import {
 } from "../utils/imageClipboard";
 import type { ShowToastOptions } from "../hooks/useToast";
 import { PinIcon } from "./icons";
+import { isTypingTarget } from "../utils/typingTarget";
 import { useCompareLabStore } from "../store/compareLabStore";
 
 interface GalleryProps {
@@ -100,18 +101,6 @@ function upsertLRU<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
         if (oldest === undefined) break;
         cache.delete(oldest);
     }
-}
-
-function isTypingTarget(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) {
-        return false;
-    }
-    const tagName = target.tagName.toLowerCase();
-    return (
-        tagName === "input" ||
-        tagName === "textarea" ||
-        target.isContentEditable
-    );
 }
 
 function toAssetSrc(filepath: string, version?: number): string {
@@ -1022,7 +1011,6 @@ const GalleryItem = memo(function GalleryItem({
     const rootRef = useRef<HTMLDivElement>(null);
     const thumbSrc = thumbnailPath ? toAssetSrc(thumbnailPath, thumbnailVersion) : null;
     const fullSrc = toAssetSrc(image.filepath);
-    const aspect = image.width && image.height ? `${image.width} / ${image.height}` : undefined;
 
     useEffect(() => {
         // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -1130,10 +1118,7 @@ const GalleryItem = memo(function GalleryItem({
                     )}
                 </div>
             )}
-            <div
-                className="gallery-item-image-wrapper"
-                style={aspect ? ({ aspectRatio: aspect } as React.CSSProperties) : undefined}
-            >
+            <div className="gallery-item-image-wrapper">
                 {!thumbLoaded && !fullLoaded && <div className="gallery-item-skeleton" />}
                 {thumbSrc && !thumbError ? (
                     <img

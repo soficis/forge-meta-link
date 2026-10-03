@@ -51,7 +51,13 @@ fn test_p5_trace_chain_live_ghost_live() {
         .upsert_image("/dir/gp.png", "gp.png", "/dir", &gp_p, Some(1000))
         .expect("upsert gp");
     let parent_id = db
-        .upsert_image("/dir/parent.png", "parent.png", "/dir", &parent_p, Some(1001))
+        .upsert_image(
+            "/dir/parent.png",
+            "parent.png",
+            "/dir",
+            &parent_p,
+            Some(1001),
+        )
         .expect("upsert parent");
     let child_id = db
         .upsert_image("/dir/child.png", "child.png", "/dir", &child_p, Some(1002))
@@ -176,10 +182,22 @@ fn test_p5_trace_fallback_to_heuristic_lineage() {
     let p_child = make_params("photo of a cat sitting", "556");
 
     let p_id = db
-        .upsert_image("/dir/h_parent.png", "h_parent.png", "/dir", &p_parent, Some(1000))
+        .upsert_image(
+            "/dir/h_parent.png",
+            "h_parent.png",
+            "/dir",
+            &p_parent,
+            Some(1000),
+        )
         .expect("upsert p");
     let c_id = db
-        .upsert_image("/dir/h_child.png", "h_child.png", "/dir", &p_child, Some(1001))
+        .upsert_image(
+            "/dir/h_child.png",
+            "h_child.png",
+            "/dir",
+            &p_child,
+            Some(1001),
+        )
         .expect("upsert c");
 
     // Insert legacy lineage table edge (no lineage_edges row)
@@ -188,7 +206,8 @@ fn test_p5_trace_fallback_to_heuristic_lineage() {
         "INSERT INTO lineage (child_filepath, parent_filepath, relation, confidence, created_at)
          VALUES ('/dir/h_child.png', '/dir/h_parent.png', 'seed_walk', 0.85, 1700000000)",
         [],
-    ).expect("insert legacy edge");
+    )
+    .expect("insert legacy edge");
 
     let trace = db.get_lineage_trace(c_id).expect("trace");
     assert_eq!(trace.nodes.len(), 2);

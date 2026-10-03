@@ -185,7 +185,10 @@ fn test_bulk_upsert_failure_rolls_back_entire_chunk() {
         .unwrap()
         .expect("parent found");
 
-    let child_rec = sample_record("C:/test/child_should_rollback.png", "child_should_rollback.png");
+    let child_rec = sample_record(
+        "C:/test/child_should_rollback.png",
+        "child_should_rollback.png",
+    );
     let failing_rec = sample_record("FORCED_FAIL", "FORCED_FAIL");
 
     let items = vec![

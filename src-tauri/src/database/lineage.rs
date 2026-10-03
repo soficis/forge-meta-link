@@ -168,9 +168,8 @@ impl Database {
             LIMIT 1",
         )?;
 
-        let mut find_by_filepath_stmt = conn.prepare(
-            "SELECT id FROM images WHERE filepath = ?1 LIMIT 1",
-        )?;
+        let mut find_by_filepath_stmt =
+            conn.prepare("SELECT id FROM images WHERE filepath = ?1 LIMIT 1")?;
 
         while depth < 64 {
             if visited.contains(&curr_id) {
@@ -196,7 +195,21 @@ impl Database {
                 ))
             });
 
-            let Ok((id, filepath, filename, culled_at, ghost_recipe, mut seed, mut cfg, mut steps, mut sampler, mut scheduler, mut model, prompt)) = img_row else {
+            let Ok((
+                id,
+                filepath,
+                filename,
+                culled_at,
+                ghost_recipe,
+                mut seed,
+                mut cfg,
+                mut steps,
+                mut sampler,
+                mut scheduler,
+                mut model,
+                prompt,
+            )) = img_row
+            else {
                 break;
             };
 
@@ -206,22 +219,40 @@ impl Database {
             if let Some(recipe_str) = &ghost_recipe {
                 if let Ok(recipe) = serde_json::from_str::<serde_json::Value>(recipe_str) {
                     if seed.as_deref().unwrap_or("").is_empty() {
-                        seed = recipe.get("seed").and_then(|v| v.as_str()).map(ToString::to_string);
+                        seed = recipe
+                            .get("seed")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                     if cfg.as_deref().unwrap_or("").is_empty() {
-                        cfg = recipe.get("cfg").and_then(|v| v.as_str()).map(ToString::to_string);
+                        cfg = recipe
+                            .get("cfg")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                     if steps.as_deref().unwrap_or("").is_empty() {
-                        steps = recipe.get("steps").and_then(|v| v.as_str()).map(ToString::to_string);
+                        steps = recipe
+                            .get("steps")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                     if sampler.as_deref().unwrap_or("").is_empty() {
-                        sampler = recipe.get("sampler").and_then(|v| v.as_str()).map(ToString::to_string);
+                        sampler = recipe
+                            .get("sampler")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                     if scheduler.as_deref().unwrap_or("").is_empty() {
-                        scheduler = recipe.get("scheduler").and_then(|v| v.as_str()).map(ToString::to_string);
+                        scheduler = recipe
+                            .get("scheduler")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                     if model.as_deref().unwrap_or("").is_empty() {
-                        model = recipe.get("model").and_then(|v| v.as_str()).map(ToString::to_string);
+                        model = recipe
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                 }
             }
@@ -239,14 +270,12 @@ impl Database {
                 Ok((p_id, ops, src)) => (Some(p_id), ops, src),
                 Err(_) => {
                     // Fall back to legacy heuristic lineage by filepath
-                    let legacy_res = legacy_edge_stmt.query_row(params![&filepath], |row| {
-                        row.get::<_, String>(0)
-                    });
+                    let legacy_res = legacy_edge_stmt
+                        .query_row(params![&filepath], |row| row.get::<_, String>(0));
                     match legacy_res {
                         Ok(p_fp) => {
-                            let p_id_res = find_by_filepath_stmt.query_row(params![&p_fp], |row| {
-                                row.get::<_, i64>(0)
-                            });
+                            let p_id_res = find_by_filepath_stmt
+                                .query_row(params![&p_fp], |row| row.get::<_, i64>(0));
                             match p_id_res {
                                 Ok(p_id) => (Some(p_id), None, "inferred".to_string()),
                                 Err(_) => (None, None, "root".to_string()),
@@ -258,7 +287,11 @@ impl Database {
             };
 
             // Permanent ghosts have a blanked prompt; an empty prompt is simply not shown.
-            let node_prompt = if prompt.trim().is_empty() { None } else { Some(prompt) };
+            let node_prompt = if prompt.trim().is_empty() {
+                None
+            } else {
+                Some(prompt)
+            };
 
             nodes.push(LineageTraceNode {
                 id,

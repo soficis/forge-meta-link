@@ -3,6 +3,7 @@ import type { DeleteMode, ImageExportFormat } from "../types/metadata";
 import type { ShowToastOptions } from "../hooks/useToast";
 import type { ForgeSettings } from "../hooks/useForgeSettings";
 import { getForgeUrlError } from "../utils/forgeUrl";
+import { buildLoraWeightMap } from "../utils/forgeSendOptions";
 import { ForgeRequeueButton } from "./ForgeRequeueButton";
 
 interface SelectionActionBarProps {
@@ -62,6 +63,7 @@ export function SelectionActionBar({
     const showQualitySlider = exportFormat === "jpeg" || exportFormat === "webp";
     const forgeUrlError = getForgeUrlError(forge.forgeBaseUrl);
     const parsedLoraWeight = forge.forgeLoraWeight.trim() ? Number(forge.forgeLoraWeight) : null;
+    const selectedLoraWeights = buildLoraWeightMap(forge.forgeSelectedLoras, forge.forgeLoraWeights);
 
     if (selectedCount === 0) {
         return null;
@@ -181,6 +183,8 @@ export function SelectionActionBar({
                     adetailerModel={forge.forgeAdetailerFaceModel.trim() ? forge.forgeAdetailerFaceModel : null}
                     loraTokens={forge.forgeSelectedLoras.length > 0 ? forge.forgeSelectedLoras : null}
                     loraWeight={parsedLoraWeight}
+                    loraWeights={selectedLoraWeights}
+                    saveForgeCopy={forge.forgeSaveCopy}
                     disabled={isBusy || forgeUrlError != null}
                     validate={() => {
                         if (

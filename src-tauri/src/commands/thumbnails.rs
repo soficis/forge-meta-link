@@ -421,6 +421,9 @@ pub async fn get_thumbnail_path(
     filepath: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    if !is_allowed_path(&filepath, &state.db, &state.cache_dir) {
+        return Err(format!("Access denied: path is not indexed or in cache: {}", filepath));
+    }
     let cache_dir = state.cache_dir.clone();
     let thumbnail_index = state.thumbnail_index.clone();
     let failed_thumbnail_sources = state.failed_thumbnail_sources.clone();
@@ -491,6 +494,14 @@ pub async fn get_thumbnail_paths(
     filepaths: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ThumbnailMapping>, String> {
+    if filepaths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let filepaths: Vec<String> = filepaths
+        .into_iter()
+        .filter(|p| is_allowed_path(p, &state.db, &state.cache_dir))
+        .collect();
     if filepaths.is_empty() {
         return Ok(Vec::new());
     }

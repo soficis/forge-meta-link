@@ -62,7 +62,10 @@ pub fn normalize_tags(raw: &str) -> String {
 }
 
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Hash over whitespace/case-normalized prompt + negative prompt.
@@ -77,12 +80,18 @@ pub fn prompt_content_hash(prompt: &str, negative: &str) -> String {
 fn clamp_title(title: Option<&str>, prompt: &str) -> String {
     let t = title.map(str::trim).unwrap_or("");
     let source = if t.is_empty() { prompt.trim() } else { t };
-    let limit = if t.is_empty() { DEFAULT_TITLE_CHARS } else { TITLE_MAX_CHARS };
+    let limit = if t.is_empty() {
+        DEFAULT_TITLE_CHARS
+    } else {
+        TITLE_MAX_CHARS
+    };
     source.chars().take(limit).collect()
 }
 
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 const SELECT_COLS: &str = "id, title, prompt, negative_prompt, tags, notes, source_image_id, \
@@ -204,7 +213,10 @@ impl Database {
             args.push(Value::Text(fts));
             order = "f.rank, p.id DESC".to_string();
         }
-        if let Some(t) = tag.map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()) {
+        if let Some(t) = tag
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+        {
             clauses.push("(',' || p.tags || ',') LIKE ? ESCAPE '\\'".to_string());
             args.push(Value::Text(format!("%,{},%", escape_like(&t))));
         }

@@ -10,19 +10,19 @@ pub mod sidecar;
 mod commands;
 
 use commands::{
-    delete_images, directory_exists, export_images, export_images_as_files, filter_images_cursor,
-    forge_cancel_queue, forge_get_options, forge_requeue_image, forge_send_to_image,
-    forge_send_to_images, forge_test_connection, get_directories, get_display_image_path,
-    get_duplicate_groups, get_file_mtimes, get_file_mtimes_for_query, get_forge_api_key,
-    get_image_clipboard_payload, get_image_detail, get_image_tags, get_images_cursor,
-    get_lineage_cursor, get_lineage_trace, get_models, get_seed_walk, get_sidecar_data, get_storage_profile,
-    get_tag_provenance, get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count,
-    infer_lineage, list_tags, move_images_to_directory, open_file_location,
-    precache_all_thumbnails, save_sidecar_tags, scan_directory, search_images_cursor,
+    delete_images, delete_prompt, directory_exists, export_images, export_images_as_files,
+    export_prompt_library, filter_images_cursor, forge_cancel_queue, forge_get_options,
+    forge_get_upscalers, forge_requeue_image, forge_send_to_image, forge_send_to_images,
+    forge_test_connection, forge_upscale_image,
+    get_directories, get_display_image_path, get_duplicate_groups, get_file_mtimes,
+    get_file_mtimes_for_query, get_forge_api_key, get_image_clipboard_payload, get_image_detail,
+    get_image_tags, get_images_cursor, get_lineage_cursor, get_lineage_trace, get_models,
+    get_seed_walk, get_sidecar_data, get_storage_profile, get_tag_provenance, get_thumbnail_path,
+    get_thumbnail_paths, get_top_tags, get_total_count, import_prompt_library, infer_lineage,
+    list_prompt_tags, list_prompts, list_tags, move_images_to_directory, open_file_location,
+    precache_all_thumbnails, save_prompt, save_sidecar_tags, scan_directory, search_images_cursor,
     set_forge_api_key, set_image_favorite, set_image_locked, set_images_favorite,
-    set_images_locked, set_lineage_override, set_storage_profile,
-    delete_prompt, export_prompt_library, import_prompt_library, list_prompt_tags, list_prompts,
-    save_prompt, update_prompt, use_prompt,
+    set_images_locked, set_lineage_override, set_storage_profile, update_prompt, use_prompt,
 };
 use database::Database;
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,10 @@ pub fn run() {
                     }
                 }
             }
+            let _ = app.asset_protocol_scope().allow_directory(&cache_dir, true);
+            let display_cache_dir = app_data.join("display-cache");
+            std::fs::create_dir_all(&display_cache_dir).ok();
+            let _ = app.asset_protocol_scope().allow_directory(&display_cache_dir, true);
             app.manage(AppState {
                 db,
                 cache_dir,
@@ -215,9 +219,11 @@ pub fn run() {
             export_images_as_files,
             forge_test_connection,
             forge_get_options,
+            forge_get_upscalers,
             forge_send_to_image,
             forge_send_to_images,
             forge_requeue_image,
+            forge_upscale_image,
             forge_cancel_queue,
             get_forge_api_key,
             set_forge_api_key,
@@ -348,8 +354,15 @@ mod tests {
     fn data_dir_override_accepts_only_absolute_paths() {
         let abs = std::env::temp_dir().join("fml_override_test");
         // Release builds ignore the variable entirely, so only debug builds honour it.
-        let expected = if cfg!(debug_assertions) { Some(abs.clone()) } else { None };
-        assert_eq!(data_dir_override(Some(abs.to_string_lossy().to_string())), expected);
+        let expected = if cfg!(debug_assertions) {
+            Some(abs.clone())
+        } else {
+            None
+        };
+        assert_eq!(
+            data_dir_override(Some(abs.to_string_lossy().to_string())),
+            expected
+        );
         assert_eq!(data_dir_override(None), None);
         assert_eq!(data_dir_override(Some(String::new())), None);
         assert_eq!(data_dir_override(Some("   ".to_string())), None);

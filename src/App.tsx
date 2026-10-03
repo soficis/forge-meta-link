@@ -16,6 +16,7 @@ import { PromptLibraryDialog } from "./components/PromptLibraryDialog";
 import { CompareLab } from "./components/CompareLab";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { resolveGalleryKeyTarget } from "./utils/galleryKeyTarget";
+import { isTypingTarget } from "./utils/typingTarget";
 import { useAppSettings } from "./hooks/useAppSettings";
 import { useForgeSettings } from "./hooks/useForgeSettings";
 import { useToast, type ShowToastOptions } from "./hooks/useToast";
@@ -1597,11 +1598,6 @@ function AppContent() {
         isDeletingImages || isMovingImages || isUpdatingSelectionMarks;
 
     useEffect(() => {
-        const isTypingTarget = (target: EventTarget | null): boolean => {
-            if (!(target instanceof HTMLElement)) return false;
-            const tag = target.tagName.toLowerCase();
-            return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
-        };
         const handleGlobalKey = (event: KeyboardEvent) => {
             if (isTypingTarget(event.target)) return;
             if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
@@ -1899,6 +1895,12 @@ function AppContent() {
                     onForgeSelectedLorasChange={forge.setForgeSelectedLoras}
                     forgeLoraWeight={forge.forgeLoraWeight}
                     onForgeLoraWeightChange={forge.setForgeLoraWeight}
+                    forgeLoraWeights={forge.forgeLoraWeights}
+                    onForgeLoraWeightsChange={forge.setForgeLoraWeights}
+                    forgeBatchCount={forge.forgeBatchCount}
+                    onForgeBatchCountChange={forge.setForgeBatchCount}
+                    forgeSaveCopy={forge.forgeSaveCopy}
+                    onForgeSaveCopyChange={forge.setForgeSaveCopy}
                     forgeIncludeSeed={forge.forgeIncludeSeed}
                     forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
                     forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}

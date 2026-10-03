@@ -36,6 +36,7 @@ pub struct ForgePayloadOverridesInput {
     pub width: Option<String>,
     pub height: Option<String>,
     pub model_name: Option<String>,
+    pub forge_additional_modules: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +58,16 @@ pub struct ForgeSendOptionsRequest {
     pub adetailer_face_model: Option<String>,
     pub lora_tokens: Option<Vec<String>>,
     pub lora_weight: Option<f32>,
+    /// Per-LoRA weights keyed by the same token as `lora_tokens`. A token with no entry
+    /// uses `lora_weight`.
+    pub lora_weights: Option<HashMap<String, f32>>,
+    /// Images generated per request (Forge `n_iter`). Defaults to 1.
+    pub batch_count: Option<u32>,
+    /// Also let Forge keep its own copy in its outputs folder (`save_images`).
+    pub save_forge_copy: Option<bool>,
     pub overrides: Option<ForgePayloadOverridesInput>,
     pub mutation_ops: Option<serde_json::Value>,
+    pub confirm_unencrypted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +94,9 @@ struct NormalizedForgeSendOptions {
     adetailer_face_model: String,
     lora_tokens: Option<Vec<String>>,
     lora_weight: f32,
+    lora_weights: HashMap<String, f32>,
+    batch_count: u32,
+    save_forge_copy: bool,
     overrides: Option<ForgePayloadOverridesInput>,
     mutation_ops: Option<serde_json::Value>,
 }
@@ -98,6 +110,9 @@ struct ForgeSendContext<'a> {
     adetailer_face_model: &'a str,
     lora_tokens: Option<&'a [String]>,
     lora_weight: f32,
+    lora_weights: &'a HashMap<String, f32>,
+    batch_count: u32,
+    save_forge_copy: bool,
     overrides: Option<&'a ForgePayloadOverridesInput>,
     mutation_ops: Option<&'a serde_json::Value>,
 }
@@ -208,11 +223,40 @@ fn normalize_forge_send_options(
         .unwrap_or(DEFAULT_ADETAILER_FACE_MODEL)
         .to_string();
     let lora_weight = options.lora_weight.unwrap_or(1.0);
-    if !lora_weight.is_finite() {
-        return Err("Invalid LoRA weight value".to_string());
+    validate_lora_weight(lora_weight)?;
+    let mut lora_weights = HashMap::new();
+    for (token, weight) in options.lora_weights.unwrap_or_default() {
+        validate_lora_weight(weight)?;
+        if let Some(normalized) = normalize_lora_token_for_prompt(&token) {
+            lora_weights.insert(normalized, weight);
+        }
+    }
+    let batch_count = options.batch_count.unwrap_or(1);
+    if batch_count == 0 || batch_count > MAX_FORGE_BATCH_COUNT {
+        return Err(format!(
+            "Batch count must be between 1 and {}",
+            MAX_FORGE_BATCH_COUNT
+        ));
     }
 
-    let _ = forge_api::validate_base_url(&options.base_url)?;
+    let warning = forge_api::validate_base_url(&options.base_url)?;
+    if warning.is_some() {
+        let has_key = options
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .is_some();
+        if has_key && options.confirm_unencrypted != Some(true) {
+            return Err(
+                "Connecting to remote Forge instance over unencrypted HTTP with an API key is insecure. Set confirmUnencrypted to proceed."
+                    .to_string(),
+            );
+        }
+        if let Some(ref msg) = warning {
+            log::warn!("{}", msg);
+        }
+    }
     let output_dir = resolve_forge_output_dir(options.output_dir.as_deref(), default_output_base)?;
 
     Ok(NormalizedForgeSendOptions {
@@ -224,6 +268,9 @@ fn normalize_forge_send_options(
         adetailer_face_model,
         lora_tokens: options.lora_tokens,
         lora_weight,
+        lora_weights,
+        batch_count,
+        save_forge_copy: options.save_forge_copy.unwrap_or(false),
         overrides: options.overrides,
         mutation_ops: options.mutation_ops,
     })
@@ -711,6 +758,18 @@ fn normalize_prompt_after_lora_strip(prompt: &str) -> String {
         .join(", ")
 }
 
+/// Upper bound on |weight| so a typo cannot produce an absurd `<lora:x:1e30>` tag.
+const MAX_LORA_WEIGHT_ABS: f32 = 100.0;
+/// Largest `n_iter` a single request may ask Forge for.
+const MAX_FORGE_BATCH_COUNT: u32 = 64;
+
+fn validate_lora_weight(weight: f32) -> Result<(), String> {
+    if !weight.is_finite() || weight.abs() > MAX_LORA_WEIGHT_ABS {
+        return Err("Invalid LoRA weight value".to_string());
+    }
+    Ok(())
+}
+
 fn format_lora_weight(weight: f32) -> String {
     let mut value = format!("{weight:.3}");
     while value.contains('.') && value.ends_with('0') {
@@ -730,6 +789,7 @@ fn apply_custom_loras_to_prompt(
     prompt: &str,
     lora_tokens: Option<&[String]>,
     lora_weight: f32,
+    lora_weights: &HashMap<String, f32>,
 ) -> String {
     let Some(tokens) = lora_tokens else {
         return prompt.to_string();
@@ -750,10 +810,12 @@ fn apply_custom_loras_to_prompt(
     }
 
     let sanitized_base = normalize_prompt_after_lora_strip(&strip_existing_lora_tags(prompt));
-    let weight_text = format_lora_weight(lora_weight);
     let lora_suffix = normalized_tokens
         .into_iter()
-        .map(|token| format!("<lora:{}:{}>", token, weight_text))
+        .map(|token| {
+            let weight = lora_weights.get(&token).copied().unwrap_or(lora_weight);
+            format!("<lora:{}:{}>", token, format_lora_weight(weight))
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -764,6 +826,7 @@ fn apply_custom_loras_to_prompt(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_payload_for_image(
     image: &ImageRecord,
     include_seed: bool,
@@ -771,6 +834,7 @@ fn build_payload_for_image(
     adetailer_face_model: Option<&str>,
     lora_tokens: Option<&[String]>,
     lora_weight: f32,
+    lora_weights: &HashMap<String, f32>,
     overrides: Option<&ForgePayloadOverridesInput>,
 ) -> Result<forge_api::ForgePayload, String> {
     let override_prompt = overrides.and_then(|o| o.prompt.as_deref());
@@ -781,6 +845,7 @@ fn build_payload_for_image(
     let override_cfg_scale = overrides.and_then(|o| o.cfg_scale.as_deref());
     let override_seed = overrides.and_then(|o| o.seed.as_deref());
     let override_model = overrides.and_then(|o| o.model_name.as_deref());
+    let override_modules = overrides.and_then(|o| o.forge_additional_modules.as_deref());
     let override_width = overrides.and_then(|o| o.width.as_deref());
     let override_height = overrides.and_then(|o| o.height.as_deref());
 
@@ -798,7 +863,7 @@ fn build_payload_for_image(
     };
 
     let base_prompt = override_prompt.unwrap_or(image.prompt.as_str());
-    let prompt = apply_custom_loras_to_prompt(base_prompt, lora_tokens, lora_weight);
+    let prompt = apply_custom_loras_to_prompt(base_prompt, lora_tokens, lora_weight, lora_weights);
 
     Ok(forge_api::build_payload_for_record(
         image,
@@ -813,12 +878,32 @@ fn build_payload_for_image(
             model_name: override_model,
             width,
             height,
+            forge_additional_modules: override_modules,
         },
         include_seed,
         adetailer_face_enabled,
         adetailer_face_model,
     ))
 }
+
+/// With more than one image per request Forge may prepend a contact-sheet "grid". Keeping it
+/// would index a composite as a child of the source image, so drop it when the count is exactly
+/// one more than requested.
+fn drop_leading_grid(mut images: Vec<String>, expected: usize) -> Vec<String> {
+    if expected > 1 && images.len() == expected + 1 {
+        images.remove(0);
+    }
+    images
+}
+
+/// Applies the per-send options that are not part of the recorded generation params.
+fn apply_send_extras(payload: &mut forge_api::ForgePayload, context: &ForgeSendContext<'_>) {
+    payload.n_iter = Some(context.batch_count);
+    payload.save_images = Some(context.save_forge_copy);
+}
+
+const MAX_SAVED_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_TOTAL_BATCH_WRITE_BYTES: usize = 1024 * 1024 * 1024;
 
 fn save_generated_images(
     payloads: &[String],
@@ -842,11 +927,29 @@ fn save_generated_images(
 
     let mut saved_paths = Vec::with_capacity(payloads.len());
     let mut decode_failures = 0usize;
+    let mut total_written = 0usize;
 
     for (index, payload) in payloads.iter().enumerate() {
         let decoded = decode_forge_image_payload(payload);
         let (bytes, ext) = match decoded {
-            Ok(value) => value,
+            Ok(value) => {
+                if value.0.len() > MAX_SAVED_IMAGE_BYTES {
+                    return Err(format!(
+                        "Decoded image size ({} bytes) exceeds maximum allowable limit of {} bytes",
+                        value.0.len(),
+                        MAX_SAVED_IMAGE_BYTES
+                    ));
+                }
+                total_written = total_written.saturating_add(value.0.len());
+                if total_written > MAX_TOTAL_BATCH_WRITE_BYTES {
+                    return Err(format!(
+                        "Total batch image size ({} bytes) exceeds maximum allowable limit of {} bytes",
+                        total_written,
+                        MAX_TOTAL_BATCH_WRITE_BYTES
+                    ));
+                }
+                value
+            }
             Err(error) => {
                 decode_failures += 1;
                 log::warn!(
@@ -909,7 +1012,10 @@ async fn send_payload_and_save(
     source_filename: &str,
     variant_label: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let api_result = forge_api::send_to_forge(payload, base_url, api_key)
+    let mut enriched_payload = payload.clone();
+    forge_api::enrich_payload_for_forge_neo(&mut enriched_payload, base_url, api_key).await;
+
+    let api_result = forge_api::send_to_forge(&enriched_payload, base_url, api_key)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -917,8 +1023,10 @@ async fn send_payload_and_save(
         return Err(api_result.message);
     }
 
+    let expected = payload.n_iter.unwrap_or(1) as usize;
+    let images = drop_leading_grid(api_result.images, expected);
     save_generated_images(
-        &api_result.images,
+        &images,
         output_dir,
         source_filename,
         variant_label,
@@ -936,15 +1044,17 @@ async fn send_image_record_to_forge(
     let mut processed_count = 0usize;
 
     if context.adetailer_face_enabled {
-        let unprocessed_payload = build_payload_for_image(
+        let mut unprocessed_payload = build_payload_for_image(
             image,
             context.include_seed,
             false,
             Some(context.adetailer_face_model),
             context.lora_tokens,
             context.lora_weight,
+            context.lora_weights,
             context.overrides,
         )?;
+        apply_send_extras(&mut unprocessed_payload, context);
         match send_payload_and_save(
             &unprocessed_payload,
             context.base_url,
@@ -971,15 +1081,17 @@ async fn send_image_record_to_forge(
         }
     }
 
-    let processed_payload = build_payload_for_image(
+    let mut processed_payload = build_payload_for_image(
         image,
         context.include_seed,
         context.adetailer_face_enabled,
         Some(context.adetailer_face_model),
         context.lora_tokens,
         context.lora_weight,
+        context.lora_weights,
         context.overrides,
     )?;
+    apply_send_extras(&mut processed_payload, context);
     let processed_variant = if context.adetailer_face_enabled {
         Some("adetailer")
     } else {
@@ -1504,6 +1616,9 @@ pub async fn forge_send_to_image(
         adetailer_face_model: &normalized.adetailer_face_model,
         lora_tokens: normalized.lora_tokens.as_deref(),
         lora_weight: normalized.lora_weight,
+        lora_weights: &normalized.lora_weights,
+        batch_count: normalized.batch_count,
+        save_forge_copy: normalized.save_forge_copy,
         overrides: normalized.overrides.as_ref(),
         mutation_ops: normalized.mutation_ops.as_ref(),
     };
@@ -1544,6 +1659,9 @@ pub async fn forge_send_to_images(
         adetailer_face_model: &normalized.adetailer_face_model,
         lora_tokens: normalized.lora_tokens.as_deref(),
         lora_weight: normalized.lora_weight,
+        lora_weights: &normalized.lora_weights,
+        batch_count: normalized.batch_count,
+        save_forge_copy: normalized.save_forge_copy,
         overrides: normalized.overrides.as_ref(),
         mutation_ops: normalized.mutation_ops.as_ref(),
     };
@@ -1652,6 +1770,7 @@ pub struct ForgeRequeueRequest {
     pub base_url: String,
     pub api_key: Option<String>,
     pub include_seed: Option<bool>,
+    pub confirm_unencrypted: Option<bool>,
 }
 
 #[tauri::command]
@@ -1665,6 +1784,7 @@ pub async fn forge_requeue_image(
         base_url,
         api_key,
         include_seed,
+        confirm_unencrypted,
     } = request;
     let _queue_guard = state.forge_send_queue.lock().await;
     let effective_api_key = api_key.or_else(|| {
@@ -1675,6 +1795,24 @@ pub async fn forge_requeue_image(
             .map(|k| k.clone())
             .filter(|k| !k.trim().is_empty())
     });
+
+    let warning = forge_api::validate_base_url(&base_url)?;
+    if warning.is_some() {
+        let has_key = effective_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .is_some();
+        if has_key && confirm_unencrypted != Some(true) {
+            return Err(
+                "Connecting to remote Forge instance over unencrypted HTTP with an API key is insecure. Set confirmUnencrypted to proceed."
+                    .to_string(),
+            );
+        }
+        if let Some(ref msg) = warning {
+            log::warn!("{}", msg);
+        }
+    }
     let default_output_base = default_forge_output_base_dir(&state.cache_dir);
     let output_dir = resolve_forge_output_dir(None, &default_output_base)?;
     let image = state
@@ -1734,4 +1872,530 @@ pub async fn forge_requeue_image(
         saved_paths,
         children,
     })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeUpscaleRequest {
+    pub image_id: i64,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub upscaler: String,
+    pub scale: f32,
+    pub output_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeUpscaleOutput {
+    pub ok: bool,
+    pub message: String,
+    pub child_id: Option<i64>,
+    pub saved_path: Option<String>,
+    pub output_dir: String,
+}
+
+pub fn inject_png_text_chunk(png_bytes: &[u8], keyword: &str, text: &str) -> Vec<u8> {
+    const PNG_HEADER: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if png_bytes.len() < 33 || !png_bytes.starts_with(&PNG_HEADER) {
+        return png_bytes.to_vec();
+    }
+
+    let ihdr_len =
+        u32::from_be_bytes([png_bytes[8], png_bytes[9], png_bytes[10], png_bytes[11]]) as usize;
+    if &png_bytes[12..16] != b"IHDR" || png_bytes.len() < 8 + 4 + 4 + ihdr_len + 4 {
+        return png_bytes.to_vec();
+    }
+    let insert_pos = 8 + 4 + 4 + ihdr_len + 4; // Right after IHDR chunk
+
+    let mut data = Vec::with_capacity(keyword.len() + 1 + text.len());
+    data.extend_from_slice(keyword.as_bytes());
+    data.push(0);
+    data.extend_from_slice(text.as_bytes());
+
+    let len = data.len() as u32;
+    let mut crc = flate2::Crc::new();
+    crc.update(b"tEXt");
+    crc.update(&data);
+    let crc_sum = crc.sum();
+
+    let mut result = Vec::with_capacity(png_bytes.len() + 12 + data.len());
+    result.extend_from_slice(&png_bytes[..insert_pos]);
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(b"tEXt");
+    result.extend_from_slice(&data);
+    result.extend_from_slice(&crc_sum.to_be_bytes());
+    result.extend_from_slice(&png_bytes[insert_pos..]);
+
+    result
+}
+
+#[tauri::command]
+pub async fn forge_get_upscalers(
+    base_url: String,
+    api_key: Option<String>,
+) -> Result<Vec<String>, String> {
+    forge_api::list_upscalers(&base_url, api_key.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn forge_upscale_image(
+    app: tauri::AppHandle,
+    request: ForgeUpscaleRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<ForgeUpscaleOutput, String> {
+    let _queue_guard = state.forge_send_queue.lock().await;
+
+    let parent_image = state
+        .db
+        .get_image_by_id(request.image_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Parent image not found: {}", request.image_id))?;
+
+    let parent_path = PathBuf::from(&parent_image.filepath);
+    if !parent_path.exists() {
+        return Err(format!(
+            "Parent image file not found at {}",
+            parent_path.display()
+        ));
+    }
+
+    const MAX_INPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+    let parent_len = std::fs::metadata(&parent_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if parent_len > MAX_INPUT_IMAGE_BYTES {
+        return Err(format!(
+            "Source image size ({} bytes) exceeds maximum allowable limit of 32 MiB",
+            parent_len
+        ));
+    }
+
+    if !request.scale.is_finite() || request.scale < 1.0 || request.scale > 4.0 {
+        return Err(format!(
+            "Invalid upscale scale factor {}: must be between 1.0 and 4.0",
+            request.scale
+        ));
+    }
+
+    const MAX_DIMENSION: u32 = 8192;
+    if let (Some(w), Some(h)) = (parent_image.width, parent_image.height) {
+        let target_w = (w as f32 * request.scale).round() as u32;
+        let target_h = (h as f32 * request.scale).round() as u32;
+        if target_w > MAX_DIMENSION || target_h > MAX_DIMENSION {
+            return Err(format!(
+                "Upscaled dimensions ({}x{}) would exceed maximum ceiling of {}x{}",
+                target_w, target_h, MAX_DIMENSION, MAX_DIMENSION
+            ));
+        }
+    }
+
+    let default_output_base = default_forge_output_base_dir(&state.cache_dir);
+    let output_dir =
+        resolve_forge_output_dir(request.output_dir.as_deref(), &default_output_base)?;
+
+    let parent_bytes = std::fs::read(&parent_path)
+        .map_err(|e| format!("Failed to read source image: {}", e))?;
+    let base64_input = BASE64_STANDARD.encode(&parent_bytes);
+
+    let effective_api_key = request.api_key.or_else(|| {
+        state
+            .forge_api_key
+            .read()
+            .ok()
+            .map(|k| k.clone())
+            .filter(|k| !k.trim().is_empty())
+    });
+
+    let payload = forge_api::ForgeUpscalePayload {
+        image: base64_input,
+        upscaler_1: request.upscaler.clone(),
+        upscaling_resize: request.scale,
+        upscaler_2: None,
+        extras_upscaler_2_visibility: None,
+    };
+
+    let api_result = forge_api::upscale_image(
+        &payload,
+        &request.base_url,
+        effective_api_key.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if !api_result.ok || api_result.image.is_none() {
+        return Ok(ForgeUpscaleOutput {
+            ok: false,
+            message: api_result.message,
+            child_id: None,
+            saved_path: None,
+            output_dir: output_dir.to_string_lossy().to_string(),
+        });
+    }
+
+    let raw_b64 = api_result.image.unwrap();
+    let (mut decoded_bytes, ext) = decode_forge_image_payload(&raw_b64)?;
+
+    // Inherit parent prompt and parameters in PNG text chunk if output is PNG
+    if ext == "png" && !parent_image.raw_metadata.is_empty() {
+        decoded_bytes =
+            inject_png_text_chunk(&decoded_bytes, "parameters", &parent_image.raw_metadata);
+    }
+
+    let stem = Path::new(&parent_image.filename)
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .map(sanitize_stem)
+        .unwrap_or_else(|| "image".to_string());
+    let upscaler_tag = sanitize_stem(&request.upscaler);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let scale_tag = format!("{}x", request.scale).replace('.', "_");
+
+    let mut counter = 0usize;
+    let target_path = loop {
+        let suffix = if counter == 0 {
+            String::new()
+        } else {
+            format!("_{}", counter)
+        };
+        let name = format!(
+            "{}_upscale_{}_{}_{}{}.{}",
+            stem, upscaler_tag, scale_tag, stamp, suffix, ext
+        );
+        let candidate = output_dir.join(name);
+        if !candidate.exists() {
+            break candidate;
+        }
+        counter += 1;
+    };
+
+    // Atomic write via temp file then rename
+    let temp_name = format!(".tmp_upscale_{}_{}.{}", stamp, counter, ext);
+    let temp_path = output_dir.join(temp_name);
+    std::fs::write(&temp_path, &decoded_bytes)
+        .map_err(|e| format!("Failed to write temporary upscaled image: {}", e))?;
+    if let Err(e) = std::fs::rename(&temp_path, &target_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "Failed to rename temporary upscaled image to {}: {}",
+            target_path.display(),
+            e
+        ));
+    }
+
+    // Build inherited parameters for DB
+    let mut params = if parent_image.raw_metadata.trim().is_empty() {
+        parser::GenerationParams {
+            prompt: parent_image.prompt.clone(),
+            negative_prompt: parent_image.negative_prompt.clone(),
+            steps: parent_image.steps.clone(),
+            sampler: parent_image.sampler.clone(),
+            cfg_scale: parent_image.cfg_scale.clone(),
+            seed: parent_image.seed.clone(),
+            model_name: parent_image.model_name.clone(),
+            ..Default::default()
+        }
+    } else {
+        parser::parse_generation_metadata(&parent_image.raw_metadata)
+    };
+
+    // Update dimensions from target image
+    if let Ok((w, h)) = image::image_dimensions(&target_path) {
+        params.width = Some(w);
+        params.height = Some(h);
+    } else if let (Some(w), Some(h)) = (parent_image.width, parent_image.height) {
+        params.width = Some((w as f32 * request.scale).round() as u32);
+        params.height = Some((h as f32 * request.scale).round() as u32);
+    }
+
+    let (file_size, file_mtime) = target_path
+        .metadata()
+        .map(|m| {
+            let s = m.len() as i64;
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (s, t)
+        })
+        .unwrap_or((decoded_bytes.len() as i64, 0));
+
+    let quick_hash = scanner::compute_quick_hash(&target_path, Some(file_size));
+    let mut tags = parser::extract_tags(&params.prompt);
+    if let Some(sidecar_data) = sidecar::read_sidecar(&parent_path) {
+        tags.extend(sidecar_data.tags);
+    }
+
+    let target_path_str = target_path.to_string_lossy().to_string();
+    let filename = target_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let directory = output_dir.to_string_lossy().to_string();
+
+    let record = BulkRecord {
+        filepath: target_path_str.clone(),
+        filename,
+        directory,
+        params,
+        file_mtime: Some(file_mtime),
+        file_size: Some(file_size),
+        quick_hash,
+        tags,
+    };
+
+    let ops_obj = serde_json::json!({
+        "relation": "upscale",
+        "upscaler": request.upscaler,
+        "scale": request.scale,
+        "confidence": 1.0,
+    });
+    let edge = LineageEdgeRecord {
+        parent_id: parent_image.id,
+        ops_json: serde_json::to_string(&ops_obj).ok(),
+        source: "forge_upscale".to_string(),
+    };
+
+    let items = vec![BulkRecordWithLineage {
+        record,
+        edge: Some(edge),
+    }];
+
+    // Single atomic transaction inserting child record and lineage edge
+    let inserted_ids = state
+        .db
+        .bulk_upsert_with_lineage(&items)
+        .map_err(|e| format!("Failed to index upscaled image into database: {}", e))?;
+    let child_id = inserted_ids.first().copied();
+
+    // Generate thumbnail
+    let storage_profile = state
+        .storage_profile
+        .read()
+        .map(|p| *p)
+        .unwrap_or(StorageProfile::Hdd);
+    let thumbs = image_processing::generate_thumbnails(
+        std::slice::from_ref(&target_path),
+        &state.cache_dir,
+        storage_profile,
+    );
+    if !thumbs.is_empty() {
+        if let Ok(mut idx) = state.thumbnail_index.write() {
+            for (_, thumb_path) in thumbs {
+                idx.insert(thumb_path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let _ = app.asset_protocol_scope().allow_directory(&output_dir, true);
+    let _ = app.emit("forge-images-ingested", vec![target_path_str.clone()]);
+
+    Ok(ForgeUpscaleOutput {
+        ok: true,
+        message: format!("Successfully upscaled image with {}", request.upscaler),
+        child_id,
+        saved_path: Some(target_path_str),
+        output_dir: output_dir.to_string_lossy().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod send_extras_tests {
+    use super::*;
+
+    fn weights(pairs: &[(&str, f32)]) -> HashMap<String, f32> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn options(extra: serde_json::Value) -> Result<NormalizedForgeSendOptions, String> {
+        let mut base = serde_json::json!({ "baseUrl": "http://127.0.0.1:7860" });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let request: ForgeSendOptionsRequest = serde_json::from_value(base).unwrap();
+        normalize_forge_send_options(request, Path::new("."))
+    }
+
+    #[test]
+    fn each_lora_gets_its_own_weight_and_unlisted_ones_use_the_default() {
+        let tokens = vec!["style/a".to_string(), "b".to_string(), "c".to_string()];
+        let prompt = apply_custom_loras_to_prompt(
+            "a cat <lora:old:0.3>",
+            Some(&tokens),
+            0.8,
+            &weights(&[("style/a", 0.55), ("b", 1.25)]),
+        );
+        assert_eq!(
+            prompt,
+            "a cat, <lora:style/a:0.55>, <lora:b:1.25>, <lora:c:0.8>"
+        );
+    }
+
+    #[test]
+    fn a_zero_weight_is_kept_not_treated_as_missing() {
+        let tokens = vec!["a".to_string()];
+        let prompt = apply_custom_loras_to_prompt("x", Some(&tokens), 1.0, &weights(&[("a", 0.0)]));
+        assert_eq!(prompt, "x, <lora:a:0>");
+    }
+
+    #[test]
+    fn weight_keys_are_matched_after_the_same_normalisation_as_tokens() {
+        let normalized = options(serde_json::json!({
+            "loraTokens": ["styles\\foo.safetensors"],
+            "loraWeights": { "styles\\foo.safetensors": 0.4 },
+        }))
+        .unwrap();
+        let tokens = normalized.lora_tokens.clone().unwrap();
+        let prompt = apply_custom_loras_to_prompt(
+            "p",
+            Some(&tokens),
+            1.0,
+            &normalized.lora_weights,
+        );
+        assert_eq!(prompt, "p, <lora:styles/foo:0.4>");
+    }
+
+    #[test]
+    fn invalid_weights_and_batch_counts_are_rejected() {
+        assert!(options(serde_json::json!({ "loraWeights": { "a": 1000.0 } })).is_err());
+        assert!(options(serde_json::json!({ "loraWeight": 1000.0 })).is_err());
+        assert!(options(serde_json::json!({ "batchCount": 0 })).is_err());
+        assert!(options(serde_json::json!({ "batchCount": MAX_FORGE_BATCH_COUNT + 1 })).is_err());
+        assert!(options(serde_json::json!({ "batchCount": MAX_FORGE_BATCH_COUNT })).is_ok());
+    }
+
+    #[test]
+    fn defaults_are_one_image_and_no_forge_side_copy() {
+        let normalized = options(serde_json::json!({})).unwrap();
+        assert_eq!(normalized.batch_count, 1);
+        assert!(!normalized.save_forge_copy);
+        assert!(normalized.lora_weights.is_empty());
+
+        let normalized =
+            options(serde_json::json!({ "batchCount": 4, "saveForgeCopy": true })).unwrap();
+        assert_eq!(normalized.batch_count, 4);
+        assert!(normalized.save_forge_copy);
+    }
+
+    #[test]
+    fn extras_are_written_into_the_payload() {
+        let empty = HashMap::new();
+        let context = ForgeSendContext {
+            base_url: "http://127.0.0.1:7860",
+            api_key: None,
+            output_dir: Path::new("."),
+            include_seed: true,
+            adetailer_face_enabled: false,
+            adetailer_face_model: "face_yolov8n.pt",
+            lora_tokens: None,
+            lora_weight: 1.0,
+            lora_weights: &empty,
+            batch_count: 6,
+            save_forge_copy: true,
+            overrides: None,
+            mutation_ops: None,
+        };
+        let mut payload = forge_api::ForgePayload {
+            prompt: "p".into(),
+            negative_prompt: String::new(),
+            steps: None,
+            sampler_name: None,
+            scheduler: None,
+            cfg_scale: None,
+            seed: None,
+            width: None,
+            height: None,
+            override_settings: None,
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        };
+        apply_send_extras(&mut payload, &context);
+        assert_eq!(payload.n_iter, Some(6));
+        assert_eq!(payload.batch_size, Some(1));
+        assert_eq!(payload.save_images, Some(true));
+    }
+
+    #[test]
+    fn a_leading_grid_is_dropped_only_when_the_count_is_exactly_one_over() {
+        let imgs = |n: usize| (0..n).map(|i| format!("img{i}")).collect::<Vec<_>>();
+        assert_eq!(drop_leading_grid(imgs(4), 3), vec!["img1", "img2", "img3"]);
+        assert_eq!(drop_leading_grid(imgs(3), 3), imgs(3));
+        assert_eq!(drop_leading_grid(imgs(2), 1), imgs(2));
+        assert_eq!(drop_leading_grid(imgs(5), 3), imgs(5));
+    }
+
+    #[test]
+    fn remote_cleartext_http_with_api_key_requires_confirm_unencrypted() {
+        // Remote HTTP + API key without confirmation -> Err
+        let req_unconfirmed = options(serde_json::json!({
+            "baseUrl": "http://remote.example.com:7860",
+            "apiKey": "secret-key-123"
+        }));
+        assert!(req_unconfirmed.is_err());
+        assert!(req_unconfirmed.unwrap_err().contains("confirmUnencrypted"));
+
+        // Remote HTTP + API key with confirmation -> Ok
+        let req_confirmed = options(serde_json::json!({
+            "baseUrl": "http://remote.example.com:7860",
+            "apiKey": "secret-key-123",
+            "confirmUnencrypted": true
+        }));
+        assert!(req_confirmed.is_ok());
+
+        // Remote HTTP without API key -> Ok (no secret transmitted)
+        let req_no_key = options(serde_json::json!({
+            "baseUrl": "http://remote.example.com:7860"
+        }));
+        assert!(req_no_key.is_ok());
+
+        // Localhost HTTP with API key -> Ok (loopback safe)
+        let req_localhost = options(serde_json::json!({
+            "baseUrl": "http://127.0.0.1:7860",
+            "apiKey": "secret-key-123"
+        }));
+        assert!(req_localhost.is_ok());
+
+        // Remote HTTPS with API key -> Ok (TLS encrypted)
+        let req_https = options(serde_json::json!({
+            "baseUrl": "https://remote.example.com:7860",
+            "apiKey": "secret-key-123"
+        }));
+        assert!(req_https.is_ok());
+    }
+
+    #[test]
+    fn test_inject_png_text_chunk() {
+        let mut minimal_png = Vec::new();
+        // PNG Header
+        minimal_png.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR chunk (13 bytes data)
+        minimal_png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
+        minimal_png.extend_from_slice(b"IHDR");
+        minimal_png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        minimal_png.extend_from_slice(&[0x90, 0x77, 0x53, 0xDE]);
+        // IEND chunk
+        minimal_png.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        minimal_png.extend_from_slice(b"IEND");
+        minimal_png.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
+
+        let prompt_text = "a cute fluffy orange cat\nSteps: 28, Sampler: Euler a, CFG scale: 7, Seed: 123456";
+        let injected = inject_png_text_chunk(&minimal_png, "parameters", prompt_text);
+
+        assert!(injected.len() > minimal_png.len());
+        assert!(injected.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+        assert!(injected.windows(4).any(|w| w == b"tEXt"));
+        assert!(injected.windows(10).any(|w| w == b"parameters"));
+        assert!(injected.windows(24).any(|w| w == b"a cute fluffy orange cat"));
+    }
 }

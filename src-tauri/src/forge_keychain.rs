@@ -95,13 +95,146 @@ fn keyring_delete() -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+mod dpapi {
+    use std::ptr;
+
+    #[repr(C)]
+    struct DataBlob {
+        cb_data: u32,
+        pb_data: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            p_data_in: *const DataBlob,
+            sz_data_descr: *const u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut std::ffi::c_void,
+            p_prompt_struct: *mut std::ffi::c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+
+        fn CryptUnprotectData(
+            p_data_in: *const DataBlob,
+            ppsz_data_descr: *mut *mut u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut std::ffi::c_void,
+            p_prompt_struct: *mut std::ffi::c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(h_mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+        let in_blob = DataBlob {
+            cb_data: data.len() as u32,
+            pb_data: data.as_ptr() as *mut u8,
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+
+        let success = unsafe {
+            CryptProtectData(
+                &in_blob,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            )
+        };
+
+        if success == 0 {
+            return Err("CryptProtectData failed".to_string());
+        }
+
+        let result = unsafe {
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let vec = slice.to_vec();
+            LocalFree(out_blob.pb_data as *mut std::ffi::c_void);
+            vec
+        };
+
+        Ok(result)
+    }
+
+    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+        let in_blob = DataBlob {
+            cb_data: data.len() as u32,
+            pb_data: data.as_ptr() as *mut u8,
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+
+        let success = unsafe {
+            CryptUnprotectData(
+                &in_blob,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            )
+        };
+
+        if success == 0 {
+            return Err("CryptUnprotectData failed".to_string());
+        }
+
+        let result = unsafe {
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let vec = slice.to_vec();
+            LocalFree(out_blob.pb_data as *mut std::ffi::c_void);
+            vec
+        };
+
+        Ok(result)
+    }
+}
+
+const DPAPI_HEADER: &[u8] = b"DPAPI:";
+
 fn read_plaintext_file(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    #[cfg(windows)]
+    {
+        if bytes.starts_with(DPAPI_HEADER) {
+            if let Ok(decrypted) = dpapi::decrypt(&bytes[DPAPI_HEADER.len()..]) {
+                if let Ok(s) = String::from_utf8(decrypted) {
+                    let trimmed = s.trim().to_string();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+        }
+    }
+    parse_plaintext_key(&bytes)
+}
+
+fn parse_plaintext_key(bytes: &[u8]) -> Option<String> {
+    let content = std::str::from_utf8(bytes).ok()?;
     #[derive(serde::Deserialize)]
     struct ForgeApiKeyConfig {
         api_key: String,
     }
-    let parsed: Result<ForgeApiKeyConfig, _> = serde_json::from_str(&content);
+    let parsed: Result<ForgeApiKeyConfig, _> = serde_json::from_str(content);
     match parsed {
         Ok(cfg) => {
             let trimmed = cfg.api_key.trim().to_string();
@@ -123,12 +256,6 @@ fn read_plaintext_file(path: &Path) -> Option<String> {
 }
 
 fn write_plaintext_fallback(path: &Path, api_key: &str) -> Result<(), String> {
-    #[derive(serde::Serialize)]
-    struct ForgeApiKeyConfig<'a> {
-        api_key: &'a str,
-    }
-    let payload = serde_json::to_string_pretty(&ForgeApiKeyConfig { api_key })
-        .map_err(|e| format!("Failed to serialize Forge API key: {}", e))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -138,14 +265,35 @@ fn write_plaintext_fallback(path: &Path, api_key: &str) -> Result<(), String> {
             )
         })?;
     }
-    std::fs::write(path, payload)
-        .map_err(|e| format!("Failed to save Forge API key to {}: {}", path.display(), e))?;
-    #[cfg(unix)]
+
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        let encrypted = dpapi::encrypt(api_key.as_bytes())?;
+        let mut payload = Vec::with_capacity(DPAPI_HEADER.len() + encrypted.len());
+        payload.extend_from_slice(DPAPI_HEADER);
+        payload.extend_from_slice(&encrypted);
+        std::fs::write(path, payload)
+            .map_err(|e| format!("Failed to save Forge API key to {}: {}", path.display(), e))?;
+        Ok(())
     }
-    Ok(())
+
+    #[cfg(not(windows))]
+    {
+        #[derive(serde::Serialize)]
+        struct ForgeApiKeyConfig<'a> {
+            api_key: &'a str,
+        }
+        let payload = serde_json::to_string_pretty(&ForgeApiKeyConfig { api_key })
+            .map_err(|e| format!("Failed to serialize Forge API key: {}", e))?;
+        std::fs::write(path, payload)
+            .map_err(|e| format!("Failed to save Forge API key to {}: {}", path.display(), e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
 }
 
 pub fn load_forge_api_key_with_migration(path: &Path) -> Result<Option<String>, String> {
@@ -320,7 +468,10 @@ mod service_name_tests {
     #[test]
     fn only_a_non_empty_data_dir_override_counts_as_isolated() {
         if !cfg!(debug_assertions) {
-            assert!(!isolated_from_env(Some("C:/x".into())), "release builds ignore the override");
+            assert!(
+                !isolated_from_env(Some("C:/x".into())),
+                "release builds ignore the override"
+            );
             return;
         }
         assert!(isolated_from_env(Some("C:/x".into())));
@@ -342,7 +493,44 @@ mod service_name_tests {
         // the mock (and therefore every load/persist path under test) keys off the same service
         let real_key = with_env(None, mock_store::key);
         let iso_key = with_env(Some("C:/isolated"), mock_store::key);
-        assert_ne!(real_key, iso_key, "an isolated run must not read or write the real key");
+        assert_ne!(
+            real_key, iso_key,
+            "an isolated run must not read or write the real key"
+        );
         assert!(iso_key.starts_with(&iso_service));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_dpapi_roundtrip_and_fallback_encryption() {
+        use super::*;
+
+        let plain = b"test-secret-key-dpapi-12345";
+        let encrypted = dpapi::encrypt(plain).expect("encryption succeeds");
+        assert_ne!(plain.to_vec(), encrypted);
+        let decrypted = dpapi::decrypt(&encrypted).expect("decryption succeeds");
+        assert_eq!(plain.to_vec(), decrypted);
+
+        // Fallback file roundtrip
+        let dir = std::env::temp_dir().join(format!("fml_dpapi_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_key.json");
+
+        write_plaintext_fallback(&path, "secret-key-roundtrip").expect("write succeeds");
+        let raw = std::fs::read(&path).expect("read raw bytes");
+        assert!(raw.starts_with(DPAPI_HEADER));
+        assert!(!String::from_utf8_lossy(&raw).contains("secret-key-roundtrip"));
+
+        let loaded = read_plaintext_file(&path);
+        assert_eq!(loaded.as_deref(), Some("secret-key-roundtrip"));
+
+        // Backward compatibility: read legacy plaintext file
+        let legacy_json = serde_json::json!({ "api_key": "legacy-plain-secret" }).to_string();
+        std::fs::write(&path, legacy_json).expect("write legacy");
+        let loaded_legacy = read_plaintext_file(&path);
+        assert_eq!(loaded_legacy.as_deref(), Some("legacy-plain-secret"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

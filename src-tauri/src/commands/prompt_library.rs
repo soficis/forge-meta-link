@@ -20,6 +20,9 @@ fn require_absolute_json(path: &str) -> Result<&Path, String> {
     if !p.is_absolute() {
         return Err("Path must be an absolute path".to_string());
     }
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("Path cannot contain parent directory (..) components".to_string());
+    }
     let is_json = p
         .extension()
         .and_then(|e| e.to_str())

@@ -89,3 +89,4 @@ banner.png
 **/banner.png
 src-tauri/tests/poc_plaintext_key.rs
 src-tauri/tests/poc_png_bomb.rs
+src-tauri/tests/poc_sidecar_yaml.rs

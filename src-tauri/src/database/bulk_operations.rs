@@ -25,10 +25,7 @@ impl Database {
 
     /// Batch upsert images and their tags (and optional lineage edges) in a single transaction.
     /// Returns the inserted/updated image ids.
-    pub fn bulk_upsert_with_lineage(
-        &self,
-        items: &[BulkRecordWithLineage],
-    ) -> SqlResult<Vec<i64>> {
+    pub fn bulk_upsert_with_lineage(&self, items: &[BulkRecordWithLineage]) -> SqlResult<Vec<i64>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -311,7 +308,10 @@ impl Database {
 
         // 1. Remove image_tags for the culled ids
         tx.execute(
-            &format!("DELETE FROM image_tags WHERE image_id IN ({})", placeholders),
+            &format!(
+                "DELETE FROM image_tags WHERE image_id IN ({})",
+                placeholders
+            ),
             params_from_iter(params_ids.clone()),
         )?;
 
@@ -617,7 +617,9 @@ fn demote_stale_culled_row(
     filepath: &str,
     new_hash: Option<&str>,
 ) -> SqlResult<()> {
-    let Some(new_hash) = new_hash else { return Ok(()) };
+    let Some(new_hash) = new_hash else {
+        return Ok(());
+    };
     let existing: Option<(i64, Option<String>, Option<i64>)> = tx
         .query_row(
             "SELECT id, quick_hash, culled_at FROM images WHERE filepath = ?1",

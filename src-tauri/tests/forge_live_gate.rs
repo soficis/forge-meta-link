@@ -40,7 +40,9 @@ fn live_url() -> Option<String> {
 }
 
 fn api_key() -> Option<String> {
-    std::env::var("FORGE_API_KEY").ok().filter(|k| !k.trim().is_empty())
+    std::env::var("FORGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
 }
 
 fn run<F: std::future::Future>(f: F) -> F::Output {
@@ -60,7 +62,9 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn decode_png(b64: &str) -> Vec<u8> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let raw = b64.split_once(";base64,").map(|(_, d)| d).unwrap_or(b64);
-    STANDARD.decode(raw.trim()).expect("forge returned invalid base64")
+    STANDARD
+        .decode(raw.trim())
+        .expect("forge returned invalid base64")
 }
 
 async fn get_json(url: &str) -> Value {
@@ -68,7 +72,12 @@ async fn get_json(url: &str) -> Value {
     if let Some(k) = api_key() {
         req = req.bearer_auth(k);
     }
-    req.send().await.expect("GET failed").json().await.expect("bad json")
+    req.send()
+        .await
+        .expect("GET failed")
+        .json()
+        .await
+        .expect("bad json")
 }
 
 /// Sends a payload through the production sender and returns the first PNG plus the infotext.
@@ -78,7 +87,8 @@ async fn generate(payload: &ForgePayload, url: &str) -> (Vec<u8>, String) {
         .expect("send_to_forge errored");
     assert!(result.ok, "Forge rejected the payload: {}", result.message);
     let png = decode_png(result.images.first().expect("no image returned"));
-    let info: Value = serde_json::from_str(result.info.as_deref().unwrap_or("{}")).unwrap_or(Value::Null);
+    let info: Value =
+        serde_json::from_str(result.info.as_deref().unwrap_or("{}")).unwrap_or(Value::Null);
     let infotext = info["infotexts"][0].as_str().unwrap_or("").to_string();
     (png, infotext)
 }
@@ -89,21 +99,50 @@ fn compare(scenario: &str, source: &GenerationParams, got: &GenerationParams) ->
     let norm = |v: &Option<String>| v.as_deref().unwrap_or("").trim().to_lowercase();
     let mut out = Vec::new();
     let mut check = |field: &str, expected: String, actual: String, ci: bool| {
-        let ok = if ci { expected.to_lowercase() == actual.to_lowercase() } else { expected == actual };
-        out.push(CheckResult { scenario: scenario.into(), field: field.into(), expected, actual, ok });
+        let ok = if ci {
+            expected.to_lowercase() == actual.to_lowercase()
+        } else {
+            expected == actual
+        };
+        out.push(CheckResult {
+            scenario: scenario.into(),
+            field: field.into(),
+            expected,
+            actual,
+            ok,
+        });
     };
     check("steps", norm(&source.steps), norm(&got.steps), false);
     check("sampler", norm(&source.sampler), norm(&got.sampler), true);
-    check("scheduler", norm(&source.schedule_type), norm(&got.schedule_type), true);
-    check("cfg_scale", norm(&source.cfg_scale), norm(&got.cfg_scale), false);
+    check(
+        "scheduler",
+        norm(&source.schedule_type),
+        norm(&got.schedule_type),
+        true,
+    );
+    check(
+        "cfg_scale",
+        norm(&source.cfg_scale),
+        norm(&got.cfg_scale),
+        false,
+    );
     check("seed", norm(&source.seed), norm(&got.seed), false);
     check(
         "size",
-        format!("{}x{}", source.width.unwrap_or(0), source.height.unwrap_or(0)),
+        format!(
+            "{}x{}",
+            source.width.unwrap_or(0),
+            source.height.unwrap_or(0)
+        ),
         format!("{}x{}", got.width.unwrap_or(0), got.height.unwrap_or(0)),
         false,
     );
-    check("model_hash", norm(&source.model_hash), norm(&got.model_hash), true);
+    check(
+        "model_hash",
+        norm(&source.model_hash),
+        norm(&got.model_hash),
+        true,
+    );
     for key in ["Lora hashes", "Clip skip"] {
         let s = source.extra_params.get(key).cloned().unwrap_or_default();
         let g = got.extra_params.get(key).cloned().unwrap_or_default();
@@ -157,10 +196,20 @@ fn make_source(url: &str) -> Source {
 
         let db = Database::new(&dir.join("gate.db"), StorageProfile::Hdd).unwrap();
         let id = db
-            .upsert_image(path.to_str().unwrap(), "source.png", dir.to_str().unwrap(), &parsed, Some(1))
+            .upsert_image(
+                path.to_str().unwrap(),
+                "source.png",
+                dir.to_str().unwrap(),
+                &parsed,
+                Some(1),
+            )
             .unwrap();
         let record = db.get_image_by_id(id).unwrap().expect("record missing");
-        Source { record, params: parsed, lora }
+        Source {
+            record,
+            params: parsed,
+            lora,
+        }
     })
 }
 
@@ -176,7 +225,12 @@ struct Ov {
 
 /// Calls the production `forge_api::build_payload_for_record`, the same function the Send-to
 /// commands use for override precedence (override, else stored record, scheduler from metadata).
-fn send_to_payload(rec: &ImageRecord, include_seed: bool, adetailer: bool, ov: &Ov) -> ForgePayload {
+fn send_to_payload(
+    rec: &ImageRecord,
+    include_seed: bool,
+    adetailer: bool,
+    ov: &Ov,
+) -> ForgePayload {
     forge_api::build_payload_for_record(
         rec,
         &rec.prompt,
@@ -246,7 +300,10 @@ fn assert_all_ok(all: &[CheckResult]) {
         bad.is_empty(),
         "round-trip mismatches against live Forge Neo:\n{}",
         bad.iter()
-            .map(|r| format!("  {} / {}: expected {:?}, got {:?}", r.scenario, r.field, r.expected, r.actual))
+            .map(|r| format!(
+                "  {} / {}: expected {:?}, got {:?}",
+                r.scenario, r.field, r.expected, r.actual
+            ))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -260,12 +317,20 @@ fn live_requeue_paths_roundtrip_every_field() {
     };
     let src = make_source(&url);
     // Sanity: the ingested source itself must carry the params we asked for.
-    assert_eq!(src.params.seed.as_deref(), Some(SOURCE_SEED), "source seed not preserved by Forge/parser");
+    assert_eq!(
+        src.params.seed.as_deref(),
+        Some(SOURCE_SEED),
+        "source seed not preserved by Forge/parser"
+    );
     let mut all = Vec::new();
 
     run(async {
         // 1. Send-to / batch path (forge_send_to_image(s)).
-        let (_, info) = generate(&send_to_payload(&src.record, true, false, &Ov::default()), &url).await;
+        let (_, info) = generate(
+            &send_to_payload(&src.record, true, false, &Ov::default()),
+            &url,
+        )
+        .await;
         all.extend(compare("send_to", &src.params, &parse_infotext(&info)));
 
         // 2. Requeue path (forge_requeue_image).
@@ -274,25 +339,36 @@ fn live_requeue_paths_roundtrip_every_field() {
         all.extend(compare("requeue", &src.params, &parse_infotext(&info)));
 
         // 3. Per-variant params: each request keeps its own seed/cfg, no bleed between requests.
-        for (i, (seed, cfg)) in [("4294967300", "6.0"), ("4294967301", "7.5"), ("4294967302", "9.0")]
-            .iter()
-            .enumerate()
+        for (i, (seed, cfg)) in [
+            ("4294967300", "6.0"),
+            ("4294967301", "7.5"),
+            ("4294967302", "9.0"),
+        ]
+        .iter()
+        .enumerate()
         {
             let mut expect = src.params.clone();
             expect.seed = Some((*seed).into());
             expect.cfg_scale = Some((*cfg).into());
-            let (_, info) =
-                generate(
-                    &send_to_payload(
-                        &src.record,
-                        true,
-                        false,
-                        &Ov { seed: Some((*seed).into()), cfg: Some((*cfg).into()), ..Ov::default() },
-                    ),
-                    &url,
-                )
-                .await;
-            all.extend(compare(&format!("variant{}", i + 1), &expect, &parse_infotext(&info)));
+            let (_, info) = generate(
+                &send_to_payload(
+                    &src.record,
+                    true,
+                    false,
+                    &Ov {
+                        seed: Some((*seed).into()),
+                        cfg: Some((*cfg).into()),
+                        ..Ov::default()
+                    },
+                ),
+                &url,
+            )
+            .await;
+            all.extend(compare(
+                &format!("variant{}", i + 1),
+                &expect,
+                &parse_infotext(&info),
+            ));
         }
     });
 
@@ -307,7 +383,12 @@ fn live_adetailer_variant_keeps_params_and_is_actually_applied() {
         let scripts = get_json(&format!("{url}/sdapi/v1/scripts")).await;
         scripts["txt2img"]
             .as_array()
-            .map(|a| a.iter().any(|s| s.as_str().is_some_and(|n| n.eq_ignore_ascii_case("adetailer"))))
+            .map(|a| {
+                a.iter().any(|s| {
+                    s.as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("adetailer"))
+                })
+            })
             .unwrap_or(false)
     });
     if !has_adetailer {
@@ -315,14 +396,21 @@ fn live_adetailer_variant_keeps_params_and_is_actually_applied() {
         return;
     }
     let src = make_source(&url);
-    let (_, info) = run(generate(&send_to_payload(&src.record, true, true, &Ov::default()), &url));
+    let (_, info) = run(generate(
+        &send_to_payload(&src.record, true, true, &Ov::default()),
+        &url,
+    ));
     let mut all = compare("adetailer", &src.params, &parse_infotext(&info));
     let applied = info.contains("ADetailer");
     all.push(CheckResult {
         scenario: "adetailer".into(),
         field: "extension_applied".into(),
         expected: "ADetailer in infotext".into(),
-        actual: if applied { "present".into() } else { "absent".into() },
+        actual: if applied {
+            "present".into()
+        } else {
+            "absent".into()
+        },
         ok: applied,
     });
     report("adetailer", &all);
@@ -337,11 +425,22 @@ fn live_lora_survives_requeue() {
         eprintln!("No LoRA installed on this Forge; skipping");
         return;
     };
-    let (_, info) = run(generate(&send_to_payload(&src.record, true, false, &Ov::default()), &url));
+    let (_, info) = run(generate(
+        &send_to_payload(&src.record, true, false, &Ov::default()),
+        &url,
+    ));
     let got = parse_infotext(&info);
     let in_prompt = got.prompt.contains(&format!("<lora:{name}"));
-    let hashes = got.extra_params.get("Lora hashes").cloned().unwrap_or_default();
-    assert!(in_prompt, "LoRA tag missing from regenerated prompt: {}", got.prompt);
+    let hashes = got
+        .extra_params
+        .get("Lora hashes")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        in_prompt,
+        "LoRA tag missing from regenerated prompt: {}",
+        got.prompt
+    );
     assert!(
         hashes.contains(&name),
         "LoRA was not loaded by Forge on requeue (Lora hashes: {hashes:?})"
@@ -355,16 +454,30 @@ fn live_lora_survives_requeue() {
 fn live_sweep_variants_apply_exactly_the_mutated_fields() {
     let Some(url) = live_url() else { return };
     let Ok(path) = std::env::var("FORGE_SWEEP_JSON") else {
-        eprintln!("FORGE_SWEEP_JSON not set (run via scripts/verify-forge-roundtrip.mjs); skipping sweep");
+        eprintln!(
+            "FORGE_SWEEP_JSON not set (run via scripts/verify-forge-roundtrip.mjs); skipping sweep"
+        );
         return;
     };
-    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("fixture unreadable"))
-        .expect("fixture is not JSON");
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture unreadable"))
+            .expect("fixture is not JSON");
     let src = make_source(&url);
     let base = &fixture["base"];
-    assert_eq!(base["seed"].as_str(), src.params.seed.as_deref(), "fixture base seed drifted from the source image");
-    assert_eq!(base["cfg_scale"].as_str(), src.params.cfg_scale.as_deref(), "fixture base cfg drifted");
-    assert_eq!(base["schedule_type"].as_str().map(str::to_lowercase), src.params.schedule_type.as_deref().map(str::to_lowercase));
+    assert_eq!(
+        base["seed"].as_str(),
+        src.params.seed.as_deref(),
+        "fixture base seed drifted from the source image"
+    );
+    assert_eq!(
+        base["cfg_scale"].as_str(),
+        src.params.cfg_scale.as_deref(),
+        "fixture base cfg drifted"
+    );
+    assert_eq!(
+        base["schedule_type"].as_str().map(str::to_lowercase),
+        src.params.schedule_type.as_deref().map(str::to_lowercase)
+    );
 
     let variants = fixture["variants"].as_array().expect("variants missing");
     assert!(!variants.is_empty(), "empty sweep fixture");
@@ -386,7 +499,11 @@ fn live_sweep_variants_apply_exactly_the_mutated_fields() {
             expect.cfg_scale = get(&v["expected"], "cfg_scale");
             expect.seed = get(&v["expected"], "seed");
             let (_, info) = generate(&send_to_payload(&src.record, true, false, &ov), &url).await;
-            all.extend(compare(&format!("sweep{:02}", i + 1), &expect, &parse_infotext(&info)));
+            all.extend(compare(
+                &format!("sweep{:02}", i + 1),
+                &expect,
+                &parse_infotext(&info),
+            ));
         }
     });
     report("sweep", &all);

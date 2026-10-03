@@ -7,6 +7,8 @@ import {
     exportImages,
     exportImagesAsFiles,
     forgeGetOptions,
+    forgeGetUpscalers,
+    forgeUpscaleImage,
     getDisplayImagePath,
     getImageClipboardPayload,
     getImageDetail,
@@ -44,6 +46,14 @@ import type { ShowToastOptions } from "../hooks/useToast";
 import { useCompareLabStore } from "../store/compareLabStore";
 import { ForgeRequeueButton } from "./ForgeRequeueButton";
 import { GhostIcon, BookmarkIcon } from "./icons";
+import { isTypingTarget } from "../utils/typingTarget";
+import { buildLoraWeightMap, parseBatchCount } from "../utils/forgeSendOptions";
+import {
+    MODEL_FAMILIES,
+    RESOLUTION_PRESETS,
+    detectResolutionFamilyFromModelName,
+} from "../utils/modelFamilies";
+import type { ModelFamilyId } from "../utils/modelFamilies";
 
 interface PhotoViewerProps {
     images: GalleryImageRecord[];
@@ -63,6 +73,13 @@ interface PhotoViewerProps {
     onForgeSelectedLorasChange: (values: string[]) => void;
     forgeLoraWeight: string;
     onForgeLoraWeightChange: (value: string) => void;
+    /** Per-LoRA weight overrides keyed by LoRA token (typed text). Missing = use forgeLoraWeight. */
+    forgeLoraWeights: Record<string, string>;
+    onForgeLoraWeightsChange: (value: Record<string, string>) => void;
+    forgeBatchCount: string;
+    onForgeBatchCountChange: (value: string) => void;
+    forgeSaveCopy: boolean;
+    onForgeSaveCopyChange: (value: boolean) => void;
     forgeIncludeSeed: boolean;
     forgeAdetailerFaceEnabled: boolean;
     forgeAdetailerFaceModel: string;
@@ -104,47 +121,6 @@ const SINGLE_IMAGE_EXPORT_OPTIONS: { value: ImageExportFormat; label: string }[]
     { value: "webp", label: "WebP" },
     { value: "jxl", label: "JPEG XL" },
 ];
-type ResolutionPresetFamily = "pony_sdxl" | "flux" | "zimage_turbo" | "krea2_turbo";
-
-const RESOLUTION_PRESETS: Record<
-    ResolutionPresetFamily,
-    Array<{ label: string; width: string; height: string }>
-> = {
-    pony_sdxl: [
-        { label: "768 x 1344", width: "768", height: "1344" },
-        { label: "832 x 1216", width: "832", height: "1216" },
-        { label: "896 x 1152", width: "896", height: "1152" },
-        { label: "1024 x 1024", width: "1024", height: "1024" },
-        { label: "1152 x 896", width: "1152", height: "896" },
-        { label: "1216 x 832", width: "1216", height: "832" },
-        { label: "1344 x 768", width: "1344", height: "768" },
-    ],
-    flux: [
-        { label: "1024 x 1024", width: "1024", height: "1024" },
-        { label: "896 x 1152", width: "896", height: "1152" },
-        { label: "1152 x 896", width: "1152", height: "896" },
-        { label: "768 x 1344", width: "768", height: "1344" },
-        { label: "1344 x 768", width: "1344", height: "768" },
-    ],
-    zimage_turbo: [
-        { label: "1024 x 1024", width: "1024", height: "1024" },
-        { label: "896 x 1152", width: "896", height: "1152" },
-        { label: "1152 x 896", width: "1152", height: "896" },
-        { label: "768 x 1344", width: "768", height: "1344" },
-        { label: "1344 x 768", width: "1344", height: "768" },
-    ],
-    // Krea 2 / Krea 2 Turbo native 1K sizes (~1 MP), per Krea's published aspect ratios.
-    krea2_turbo: [
-        { label: "1024 x 1024 (1:1)", width: "1024", height: "1024" },
-        { label: "1184 x 896 (4:3)", width: "1184", height: "896" },
-        { label: "1248 x 832 (3:2)", width: "1248", height: "832" },
-        { label: "1376 x 768 (16:9)", width: "1376", height: "768" },
-        { label: "1568 x 672 (2.35:1)", width: "1568", height: "672" },
-        { label: "928 x 1152 (4:5)", width: "928", height: "1152" },
-        { label: "832 x 1248 (2:3)", width: "832", height: "1248" },
-        { label: "768 x 1376 (9:16)", width: "768", height: "1376" },
-    ],
-};
 const ADETAILER_FACE_MODELS = ["face_yolov8n.pt", "face_yolov8s.pt"];
 const FORGE_PAYLOAD_PRESETS_STORAGE_KEY = "forgePayloadPresets";
 
@@ -159,6 +135,8 @@ interface ForgePayloadPreset {
     adetailer_face_model: string;
     lora_tokens: string[];
     lora_weight: string;
+    /** Per-LoRA weights; absent in presets saved before per-LoRA weights existed. */
+    lora_weights?: Record<string, string>;
 }
 
 function parseForgePayloadPresets(
@@ -201,6 +179,17 @@ function parseForgePayloadPresets(
                         candidate.lora_weight.trim()
                             ? candidate.lora_weight
                             : "1.0",
+                    lora_weights:
+                        candidate.lora_weights &&
+                        typeof candidate.lora_weights === "object" &&
+                        !Array.isArray(candidate.lora_weights)
+                            ? Object.fromEntries(
+                                  Object.entries(candidate.lora_weights).filter(
+                                      (entry): entry is [string, string] =>
+                                          typeof entry[1] === "string"
+                                  )
+                              )
+                            : {},
                 };
                 return acc;
             },
@@ -263,22 +252,6 @@ function validateOptionalFloat(
         return `${fieldLabel} must be between ${min} and ${max}.`;
     }
     return null;
-}
-
-function detectResolutionFamilyFromModelName(modelName: string | null | undefined): ResolutionPresetFamily {
-    const lowered = (modelName ?? "").toLowerCase();
-    if (lowered.includes("flux")) {
-        return "flux";
-    }
-    // Before the generic "turbo" match below so "krea2-turbo" is not read as Z-Image Turbo.
-    // Checked after "flux" so FLUX.1 Krea [dev] keeps Flux presets.
-    if (/krea[\s_-]*2/.test(lowered)) {
-        return "krea2_turbo";
-    }
-    if (lowered.includes("z-image") || lowered.includes("zimage") || lowered.includes("turbo")) {
-        return "zimage_turbo";
-    }
-    return "pony_sdxl";
 }
 
 function createEmptyForgeOverrides(): ForgePayloadOverrides {
@@ -344,6 +317,12 @@ export function PhotoViewer({
     onForgeSelectedLorasChange,
     forgeLoraWeight,
     onForgeLoraWeightChange,
+    forgeLoraWeights,
+    onForgeLoraWeightsChange,
+    forgeBatchCount,
+    onForgeBatchCountChange,
+    forgeSaveCopy,
+    onForgeSaveCopyChange,
     forgeIncludeSeed,
     forgeAdetailerFaceEnabled,
     forgeAdetailerFaceModel,
@@ -435,7 +414,8 @@ export function PhotoViewer({
         slideshowIntervalStorage
     );
     const [selectedResolutionFamily, setSelectedResolutionFamily] =
-        useState<ResolutionPresetFamily>("pony_sdxl");
+        useState<ModelFamilyId>("unknown");
+    const [filterModelsByFamily, setFilterModelsByFamily] = useState(false);
     const [isLoraDropdownOpen, setIsLoraDropdownOpen] = useState(false);
     const [loraSearch, setLoraSearch] = useState("");
     const [promptSectionOpen, setPromptSectionOpen] = usePersistedState(
@@ -458,6 +438,15 @@ export function PhotoViewer({
         false,
         booleanStorage
     );
+    const [upscaleSectionOpen, setUpscaleSectionOpen] = usePersistedState(
+        "forgeSectionUpscaleOpen",
+        false,
+        booleanStorage
+    );
+    const [forgeUpscalerOptions, setForgeUpscalerOptions] = useState<string[]>([]);
+    const [selectedUpscaler, setSelectedUpscaler] = useState<string>("");
+    const [upscaleScale, setUpscaleScale] = useState<number>(2.0);
+    const [isUpscaling, setIsUpscaling] = useState<boolean>(false);
 
     const panOriginRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(
         null
@@ -592,7 +581,10 @@ export function PhotoViewer({
     const selectedResolutionPreset = useMemo(() => {
         const width = forgeOverrides.width.trim();
         const height = forgeOverrides.height.trim();
-        const presets = RESOLUTION_PRESETS[selectedResolutionFamily];
+        const presets =
+            RESOLUTION_PRESETS[selectedResolutionFamily] ??
+            RESOLUTION_PRESETS["unknown"] ??
+            [];
         const match = presets.find(
             (option) => option.width === width && option.height === height
         );
@@ -612,12 +604,15 @@ export function PhotoViewer({
     }, [forgeModelOptions]);
 
     const familyCompatibleModelOptions = useMemo(() => {
+        if (!filterModelsByFamily) {
+            return modelDropdownOptions;
+        }
         const compatible = modelDropdownOptions.filter(
             (modelName) =>
                 detectResolutionFamilyFromModelName(modelName) === detectedModelFamily
         );
         return compatible.length > 0 ? compatible : modelDropdownOptions;
-    }, [detectedModelFamily, modelDropdownOptions]);
+    }, [detectedModelFamily, filterModelsByFamily, modelDropdownOptions]);
 
     const samplerDropdownOptions = useMemo(() => {
         const current = forgeOverrides.sampler_name.trim();
@@ -706,10 +701,32 @@ export function PhotoViewer({
             ),
         [forgeLoraWeight]
     );
+    const loraWeightErrors = useMemo(() => {
+        const errors: Record<string, string | null> = {};
+        for (const lora of forgeSelectedLoras) {
+            errors[lora] = validateOptionalFloat(
+                forgeLoraWeights[lora] ?? "",
+                FORGE_LORA_WEIGHT_MIN,
+                FORGE_LORA_WEIGHT_MAX,
+                `Weight for ${lora}`
+            );
+        }
+        return errors;
+    }, [forgeLoraWeights, forgeSelectedLoras]);
+    const loraWeightErrorMessages = Object.values(loraWeightErrors).filter(
+        (message): message is string => message != null
+    );
+    const effectiveLoraWeights = useMemo(
+        () => buildLoraWeightMap(forgeSelectedLoras, forgeLoraWeights),
+        [forgeLoraWeights, forgeSelectedLoras]
+    );
+    const batchCountParse = useMemo(() => parseBatchCount(forgeBatchCount), [forgeBatchCount]);
     const hasForgeValidationErrors =
         stepsValidationError != null ||
         cfgScaleValidationError != null ||
-        loraWeightValidationError != null;
+        loraWeightValidationError != null ||
+        loraWeightErrorMessages.length > 0 ||
+        batchCountParse.error != null;
     const forgeUrlValidationError = useMemo(() => {
         const normalized = forgeBaseUrl.trim();
         if (!normalized) {
@@ -886,11 +903,30 @@ export function PhotoViewer({
             setForgeOptionsWarning(
                 options.warnings.length > 0 ? options.warnings.join(" | ") : null
             );
+
+            try {
+                const upscalers = await forgeGetUpscalers(
+                    forgeBaseUrl,
+                    forgeApiKey.trim() ? forgeApiKey : null
+                );
+                setForgeUpscalerOptions(upscalers);
+                setSelectedUpscaler((prev) => {
+                    if (prev && upscalers.includes(prev)) return prev;
+                    const defaultChoice =
+                        upscalers.find((u) => u.includes("R-ESRGAN 4x+")) ??
+                        upscalers[0] ??
+                        "";
+                    return defaultChoice;
+                });
+            } catch {
+                setForgeUpscalerOptions([]);
+            }
         } catch (error) {
             setForgeModelOptions([]);
             setForgeLoraOptions([]);
             setForgeSamplerOptions([]);
             setForgeSchedulerOptions([]);
+            setForgeUpscalerOptions([]);
             setForgeOptionsWarning(`Forge options unavailable: ${String(error)}`);
         } finally {
             setIsLoadingForgeOptions(false);
@@ -1146,6 +1182,19 @@ export function PhotoViewer({
         setForgeOverrides((prev) => ({ ...prev, width, height }));
     }, []);
 
+    const removeSelectedLora = useCallback(
+        (loraToken: string) => {
+            onForgeSelectedLorasChange(
+                forgeSelectedLoras.filter((value) => value !== loraToken)
+            );
+            if (loraToken in forgeLoraWeights) {
+                const { [loraToken]: _dropped, ...rest } = forgeLoraWeights;
+                onForgeLoraWeightsChange(rest);
+            }
+        },
+        [forgeLoraWeights, forgeSelectedLoras, onForgeLoraWeightsChange, onForgeSelectedLorasChange]
+    );
+
     const toggleLoraSelection = useCallback(
         (loraToken: string) => {
             const token = loraToken.trim();
@@ -1153,23 +1202,19 @@ export function PhotoViewer({
                 return;
             }
             if (forgeSelectedLoras.includes(token)) {
-                onForgeSelectedLorasChange(
-                    forgeSelectedLoras.filter((value) => value !== token)
-                );
+                removeSelectedLora(token);
                 return;
             }
             onForgeSelectedLorasChange([...forgeSelectedLoras, token]);
         },
-        [forgeSelectedLoras, onForgeSelectedLorasChange]
+        [forgeSelectedLoras, onForgeSelectedLorasChange, removeSelectedLora]
     );
 
-    const removeSelectedLora = useCallback(
-        (loraToken: string) => {
-            onForgeSelectedLorasChange(
-                forgeSelectedLoras.filter((value) => value !== loraToken)
-            );
+    const setLoraWeight = useCallback(
+        (loraToken: string, value: string) => {
+            onForgeLoraWeightsChange({ ...forgeLoraWeights, [loraToken]: value });
         },
-        [forgeSelectedLoras, onForgeSelectedLorasChange]
+        [forgeLoraWeights, onForgeLoraWeightsChange]
     );
 
     const showViewerToast = useCallback(
@@ -1306,11 +1351,13 @@ export function PhotoViewer({
             );
             onForgeSelectedLorasChange(preset.lora_tokens ?? []);
             onForgeLoraWeightChange(preset.lora_weight || "1.0");
+            onForgeLoraWeightsChange(preset.lora_weights ?? {});
             showViewerToast(`Loaded preset: ${name}`, "success", 2400);
         },
         [
             forgePayloadPresets,
             onForgeLoraWeightChange,
+            onForgeLoraWeightsChange,
             onForgeSelectedLorasChange,
             showViewerToast,
         ]
@@ -1331,6 +1378,11 @@ export function PhotoViewer({
                 adetailerFaceModelForCurrentRequest || "face_yolov8n.pt",
             lora_tokens: [...forgeSelectedLoras],
             lora_weight: forgeLoraWeight || "1.0",
+            lora_weights: Object.fromEntries(
+                forgeSelectedLoras
+                    .filter((lora) => (forgeLoraWeights[lora] ?? "").trim() !== "")
+                    .map((lora) => [lora, forgeLoraWeights[lora]])
+            ),
         };
 
         setForgePayloadPresets((prev) => ({ ...prev, [name]: preset }));
@@ -1340,6 +1392,7 @@ export function PhotoViewer({
     }, [
         adetailerFaceModelForCurrentRequest,
         forgeLoraWeight,
+        forgeLoraWeights,
         forgeOverrides,
         forgePresetNameInput,
         forgeSelectedLoras,
@@ -1817,6 +1870,12 @@ export function PhotoViewer({
         const handleKeyDown = (event: KeyboardEvent) => {
             const key = event.key.toLowerCase();
 
+            // Typing in a field (preset name, prompt, ...) must not drive the viewer. Escape is
+            // the one exception so the viewer can still be closed.
+            if (event.key !== "Escape" && isTypingTarget(event.target)) {
+                return;
+            }
+
             if (event.key === "Escape") {
                 event.preventDefault();
                 if (isSlideshow) {
@@ -2131,6 +2190,13 @@ export function PhotoViewer({
                                                     alt={image.filename}
                                                     loading="lazy"
                                                     decoding="async"
+                                                    onError={(e) => {
+                                                        const target = e.currentTarget;
+                                                        const fallback = toAssetSrc(image.filepath);
+                                                        if (target.src !== fallback) {
+                                                            target.src = fallback;
+                                                        }
+                                                    }}
                                                 />
                                             ) : (
                                                 <span className="photo-viewer-thumb-loading">
@@ -2775,14 +2841,15 @@ export function PhotoViewer({
                                                     value={selectedResolutionFamily}
                                                     onChange={(event) =>
                                                         setSelectedResolutionFamily(
-                                                            event.target.value as ResolutionPresetFamily
+                                                            event.target.value as ModelFamilyId
                                                         )
                                                     }
                                                 >
-                                                    <option value="pony_sdxl">PonyXL / SDXL</option>
-                                                    <option value="flux">Flux</option>
-                                                    <option value="zimage_turbo">Z-Image Turbo</option>
-                                                    <option value="krea2_turbo">Krea 2 Turbo</option>
+                                                    {MODEL_FAMILIES.map((family) => (
+                                                        <option key={family.id} value={family.id}>
+                                                            {family.label}
+                                                        </option>
+                                                    ))}
                                                 </select>
                                                 <div className="sidebar-help">
                                                     Detected family: {detectedModelFamily} | functionality:{" "}
@@ -2797,7 +2864,11 @@ export function PhotoViewer({
                                                     }
                                                 >
                                                     <option value="custom">Custom</option>
-                                                    {RESOLUTION_PRESETS[selectedResolutionFamily].map((option) => (
+                                                    {(
+                                                        RESOLUTION_PRESETS[selectedResolutionFamily] ??
+                                                        RESOLUTION_PRESETS["unknown"] ??
+                                                        []
+                                                    ).map((option) => (
                                                         <option
                                                             key={`${option.width}x${option.height}`}
                                                             value={`${option.width}x${option.height}`}
@@ -2840,6 +2911,14 @@ export function PhotoViewer({
                                             </summary>
                                             <div className="viewer-section-content">
                                                 <div className="viewer-form-label">Model Checkpoint</div>
+                                                <label className="viewer-toggle-row" style={{ margin: "2px 0 6px 0", fontSize: "12px" }}>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={filterModelsByFamily}
+                                                        onChange={(event) => setFilterModelsByFamily(event.target.checked)}
+                                                    />
+                                                    Filter to detected family ({detectedModelFamily})
+                                                </label>
                                                 <select
                                                     className="viewer-input"
                                                     value={
@@ -2849,9 +2928,16 @@ export function PhotoViewer({
                                                             ? forgeOverrides.model_name
                                                             : ""
                                                     }
-                                                    onChange={(event) =>
-                                                        updateForgeOverride("model_name", event.target.value)
-                                                    }
+                                                    onChange={(event) => {
+                                                        const newModel = event.target.value;
+                                                        updateForgeOverride("model_name", newModel);
+                                                        if (newModel) {
+                                                            const targetFamily = detectResolutionFamilyFromModelName(newModel);
+                                                            if (targetFamily !== "unknown") {
+                                                                setSelectedResolutionFamily(targetFamily);
+                                                            }
+                                                        }
+                                                    }}
                                                 >
                                                     <option value="">Model checkpoint (none/default)</option>
                                                     {familyCompatibleModelOptions.map((model) => (
@@ -2944,21 +3030,56 @@ export function PhotoViewer({
                                                     )}
                                                 </div>
                                                 {forgeSelectedLoras.length > 0 && (
-                                                    <div className="viewer-tag-chip-list">
+                                                    <div
+                                                        className="viewer-lora-weight-list"
+                                                        data-testid="lora-weight-list"
+                                                    >
                                                         {forgeSelectedLoras.map((lora) => (
-                                                            <button
-                                                                key={lora}
-                                                                className="viewer-tag-chip"
-                                                                onClick={() => removeSelectedLora(lora)}
-                                                                title="Remove LoRA"
-                                                                type="button"
-                                                            >
-                                                                {lora}
-                                                            </button>
+                                                            <div key={lora} className="viewer-lora-weight-row">
+                                                                <span
+                                                                    className="viewer-lora-weight-name"
+                                                                    title={lora}
+                                                                >
+                                                                    {lora}
+                                                                </span>
+                                                                <input
+                                                                    className={`viewer-input viewer-lora-weight-input ${
+                                                                        loraWeightErrors[lora] ? "input-invalid" : ""
+                                                                    }`}
+                                                                    value={forgeLoraWeights[lora] ?? ""}
+                                                                    placeholder={forgeLoraWeight.trim() || "1.0"}
+                                                                    inputMode="decimal"
+                                                                    aria-label={`Weight for ${lora}`}
+                                                                    aria-invalid={loraWeightErrors[lora] != null}
+                                                                    onChange={(event) =>
+                                                                        setLoraWeight(lora, event.target.value)
+                                                                    }
+                                                                />
+                                                                <button
+                                                                    type="button"
+                                                                    className="viewer-tag-chip"
+                                                                    onClick={() => removeSelectedLora(lora)}
+                                                                    title="Remove LoRA"
+                                                                    aria-label={`Remove ${lora}`}
+                                                                >
+                                                                    ×
+                                                                </button>
+                                                            </div>
+                                                        ))}
+                                                        {loraWeightErrorMessages.map((message) => (
+                                                            <div key={message} className="input-error" role="alert">
+                                                                {message}
+                                                            </div>
                                                         ))}
                                                     </div>
                                                 )}
-                                                <div className="viewer-form-label">LoRA Weight</div>
+                                                <div className="viewer-form-label">
+                                                    Default LoRA weight
+                                                    <span className="viewer-form-hint">
+                                                        {" "}
+                                                        (used for LoRAs without their own weight)
+                                                    </span>
+                                                </div>
                                                 <div className="viewer-form-grid">
                                                     <input
                                                         className="viewer-input"
@@ -3020,10 +3141,140 @@ export function PhotoViewer({
                                                 </select>
                                             </div>
                                         </details>
+
+                                        {/* 5. Upscale section */}
+                                        <details
+                                            open={upscaleSectionOpen}
+                                            onToggle={(e) => setUpscaleSectionOpen(e.currentTarget.open)}
+                                            data-testid="forge-section-upscale"
+                                            className="viewer-collapsible-section"
+                                        >
+                                            <summary className="viewer-section-summary">
+                                                <span className="viewer-summary-title">Upscale</span>
+                                            </summary>
+                                            <div className="viewer-section-content">
+                                                <div className="viewer-form-label">Upscaler</div>
+                                                <select
+                                                    className="viewer-input"
+                                                    value={selectedUpscaler}
+                                                    onChange={(e) => setSelectedUpscaler(e.target.value)}
+                                                    disabled={forgeUpscalerOptions.length === 0}
+                                                >
+                                                    {forgeUpscalerOptions.length === 0 ? (
+                                                        <option value="">No upscalers available (check Forge connection)</option>
+                                                    ) : (
+                                                        forgeUpscalerOptions.map((name) => (
+                                                            <option key={name} value={name}>
+                                                                {name}
+                                                            </option>
+                                                        ))
+                                                    )}
+                                                </select>
+
+                                                <div className="viewer-form-label">Scale Factor</div>
+                                                <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
+                                                    {[1.5, 2.0, 4.0].map((factor) => (
+                                                        <button
+                                                            key={factor}
+                                                            type="button"
+                                                            className={`viewer-ghost-button ${upscaleScale === factor ? "active" : ""}`}
+                                                            style={{
+                                                                flex: 1,
+                                                                padding: "6px 0",
+                                                                fontWeight: upscaleScale === factor ? "bold" : "normal",
+                                                                background:
+                                                                    upscaleScale === factor
+                                                                        ? "var(--color-accent-subtle, rgba(255,255,255,0.15))"
+                                                                        : undefined,
+                                                            }}
+                                                            onClick={() => setUpscaleScale(factor)}
+                                                        >
+                                                            {factor}x
+                                                        </button>
+                                                    ))}
+                                                </div>
+
+                                                <button
+                                                    type="button"
+                                                    className="viewer-action-button primary"
+                                                    style={{ width: "100%", marginTop: "4px" }}
+                                                    disabled={
+                                                        !hasValidForgeUrl ||
+                                                        !selectedUpscaler ||
+                                                        isUpscaling ||
+                                                        !currentImage
+                                                    }
+                                                    onClick={async () => {
+                                                        if (!currentImage) return;
+                                                        setIsUpscaling(true);
+                                                        try {
+                                                            const result = await forgeUpscaleImage({
+                                                                imageId: currentImage.id,
+                                                                baseUrl: forgeBaseUrl,
+                                                                apiKey: forgeApiKey.trim() ? forgeApiKey : null,
+                                                                upscaler: selectedUpscaler,
+                                                                scale: upscaleScale,
+                                                                outputDir: forgeOutputDir.trim() ? forgeOutputDir : null,
+                                                            });
+                                                            if (result.ok) {
+                                                                showViewerToast(result.message, "success");
+                                                            } else {
+                                                                showViewerToast(result.message, "error");
+                                                            }
+                                                        } catch (err) {
+                                                            showViewerToast(`Upscale failed: ${String(err)}`, "error");
+                                                        } finally {
+                                                            setIsUpscaling(false);
+                                                        }
+                                                    }}
+                                                >
+                                                    {isUpscaling ? (
+                                                        <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                                                            <span className="spinner small" /> Upscaling with Forge…
+                                                        </span>
+                                                    ) : (
+                                                        `Upscale with Forge (${upscaleScale}x)`
+                                                    )}
+                                                </button>
+                                            </div>
+                                        </details>
                                     </section>
 
                                     {/* Sticky footer with Send to Forge */}
                                     <div className="viewer-forge-sticky-footer">
+                                        <div className="viewer-forge-send-options">
+                                            <label className="viewer-batch-count-field">
+                                                <span>Images per send</span>
+                                                <input
+                                                    className={`viewer-input viewer-batch-count-input ${
+                                                        batchCountParse.error ? "input-invalid" : ""
+                                                    }`}
+                                                    value={forgeBatchCount}
+                                                    placeholder="1"
+                                                    inputMode="numeric"
+                                                    aria-label="Images per send"
+                                                    aria-invalid={batchCountParse.error != null}
+                                                    onChange={(event) =>
+                                                        onForgeBatchCountChange(event.target.value)
+                                                    }
+                                                />
+                                            </label>
+                                            <label className="viewer-toggle-row">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={forgeSaveCopy}
+                                                    onChange={(event) =>
+                                                        onForgeSaveCopyChange(event.target.checked)
+                                                    }
+                                                />
+                                                Also let Forge save its own copy
+                                            </label>
+                                            {batchCountParse.error && (
+                                                <div className="input-error" role="alert">
+                                                    {batchCountParse.error}
+                                                </div>
+                                            )}
+                                        </div>
                                         <ForgeRequeueButton
                                             imageId={currentImage?.id}
                                             baseUrl={forgeBaseUrl}
@@ -3048,6 +3299,9 @@ export function PhotoViewer({
                                                     ? Number(forgeLoraWeight)
                                                     : null
                                             }
+                                            loraWeights={effectiveLoraWeights}
+                                            batchCount={batchCountParse.value}
+                                            saveForgeCopy={forgeSaveCopy}
                                             overrides={forgeOverrides}
                                             disabled={
                                                 !hasValidForgeUrl ||

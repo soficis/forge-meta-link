@@ -877,15 +877,49 @@ fn append_model_filter(
     params.push(Value::Text(normalized.to_string()));
 }
 
+const FAMILY_PATTERNS_QWEN_IMAGE: &[&str] = &[
+    "%qwen2512%",
+    "%qwen_2512%",
+    "%qwen-2512%",
+    "%qwen-image%",
+    "%qwen_image%",
+    "%qwen2.5%",
+    "%qwen%",
+];
 const FAMILY_PATTERNS_PONYXL: &[&str] = &["%ponyxl%", "%pony xl%", "%pony diffusion%", "%pony%"];
-const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%"];
+const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%", "%sd_xl%", "%sd-xl%"];
 const FAMILY_PATTERNS_FLUX: &[&str] = &["%flux%"];
 const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] =
     &["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"];
 // "_" is a single-character LIKE wildcard, so "%krea_2%" covers "krea 2", "krea-2" and "krea_2".
 const FAMILY_PATTERNS_KREA2_TURBO: &[&str] = &["%krea2%", "%krea_2%"];
-const FAMILY_PATTERNS_SD15:&[&str] = &["%sd1.5%", "%sd15%", "%stable diffusion 1.5%"];
-const FAMILY_PATTERNS_SD21: &[&str] = &["%sd2.1%", "%sd21%", "%stable diffusion 2.1%"];
+const FAMILY_PATTERNS_SD35: &[&str] = &["%sd3.5%", "%sd35%", "%sd_3.5%", "%sd-3.5%"];
+const FAMILY_PATTERNS_SD3: &[&str] = &["%sd3%", "%sd_3%", "%sd-3%", "%stable diffusion 3%"];
+const FAMILY_PATTERNS_SD15: &[&str] = &[
+    "%sd1.5%",
+    "%sd15%",
+    "%sd_1.5%",
+    "%sd-1.5%",
+    "%stable diffusion 1.5%",
+    "%v1-5%",
+];
+const FAMILY_PATTERNS_SD21: &[&str] = &[
+    "%sd2.1%",
+    "%sd21%",
+    "%sd_2.1%",
+    "%sd-2.1%",
+    "%stable diffusion 2.1%",
+    "%v2-1%",
+];
+const FAMILY_PATTERNS_LUMINA: &[&str] = &["%lumina%"];
+const FAMILY_PATTERNS_PIXART: &[&str] = &["%pixart%"];
+const FAMILY_PATTERNS_KOLORS: &[&str] = &["%kolors%"];
+const FAMILY_PATTERNS_AURAFLOW: &[&str] = &["%auraflow%"];
+const FAMILY_PATTERNS_HUNYUAN: &[&str] = &["%hunyuan%"];
+const FAMILY_PATTERNS_SANA: &[&str] =
+    &["%sana_%", "%sana-%", "%_sana%", "%-sana%", "%sana.safetensors%"];
+const FAMILY_PATTERNS_WAN: &[&str] =
+    &["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
 const FAMILY_PATTERNS_VACE: &[&str] = &["%vace%"];
 
@@ -898,13 +932,25 @@ fn normalize_model_family(value: &str) -> Option<&'static str> {
         .collect();
 
     match compact.as_str() {
-        "pony" | "ponyxl" => Some("ponyxl"),
-        "sdxl" => Some("sdxl"),
-        "flux" => Some("flux"),
+        "qwen" | "qwenimage" | "qwen2512" | "qwen25" | "qwen25image" | "qwen2512b" => {
+            Some("qwen_image")
+        }
+        "pony" | "ponyxl" | "ponydiffusion" => Some("ponyxl"),
+        "sdxl" | "stablediffusionxl" => Some("sdxl"),
+        "flux" | "flux1" | "fluxdev" | "fluxschnell" | "fluxkontext" => Some("flux"),
         "zimage" | "zimageturbo" => Some("zimage_turbo"),
         "krea2" | "krea2turbo" => Some("krea2_turbo"),
-        "sd15" | "stablediffusion15" | "sdv15" => Some("sd15"),
-        "sd21" | "stablediffusion21" | "sdv21" => Some("sd21"),
+        "sd35" | "sd35large" | "sd35medium" => Some("sd35"),
+        "sd3" | "sd3medium" | "stablediffusion3" => Some("sd3"),
+        "sd15" | "stablediffusion15" | "sdv15" | "sd1" => Some("sd15"),
+        "sd21" | "stablediffusion21" | "sdv21" | "sd2" => Some("sd21"),
+        "lumina" | "luminanext" | "lumina2" => Some("lumina"),
+        "pixart" | "pixartalpha" | "pixartsigma" => Some("pixart"),
+        "kolors" => Some("kolors"),
+        "auraflow" => Some("auraflow"),
+        "hunyuan" | "hunyuandit" | "hunyuanvideo" => Some("hunyuan"),
+        "sana" => Some("sana"),
+        "wan" | "wan2" | "wan21" | "wan22" | "wanvideo" => Some("wan"),
         "chroma" => Some("chroma"),
         "vace" => Some("vace"),
         _ => None,
@@ -932,13 +978,23 @@ fn normalize_model_family_filters(model_family_filters: Option<&[String]>) -> Ve
 
 fn family_patterns(family: &str) -> &'static [&'static str] {
     match family {
+        "qwen_image" | "qwen" => FAMILY_PATTERNS_QWEN_IMAGE,
         "ponyxl" => FAMILY_PATTERNS_PONYXL,
         "sdxl" => FAMILY_PATTERNS_SDXL,
         "flux" => FAMILY_PATTERNS_FLUX,
         "zimage_turbo" => FAMILY_PATTERNS_ZIMAGE_TURBO,
         "krea2_turbo" => FAMILY_PATTERNS_KREA2_TURBO,
+        "sd35" => FAMILY_PATTERNS_SD35,
+        "sd3" => FAMILY_PATTERNS_SD3,
         "sd15" => FAMILY_PATTERNS_SD15,
         "sd21" => FAMILY_PATTERNS_SD21,
+        "lumina" => FAMILY_PATTERNS_LUMINA,
+        "pixart" => FAMILY_PATTERNS_PIXART,
+        "kolors" => FAMILY_PATTERNS_KOLORS,
+        "auraflow" => FAMILY_PATTERNS_AURAFLOW,
+        "hunyuan" => FAMILY_PATTERNS_HUNYUAN,
+        "sana" => FAMILY_PATTERNS_SANA,
+        "wan" => FAMILY_PATTERNS_WAN,
         "chroma" => FAMILY_PATTERNS_CHROMA,
         "vace" => FAMILY_PATTERNS_VACE,
         _ => &[],
@@ -1122,6 +1178,32 @@ mod tests {
         assert_eq!(normalize_model_family("flux1-krea-dev"), None);
     }
 
+    #[test]
+    fn qwen_and_all_model_families_normalize_and_have_patterns() {
+        for raw in ["qwen2512", "qwen-image", "Qwen 2.5", "qwen25", "qwen"] {
+            assert_eq!(normalize_model_family(raw), Some("qwen_image"), "{raw}");
+        }
+        assert_eq!(family_patterns("qwen_image"), FAMILY_PATTERNS_QWEN_IMAGE);
+
+        assert_eq!(normalize_model_family("sd35"), Some("sd35"));
+        assert_eq!(normalize_model_family("sd3.5"), Some("sd35"));
+        assert_eq!(normalize_model_family("sd3"), Some("sd3"));
+
+        assert_eq!(normalize_model_family("sd15"), Some("sd15"));
+        assert_eq!(normalize_model_family("sd21"), Some("sd21"));
+        assert_eq!(normalize_model_family("lumina"), Some("lumina"));
+        assert_eq!(normalize_model_family("pixart"), Some("pixart"));
+        assert_eq!(normalize_model_family("kolors"), Some("kolors"));
+        assert_eq!(normalize_model_family("auraflow"), Some("auraflow"));
+        assert_eq!(normalize_model_family("hunyuan"), Some("hunyuan"));
+        assert_eq!(normalize_model_family("sana"), Some("sana"));
+        assert_eq!(normalize_model_family("wan2"), Some("wan"));
+
+        // Unknown models must return None
+        assert_eq!(normalize_model_family("custom_random_model_v1"), None);
+        assert_eq!(normalize_model_family("unknown"), None);
+    }
+
     fn insert_with_prompt(db: &Database, filepath: &str, prompt: &str, tags: &[&str]) {
         let params = GenerationParams {
             prompt: prompt.to_string(),
@@ -1222,10 +1304,7 @@ mod tests {
             vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
         );
         // several exclusions combine
-        assert_eq!(
-            search_paths(&db, "-girl -boy"),
-            vec!["e_girlfriend.png"]
-        );
+        assert_eq!(search_paths(&db, "-girl -boy"), vec!["e_girlfriend.png"]);
         // excluding something nothing has returns the whole library
         assert_eq!(search_paths(&db, "-unicorn").len(), 5);
         // a query of only punctuation is still empty
@@ -1267,7 +1346,10 @@ mod tests {
         // no tag rows at all: only the FTS fallback decides. "girl" is in the prompt of
         // a/b, and only in the NEGATIVE prompt of d.
         let excluded = filter_paths_tags(&db, &[], &["girl".to_string()]);
-        assert_eq!(excluded, vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]);
+        assert_eq!(
+            excluded,
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
         let included = filter_paths_tags(&db, &["girl".to_string()], &[]);
         assert_eq!(included, vec!["a_girl.png", "b_girls.png"]);
 

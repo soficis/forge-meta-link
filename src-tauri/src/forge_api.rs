@@ -54,11 +54,36 @@ pub struct ForgeSendResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeUpscalePayload {
+    pub image: String,
+    pub upscaler_1: String,
+    pub upscaling_resize: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upscaler_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extras_upscaler_2_visibility: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeUpscaleResult {
+    pub ok: bool,
+    pub image: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ForgeTxt2ImgResponse {
     #[serde(default)]
     images: Vec<String>,
     info: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ForgeExtraSingleImageResponse {
+    pub image: Option<String>,
+    #[allow(dead_code)]
+    pub html_info: Option<String>,
 }
 
 const SDAPI_PREFIX: &str = "/sdapi/v1";
@@ -97,6 +122,66 @@ pub async fn test_connection(
     Ok(ForgeStatus { ok: false, message })
 }
 
+async fn read_bounded_bytes(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if buffer.len() + chunk.len() > max_bytes {
+            return Err(std::io::Error::other(format!(
+                "Response size exceeded limit of {} bytes",
+                max_bytes
+            ))
+            .into());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
+async fn extract_error_message(
+    response: reqwest::Response,
+    endpoint: &str,
+    fallback_not_found: bool,
+) -> String {
+    let status = response.status();
+    const MAX_ERROR_BODY_BYTES: usize = 4096;
+    let err_text = match read_bounded_bytes(response, MAX_ERROR_BODY_BYTES).await {
+        Ok(bytes) => {
+            if let Ok(err_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                err_json
+                    .get("message")
+                    .or_else(|| err_json.get("detail"))
+                    .or_else(|| err_json.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string())
+            } else {
+                String::from_utf8_lossy(&bytes).trim().to_string()
+            }
+        }
+        Err(_) => String::new(),
+    };
+
+    if status == StatusCode::NOT_FOUND && fallback_not_found {
+        format!(
+            "Forge request failed with status {} at {}. Start Forge with --api and use a base URL like http://127.0.0.1:7860 (without /sdapi/v1).",
+            status, endpoint
+        )
+    } else if !err_text.is_empty() {
+        format!(
+            "Forge request failed with status {} at {}: {}",
+            status, endpoint, err_text
+        )
+    } else {
+        format!(
+            "Forge request failed with status {} at {}",
+            status, endpoint
+        )
+    }
+}
+
 pub async fn send_to_forge(
     payload: &ForgePayload,
     base_url: &str,
@@ -132,19 +217,7 @@ pub async fn send_to_forge(
         }
     };
     if !response.status().is_success() {
-        let status = response.status();
-        let message = if status == StatusCode::NOT_FOUND {
-            format!(
-                "Forge request failed with status {} at {}. Start Forge with --api and use a base URL like http://127.0.0.1:7860 (without /sdapi/v1).",
-                status, endpoint
-            )
-        } else {
-            format!(
-                "Forge request failed with status {} at {}",
-                status, endpoint
-            )
-        };
-
+        let message = extract_error_message(response, &endpoint, true).await;
         return Ok(ForgeSendResult {
             ok: false,
             images: Vec::new(),
@@ -153,7 +226,10 @@ pub async fn send_to_forge(
         });
     }
 
-    let body: ForgeTxt2ImgResponse = response.json().await?;
+    let n_iter = payload.n_iter.unwrap_or(1) as usize;
+    let max_bytes = (128 * 1024 * 1024 * n_iter).clamp(128 * 1024 * 1024, 1024 * 1024 * 1024);
+    let bytes = read_bounded_bytes(response, max_bytes).await?;
+    let body: ForgeTxt2ImgResponse = serde_json::from_slice(&bytes)?;
     Ok(ForgeSendResult {
         ok: true,
         images: body.images,
@@ -183,6 +259,259 @@ pub async fn list_models(
     list_named_options(base_url, api_key, "sd-models").await
 }
 
+pub async fn list_upscalers(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    list_named_options(base_url, api_key, "upscalers").await
+}
+
+pub async fn get_forge_options(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let client = build_client(api_key, TEST_TIMEOUT_SECONDS)?;
+    let endpoint = build_sdapi_endpoint(base_url, "options");
+    let response = client.get(&endpoint).send().await?;
+    if !response.status().is_success() {
+        return Err(std::io::Error::other(format!(
+            "Request failed for {} with status {}",
+            endpoint,
+            response.status()
+        ))
+        .into());
+    }
+    const MAX_OPTIONS_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    let bytes = read_bounded_bytes(response, MAX_OPTIONS_RESPONSE_BYTES).await?;
+    let val: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(val)
+}
+
+pub fn enrich_override_settings_from_forge_options(
+    payload: &mut ForgePayload,
+    target_model: &str,
+    opts: &serde_json::Value,
+) {
+    let is_forge_neo = opts.get("forge_preset").is_some()
+        || opts.get("forge_additional_modules").is_some()
+        || opts.as_object().is_some_and(|map| {
+            map.keys().any(|k| k.starts_with("forge_additional_modules_"))
+        });
+
+    if !is_forge_neo {
+        return;
+    }
+
+    const FORGE_PRESETS: &[&str] = &[
+        "zit", "krea", "qwen", "flux", "klein", "anima", "lumina", "wan", "ernie", "pid", "xl", "sd",
+    ];
+
+    let target_lower = target_model.to_ascii_lowercase();
+    let target_clean = target_lower
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".ckpt")
+        .trim();
+
+    let mut matched_preset = None;
+
+    // 1. Check if target_model matches any forge_checkpoint_{preset} configured in Forge
+    for &preset in FORGE_PRESETS {
+        let key = format!("forge_checkpoint_{}", preset);
+        if let Some(cp_str) = opts.get(&key).and_then(|v| v.as_str()) {
+            let cp_clean = cp_str
+                .to_ascii_lowercase()
+                .trim_end_matches(".safetensors")
+                .trim_end_matches(".gguf")
+                .trim_end_matches(".ckpt")
+                .trim()
+                .to_string();
+
+            if !cp_clean.is_empty()
+                && (target_clean == cp_clean
+                    || target_clean.contains(&cp_clean)
+                    || cp_clean.contains(target_clean))
+            {
+                matched_preset = Some(preset);
+                break;
+            }
+        }
+    }
+
+    // 2. Fall back to model architecture classifier heuristics for Forge Neo presets
+    if matched_preset.is_none() {
+        if target_lower.contains("z_image")
+            || target_lower.contains("z-image")
+            || target_lower.contains("zimage")
+        {
+            matched_preset = Some("zit");
+        } else if target_lower.contains("krea") {
+            matched_preset = Some("krea");
+        } else if target_lower.contains("qwen") {
+            matched_preset = Some("qwen");
+        } else if target_lower.contains("klein")
+            || target_lower.contains("flux-2")
+            || target_lower.contains("flux2")
+        {
+            matched_preset = Some("klein");
+        } else if target_lower.contains("flux") {
+            matched_preset = Some("flux");
+        } else if target_lower.contains("anima") {
+            matched_preset = Some("anima");
+        } else if target_lower.contains("lumina") {
+            matched_preset = Some("lumina");
+        } else if target_lower.contains("wan") {
+            matched_preset = Some("wan");
+        } else if target_lower.contains("ernie") {
+            matched_preset = Some("ernie");
+        } else if target_lower.contains("pid") {
+            matched_preset = Some("pid");
+        } else if target_lower.contains("pony")
+            || target_lower.contains("sdxl")
+            || target_lower.contains("sd_xl")
+        {
+            matched_preset = Some("xl");
+        } else if target_lower.contains("sd15")
+            || target_lower.contains("v1-5")
+            || target_lower.contains("sd1.5")
+            || target_lower.contains("sd21")
+            || target_lower.contains("v2-1")
+            || target_lower.contains("sd2.1")
+        {
+            matched_preset = Some("sd");
+        }
+    }
+
+    if let Some(preset) = matched_preset {
+        let modules_key = format!("forge_additional_modules_{}", preset);
+        let dtype_key = format!("forge_unet_storage_dtype_{}", preset);
+
+        let modules_val = opts
+            .get(&modules_key)
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+
+        let mut overrides = match payload.override_settings.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+
+        overrides.insert("forge_additional_modules".to_string(), modules_val);
+
+        if let Some(dtype_str) = opts.get(&dtype_key).and_then(|v| v.as_str()) {
+            if !dtype_str.trim().is_empty() && dtype_str != "None" {
+                overrides.insert(
+                    "forge_unet_storage_dtype".to_string(),
+                    serde_json::Value::String(dtype_str.to_string()),
+                );
+            }
+        }
+
+        payload.override_settings = Some(serde_json::Value::Object(overrides));
+    }
+}
+
+pub async fn enrich_payload_for_forge_neo(
+    payload: &mut ForgePayload,
+    base_url: &str,
+    api_key: Option<&str>,
+) {
+    let target_model = payload
+        .override_settings
+        .as_ref()
+        .and_then(|ov| ov.get("sd_model_checkpoint"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+
+    let Some(target_model) = target_model else {
+        return;
+    };
+
+    if payload
+        .override_settings
+        .as_ref()
+        .and_then(|ov| ov.get("forge_additional_modules"))
+        .is_some()
+    {
+        return;
+    }
+
+    if let Ok(opts) = get_forge_options(base_url, api_key).await {
+        enrich_override_settings_from_forge_options(payload, &target_model, &opts);
+    }
+}
+
+pub async fn upscale_image(
+    payload: &ForgeUpscalePayload,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<ForgeUpscaleResult, Box<dyn Error + Send + Sync>> {
+    let warning = match validate_base_url(base_url) {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(ForgeUpscaleResult {
+                ok: false,
+                image: None,
+                message: e,
+            });
+        }
+    };
+    if let Some(w) = warning {
+        log::warn!("{}", w);
+    }
+
+    let client = build_client(api_key, SEND_TIMEOUT_SECONDS)?;
+    let endpoint = build_sdapi_endpoint(base_url, "extra-single-image");
+
+    let request_body = json!({
+        "resize_mode": 0,
+        "show_extras_results": true,
+        "upscaling_resize": payload.upscaling_resize,
+        "upscaler_1": payload.upscaler_1,
+        "upscaler_2": payload.upscaler_2.as_deref().unwrap_or("None"),
+        "extras_upscaler_2_visibility": payload.extras_upscaler_2_visibility.unwrap_or(0.0),
+        "image": payload.image,
+    });
+
+    let response = match client.post(&endpoint).json(&request_body).send().await {
+        Ok(res) => res,
+        Err(error) => {
+            return Ok(ForgeUpscaleResult {
+                ok: false,
+                image: None,
+                message: format_send_transport_error(&endpoint, &error),
+            });
+        }
+    };
+
+    if !response.status().is_success() {
+        let message = extract_error_message(response, &endpoint, false).await;
+        return Ok(ForgeUpscaleResult {
+            ok: false,
+            image: None,
+            message,
+        });
+    }
+
+    const MAX_UPSCALE_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+    let bytes = read_bounded_bytes(response, MAX_UPSCALE_RESPONSE_BYTES).await?;
+    let body: ForgeExtraSingleImageResponse = serde_json::from_slice(&bytes)?;
+
+    if let Some(img) = body.image {
+        Ok(ForgeUpscaleResult {
+            ok: true,
+            image: Some(img),
+            message: "Upscaling completed successfully".to_string(),
+        })
+    } else {
+        Ok(ForgeUpscaleResult {
+            ok: false,
+            image: None,
+            message: "Forge returned no image in response".to_string(),
+        })
+    }
+}
+
 pub struct ForgePayloadBuildInput<'a> {
     pub prompt: &'a str,
     pub negative_prompt: &'a str,
@@ -197,6 +526,7 @@ pub struct ForgePayloadBuildInput<'a> {
     pub include_seed: bool,
     pub adetailer_face_enabled: bool,
     pub adetailer_face_model: Option<&'a str>,
+    pub forge_additional_modules: Option<&'a [String]>,
 }
 
 /// Scheduler to send when re-generating a stored image: an explicit override wins, otherwise
@@ -225,6 +555,7 @@ pub struct RecordOverrides<'a> {
     pub model_name: Option<&'a str>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub forge_additional_modules: Option<&'a [String]>,
 }
 
 /// An override that is `None` or only whitespace counts as unset.
@@ -263,6 +594,7 @@ pub fn build_payload_for_record(
         include_seed,
         adetailer_face_enabled,
         adetailer_face_model,
+        forge_additional_modules: overrides.forge_additional_modules,
     })
 }
 
@@ -281,11 +613,19 @@ pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> For
         include_seed,
         adetailer_face_enabled,
         adetailer_face_model,
+        forge_additional_modules,
     } = input;
     let sampler_name = parse_optional_text(sampler);
     let scheduler = parse_optional_text(scheduler);
     let model_name = parse_optional_text(model_name);
-    let override_settings = model_name.map(|name| json!({ "sd_model_checkpoint": name }));
+    let override_settings = model_name.map(|name| {
+        let mut obj = serde_json::Map::new();
+        obj.insert("sd_model_checkpoint".to_string(), json!(name));
+        if let Some(modules) = forge_additional_modules {
+            obj.insert("forge_additional_modules".to_string(), json!(modules));
+        }
+        serde_json::Value::Object(obj)
+    });
     let alwayson_scripts =
         build_adetailer_alwayson_scripts(adetailer_face_enabled, adetailer_face_model);
 
@@ -449,7 +789,8 @@ pub async fn forge_requeue_image(
             message: format!("Forge not reachable: {}", status.message),
         });
     }
-    let payload = build_requeue_payload(params, include_seed);
+    let mut payload = build_requeue_payload(params, include_seed);
+    enrich_payload_for_forge_neo(&mut payload, base_url, api_key).await;
     let mut result = send_to_forge(&payload, base_url, api_key).await?;
     if result.ok {
         if let Some(info) = result.info.as_deref() {
@@ -556,7 +897,9 @@ async fn list_named_options(
         .into());
     }
 
-    let raw: Vec<serde_json::Value> = response.json().await?;
+    const MAX_OPTION_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    let bytes = read_bounded_bytes(response, MAX_OPTION_RESPONSE_BYTES).await?;
+    let raw: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
     Ok(collect_named_options(&raw))
 }
 
@@ -865,7 +1208,8 @@ mod tests {
             model_hash: None,
             model_name: Some("m.safetensors".into()),
             raw_metadata: "a cat
-Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 4294967299".into(),
+Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 4294967299"
+                .into(),
             is_favorite: false,
             is_locked: false,
         }
@@ -882,8 +1226,19 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 42949672
             model_name: Some(""),
             ..Default::default()
         };
-        let p = crate::forge_api::build_payload_for_record(&img, &img.prompt, &blank, true, false, None);
-        assert_eq!(p.steps, Some(20), "a cleared Steps box must not become Forge's default");
+        let p = crate::forge_api::build_payload_for_record(
+            &img,
+            &img.prompt,
+            &blank,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            p.steps,
+            Some(20),
+            "a cleared Steps box must not become Forge's default"
+        );
         assert_eq!(p.sampler_name.as_deref(), Some("Euler a"));
         assert_eq!(p.cfg_scale, Some(7.0));
         assert_eq!(p.seed, Some(4294967299));
@@ -898,9 +1253,13 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 42949672
             negative_prompt: Some(""),
             ..Default::default()
         };
-        let p = crate::forge_api::build_payload_for_record(&img, &img.prompt, &ov, true, false, None);
+        let p =
+            crate::forge_api::build_payload_for_record(&img, &img.prompt, &ov, true, false, None);
         assert_eq!(p.steps, Some(30));
-        assert_eq!(p.negative_prompt, "", "blank negative prompt is a legitimate choice");
+        assert_eq!(
+            p.negative_prompt, "",
+            "blank negative prompt is a legitimate choice"
+        );
     }
 
     #[test]
@@ -908,11 +1267,23 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 42949672
         let raw = "a cat
 Negative prompt: x
 Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 1, Size: 512x512";
-        assert_eq!(resolve_scheduler(Some("exponential"), raw).as_deref(), Some("exponential"));
+        assert_eq!(
+            resolve_scheduler(Some("exponential"), raw).as_deref(),
+            Some("exponential")
+        );
         assert_eq!(resolve_scheduler(None, raw).as_deref(), Some("Karras"));
-        assert_eq!(resolve_scheduler(Some("  "), raw).as_deref(), Some("Karras"));
-        assert_eq!(resolve_scheduler(None, "a cat
-Steps: 20, Sampler: Euler"), None);
+        assert_eq!(
+            resolve_scheduler(Some("  "), raw).as_deref(),
+            Some("Karras")
+        );
+        assert_eq!(
+            resolve_scheduler(
+                None,
+                "a cat
+Steps: 20, Sampler: Euler"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -924,7 +1295,10 @@ Steps: 20, Sampler: Euler"), None);
             build_payload_from_generation_params(&params, true, false, None),
         ] {
             assert!(payload.prompt.contains("<lora:style_a:0.7>"));
-            assert!(payload.alwayson_scripts.is_none(), "Forge answers 422 to a LoRA script");
+            assert!(
+                payload.alwayson_scripts.is_none(),
+                "Forge answers 422 to a LoRA script"
+            );
         }
     }
 
@@ -1044,5 +1418,125 @@ Steps: 20, Sampler: Euler"), None);
             "mock samplers should report ok: {}",
             status.message
         );
+    }
+
+    #[test]
+    fn test_enrich_override_settings_for_forge_neo() {
+        use serde_json::json;
+
+        let forge_neo_opts = json!({
+            "forge_preset": "krea",
+            "forge_additional_modules": ["qwen_image_vae.safetensors", "qwen3vl_4b_fp8_scaled.safetensors"],
+            "forge_checkpoint_zit": "z_image_de_turbo_v1_bf16.safetensors",
+            "forge_additional_modules_zit": ["ae.safetensors", "Qwen3-4B-Q8_0.gguf"],
+            "forge_unet_storage_dtype_zit": "Automatic (fp16 LoRA)",
+            "forge_checkpoint_krea": "krea2_turbo_fp8_scaled.safetensors",
+            "forge_additional_modules_krea": ["qwen_image_vae.safetensors", "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors"],
+            "forge_unet_storage_dtype_krea": "Automatic (fp16 LoRA)",
+            "forge_additional_modules_xl": [],
+            "forge_unet_storage_dtype_xl": "Automatic",
+        });
+
+        // 1. Target model is Z-Image Turbo -> should inject zit modules and dtype
+        let mut payload_zit = super::ForgePayload {
+            prompt: "cat".to_string(),
+            negative_prompt: "".to_string(),
+            steps: Some(20),
+            sampler_name: None,
+            scheduler: None,
+            cfg_scale: None,
+            seed: None,
+            width: Some(512),
+            height: Some(512),
+            override_settings: Some(json!({ "sd_model_checkpoint": "z_image_turbo_bf16.safetensors" })),
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        };
+        super::enrich_override_settings_from_forge_options(&mut payload_zit, "z_image_turbo_bf16.safetensors", &forge_neo_opts);
+        let ov_zit = payload_zit.override_settings.unwrap();
+        assert_eq!(
+            ov_zit.get("forge_additional_modules").unwrap(),
+            &json!(["ae.safetensors", "Qwen3-4B-Q8_0.gguf"])
+        );
+        assert_eq!(
+            ov_zit.get("forge_unet_storage_dtype").unwrap().as_str().unwrap(),
+            "Automatic (fp16 LoRA)"
+        );
+
+        // 2. Target model is Krea 2 -> should inject krea modules and dtype
+        let mut payload_krea = super::ForgePayload {
+            prompt: "cat".to_string(),
+            negative_prompt: "".to_string(),
+            steps: Some(20),
+            sampler_name: None,
+            scheduler: None,
+            cfg_scale: None,
+            seed: None,
+            width: Some(512),
+            height: Some(512),
+            override_settings: Some(json!({ "sd_model_checkpoint": "krea2_turbo_fp8_scaled.safetensors" })),
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        };
+        super::enrich_override_settings_from_forge_options(&mut payload_krea, "krea2_turbo_fp8_scaled.safetensors", &forge_neo_opts);
+        let ov_krea = payload_krea.override_settings.unwrap();
+        assert_eq!(
+            ov_krea.get("forge_additional_modules").unwrap(),
+            &json!(["qwen_image_vae.safetensors", "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors"])
+        );
+
+        // 3. Target model is SDXL -> should inject empty list [] to unload extra modules
+        let mut payload_xl = super::ForgePayload {
+            prompt: "cat".to_string(),
+            negative_prompt: "".to_string(),
+            steps: Some(20),
+            sampler_name: None,
+            scheduler: None,
+            cfg_scale: None,
+            seed: None,
+            width: Some(1024),
+            height: Some(1024),
+            override_settings: Some(json!({ "sd_model_checkpoint": "sd_xl_base_1.0.safetensors" })),
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        };
+        super::enrich_override_settings_from_forge_options(&mut payload_xl, "sd_xl_base_1.0.safetensors", &forge_neo_opts);
+        let ov_xl = payload_xl.override_settings.unwrap();
+        assert_eq!(ov_xl.get("forge_additional_modules").unwrap(), &json!([]));
+
+        // 4. Standard options without Forge Neo keys -> leaves override_settings unchanged
+        let standard_opts = json!({
+            "sd_model_checkpoint": "v1-5-pruned.safetensors",
+            "samples_save": true,
+        });
+        let mut payload_std = super::ForgePayload {
+            prompt: "cat".to_string(),
+            negative_prompt: "".to_string(),
+            steps: Some(20),
+            sampler_name: None,
+            scheduler: None,
+            cfg_scale: None,
+            seed: None,
+            width: Some(512),
+            height: Some(512),
+            override_settings: Some(json!({ "sd_model_checkpoint": "v1-5-pruned.safetensors" })),
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        };
+        super::enrich_override_settings_from_forge_options(&mut payload_std, "v1-5-pruned.safetensors", &standard_opts);
+        let ov_std = payload_std.override_settings.unwrap();
+        assert!(ov_std.get("forge_additional_modules").is_none());
     }
 }
