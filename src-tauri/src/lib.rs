@@ -98,11 +98,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let app_data = app
-                .path()
-                .app_data_dir()
-                .expect("Failed to get app data directory");
+            let override_raw = std::env::var("FORGE_META_LINK_DATA_DIR").ok();
+            if cfg!(debug_assertions) && override_raw.is_some() && data_dir_override(override_raw.clone()).is_none() {
+                // The caller asked for isolation. Falling back to the real library would defeat it.
+                return Err("FORGE_META_LINK_DATA_DIR is set but invalid (needs an absolute path); refusing to open the default data dir".into());
+            }
+            let app_data = match data_dir_override(override_raw) {
+                Some(dir) => {
+                    log::warn!("Using OVERRIDDEN app data dir (debug build): {}", dir.display());
+                    dir
+                }
+                None => app
+                    .path()
+                    .app_data_dir()
+                    .expect("Failed to get app data directory"),
+            };
             std::fs::create_dir_all(&app_data).ok();
+            log::info!("App data dir: {}", app_data.display());
             let storage_profile_path = app_data.join(STORAGE_PROFILE_FILE);
             let storage_profile_value = load_storage_profile(&storage_profile_path);
             let storage_profile = Arc::new(RwLock::new(storage_profile_value));
@@ -276,6 +288,23 @@ pub(crate) fn persist_forge_api_key(path: &Path, api_key: &str) -> Result<(), St
     forge_keychain::persist_forge_api_key_secure(path, api_key)
 }
 
+/// Debug builds only: `FORGE_META_LINK_DATA_DIR` redirects the database, thumbnails and settings
+/// to another folder so the app can be exercised without touching a real library. Tauri finds the
+/// default folder through a Windows API, so overriding `APPDATA` does NOT work. Release builds
+/// ignore the variable, and a relative or empty value is rejected rather than guessed at.
+fn data_dir_override(raw: Option<String>) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let value = raw?;
+    let path = PathBuf::from(value.trim());
+    if value.trim().is_empty() || !path.is_absolute() {
+        log::warn!("Ignoring FORGE_META_LINK_DATA_DIR: it must be a non-empty absolute path");
+        return None;
+    }
+    Some(path)
+}
+
 fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
     let mut index = HashSet::new();
 
@@ -313,7 +342,21 @@ fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_forge_api_key, persist_forge_api_key};
+    #[test]
+    fn data_dir_override_accepts_only_absolute_paths() {
+        let abs = std::env::temp_dir().join("fml_override_test");
+        assert_eq!(
+            data_dir_override(Some(abs.to_string_lossy().to_string())),
+            Some(abs.clone()),
+            "debug builds honour an absolute override"
+        );
+        assert_eq!(data_dir_override(None), None);
+        assert_eq!(data_dir_override(Some(String::new())), None);
+        assert_eq!(data_dir_override(Some("   ".to_string())), None);
+        assert_eq!(data_dir_override(Some("relative/dir".to_string())), None);
+    }
+
+    use super::{data_dir_override, load_forge_api_key, persist_forge_api_key};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
