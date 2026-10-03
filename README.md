@@ -9,10 +9,11 @@ The recipe sits inside each PNG, but nothing reads it for you. ForgeMetaLink doe
 
 ## What it does
 
-- **Searches your library in an instant.** Type a prompt word, model, LoRA, sampler, seed, or tag.
+- **Searches your library in an instant.** Type a prompt word, model, LoRA, sampler, seed, or tag. Put `-` before a tag to exclude it. Filter by checkpoint family.
 - **Compares up to four images side by side.** It highlights every setting that differs.
-- **Makes variations of your winner.** Pick the image. Tick the changes: seed +1 to +4, higher or lower CFG or steps, another sampler or scheduler. It queues them all in Forge Neo.
-- **Sends any image back to Forge Neo.** Sampler, scheduler, CFG, seed, size, model, and LoRAs arrive unchanged. No PNG Info copy-paste.
+- **Makes variations of your winner.** Pick the image. Tick the changes: seed +1 to +4, higher or lower CFG or steps, another sampler or scheduler. It queues them all in Forge Neo. One sweep holds 16 images at most. Past 8, it asks first.
+- **Sends any image back to Forge Neo.** Sampler, scheduler, CFG, seed, size, model, and LoRAs arrive unchanged. No PNG Info copy-paste. Resolution presets match your model family.
+- **Upscales in place.** In the **Forge** tab, pick one of Forge Neo's upscalers, set the scale, and go.
 - **Traces an image to its origin.** Variations made here remember their parent. You can walk back to the first prompt, even after you delete the images in between.
 - **Deletes safely.** Images go to the Recycle Bin with a 6-second undo. Locked images never get deleted.
 - **Stores your prompts.** Save the ones you reuse. Search them. Apply one to a new request.
@@ -77,7 +78,7 @@ npm test                     # frontend tests
 cd src-tauri && cargo test   # backend tests
 ```
 
-Windows gets the most testing. Linux and macOS builds work with limited testing. ARM64 builds are untested.
+Windows gets the most testing. It needs WebView2 111 or newer. CI also builds Linux, macOS, and ARM64 installers. Those get little hands-on testing.
 
 ## License
 
