@@ -69,15 +69,12 @@ export function applyOps(
                     throw new Error("Cannot apply seed step to random seed (-1)");
                 }
                 const trimmed = params.seed.trim();
-                let seedBigInt: bigint;
-                try {
-                    seedBigInt = BigInt(trimmed);
-                } catch {
+                // Plain non-negative decimal only. BigInt() would also accept "0x10" or " 12 ",
+                // and a negative seed is not a valid Forge seed to step from.
+                if (!/^\d+$/.test(trimmed)) {
                     throw new Error(`Invalid numeric seed: "${params.seed}"`);
                 }
-                if (seedBigInt === -1n) {
-                    throw new Error("Cannot apply seed step to random seed (-1)");
-                }
+                const seedBigInt = BigInt(trimmed);
                 const stepped = seedBigInt + BigInt(op.value);
                 if (stepped > 9223372036854775807n) {
                     throw new Error("Seed step overflows the 64-bit seed range");

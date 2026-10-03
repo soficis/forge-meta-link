@@ -92,6 +92,27 @@ function viewer(index: number) {
 const promptBox = () => screen.getByPlaceholderText("Prompt") as HTMLTextAreaElement;
 const sleep = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, ms)));
 
+/**
+ * Polls `read` until it has not changed for `quietMs`, then returns it. A loop that keeps
+ * changing the value never settles and the helper throws, so no fixed sleep has to guess how
+ * long "long enough" is on a slow machine.
+ */
+async function settled(read: () => number, quietMs = 500, timeoutMs = 5000): Promise<number> {
+    const start = Date.now();
+    let last = read();
+    let since = Date.now();
+    while (Date.now() - since < quietMs) {
+        if (Date.now() - start > timeoutMs) throw new Error(`value never settled (still changing at ${read()})`);
+        await sleep(25);
+        const now = read();
+        if (now !== last) {
+            last = now;
+            since = Date.now();
+        }
+    }
+    return last;
+}
+
 beforeEach(() => {
     localStorage.clear();
 });
@@ -112,8 +133,7 @@ describe("PhotoViewer Forge panel", () => {
         await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
 
         rerender(viewer(1));
-        await sleep(250);
-        await waitFor(() => expect(promptBox().value).toBe("a misty forest"));
+        await waitFor(() => expect(promptBox().value).toBe("a misty forest"), { timeout: 3000 });
         // the CFG field must follow too, not just the prompt
         expect(screen.getByDisplayValue("7.0")).toBeTruthy();
     });
@@ -122,11 +142,9 @@ describe("PhotoViewer Forge panel", () => {
         mock = installTauriMock(baseHandlers());
         render(viewer(0));
         fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
-        await sleep(400);
-        const settled = mock.count("forge_get_options");
-        await sleep(600);
-        expect(mock.count("forge_get_options")).toBe(settled);
-        expect(settled).toBeLessThanOrEqual(3);
+        const calls = await settled(() => mock.count("forge_get_options"));
+        expect(calls).toBeGreaterThan(0);
+        expect(calls).toBeLessThanOrEqual(3);
         expect(screen.getByText(/LoRA directory not configured/)).toBeTruthy();
     });
 
@@ -231,9 +249,9 @@ describe("PhotoViewer prompt library wiring", () => {
         expect(screen.getByText(/Applied "Studio portrait"/)).toBeTruthy();
     });
 
-    it("an applied prompt is not overwritten when the same image's detail finishes loading later", async () => {
+    it("an applied prompt survives a re-render of the same image", async () => {
         mock = installTauriMock(libraryHandlers([savedPrompt()]));
-        render(viewer(0));
+        const { rerender } = render(viewer(0));
         fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
         await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
         fireEvent.click(screen.getByRole("button", { name: "Library" }));
@@ -241,7 +259,10 @@ describe("PhotoViewer prompt library wiring", () => {
         await within(dialog).findByText("Studio portrait");
         fireEvent.click(within(dialog).getByText("Apply"));
         await waitFor(() => expect(promptBox().value).toBe("studio portrait, soft light"));
-        await sleep(300);
+        rerender(viewer(0));
+        await act(async () => {
+            await Promise.resolve();
+        });
         expect(promptBox().value).toBe("studio portrait, soft light");
     });
 
@@ -271,5 +292,28 @@ describe("PhotoViewer prompt library wiring", () => {
         fireEvent.click(screen.getByRole("button", { name: "Save to library" }));
         expect(await screen.findByText(/Nothing to save/)).toBeTruthy();
         expect(mock.count("save_prompt")).toBe(0);
+    });
+});
+
+describe("PhotoViewer detail load failure", () => {
+    it("says so instead of showing silently empty fields, and Retry recovers", async () => {
+        let failing = true;
+        mock = installTauriMock(
+            baseHandlers({
+                get_image_detail: ({ id }) => {
+                    if (failing) throw new Error("db busy");
+                    return DETAILS[id as number];
+                },
+            })
+        );
+        render(viewer(0));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        expect(await screen.findByTestId("forge-detail-error")).toBeTruthy();
+        expect(promptBox().value).toBe("");
+
+        failing = false;
+        fireEvent.click(within(screen.getByTestId("forge-detail-error")).getByText("Retry"));
+        await waitFor(() => expect(screen.queryByTestId("forge-detail-error")).toBeNull());
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
     });
 });

@@ -340,6 +340,8 @@ export function PhotoViewer({
     const currentImage = images[currentIndex] ?? null;
     const [currentDetail, setCurrentDetail] = useState<ImageRecord | null>(null);
     const [isDetailLoading, setIsDetailLoading] = useState(false);
+    const [detailFailed, setDetailFailed] = useState(false);
+    const [detailReloadKey, setDetailReloadKey] = useState(0);
 
     const [isSavingSidecar, setIsSavingSidecar] = useState(false);
 
@@ -720,6 +722,7 @@ export function PhotoViewer({
         detailRequestRef.current = requestId;
 
         setCurrentDetail(null);
+        setDetailFailed(false);
         setIsDetailLoading(true);
 
         getImageDetail(imageId)
@@ -728,12 +731,14 @@ export function PhotoViewer({
                     return;
                 }
                 setCurrentDetail(detail);
+                setDetailFailed(detail == null);
             })
             .catch(() => {
                 if (cancelled || detailRequestRef.current !== requestId) {
                     return;
                 }
                 setCurrentDetail(null);
+                setDetailFailed(true);
             })
             .finally(() => {
                 if (cancelled || detailRequestRef.current !== requestId) {
@@ -745,7 +750,7 @@ export function PhotoViewer({
         return () => {
             cancelled = true;
         };
-    }, [currentImage?.id]);
+    }, [currentImage?.id, detailReloadKey]);
 
     useEffect(() => {
         forgeOverridesImageIdRef.current = null;
@@ -2376,6 +2381,18 @@ export function PhotoViewer({
                                 <>
                                     <section className="photo-viewer-section">
                                         <h4>Forge Payload</h4>
+                                        {detailFailed && (
+                                            <div className="input-error" role="alert" data-testid="forge-detail-error">
+                                                Could not load this image&apos;s details, so the fields below are empty.{" "}
+                                                <button
+                                                    type="button"
+                                                    className="viewer-control-button"
+                                                    onClick={() => setDetailReloadKey((key) => key + 1)}
+                                                >
+                                                    Retry
+                                                </button>
+                                            </div>
+                                        )}
                                         {!hasValidForgeUrl && (
                                             <div className="input-error" role="alert">
                                                 {forgeUrlValidationError}

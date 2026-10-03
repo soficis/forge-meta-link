@@ -170,6 +170,19 @@ describe("mutations pure module", () => {
         });
     });
 
+    describe("seed validation", () => {
+        for (const bad of ["0x10", "1e3", "-5", " ", "12abc", "1.5"]) {
+            it(`rejects the seed ${JSON.stringify(bad)}`, () => {
+                expect(() => applyOps({ ...baseParams, seed: bad }, [{ kind: "seed_step", value: 1 }])).toThrow(
+                    /seed/i
+                );
+            });
+        }
+        it("accepts a plain decimal seed with surrounding spaces", () => {
+            expect(applyOps({ ...baseParams, seed: " 41 " }, [{ kind: "seed_step", value: 1 }]).seed).toBe("42");
+        });
+    });
+
     describe("changedOverrides", () => {
         it("returns only the fields a mutation changed", () => {
             const mutated = applyOps(baseParams, [
