@@ -790,41 +790,33 @@ fn build_payload_for_image(
 
     let width = match override_width {
         Some(raw) => parse_optional_u32_override("width", raw)?,
-        None => image.width,
+        None => None,
     };
     let height = match override_height {
         Some(raw) => parse_optional_u32_override("height", raw)?,
-        None => image.height,
+        None => None,
     };
 
     let base_prompt = override_prompt.unwrap_or(image.prompt.as_str());
     let prompt = apply_custom_loras_to_prompt(base_prompt, lora_tokens, lora_weight);
-    let negative_prompt = override_negative_prompt.unwrap_or(image.negative_prompt.as_str());
-    let steps = override_steps.or(image.steps.as_deref());
-    let sampler = override_sampler.or(image.sampler.as_deref());
-    // ImageRecord has no scheduler column: fall back to the Schedule type in the stored metadata.
-    let resolved_scheduler = forge_api::resolve_scheduler(override_scheduler, &image.raw_metadata);
-    let scheduler = resolved_scheduler.as_deref();
-    let cfg_scale = override_cfg_scale.or(image.cfg_scale.as_deref());
-    let seed = override_seed.or(image.seed.as_deref());
-    let model_name = override_model.or(image.model_name.as_deref());
 
-    Ok(forge_api::build_payload_from_image_record(
-        forge_api::ForgePayloadBuildInput {
-            prompt: &prompt,
-            negative_prompt,
-            steps,
-            sampler,
-            scheduler,
-            cfg_scale,
-            seed,
+    Ok(forge_api::build_payload_for_record(
+        image,
+        &prompt,
+        &forge_api::RecordOverrides {
+            negative_prompt: override_negative_prompt,
+            steps: override_steps,
+            sampler: override_sampler,
+            scheduler: override_scheduler,
+            cfg_scale: override_cfg_scale,
+            seed: override_seed,
+            model_name: override_model,
             width,
             height,
-            model_name,
-            include_seed,
-            adetailer_face_enabled,
-            adetailer_face_model,
         },
+        include_seed,
+        adetailer_face_enabled,
+        adetailer_face_model,
     ))
 }
 
@@ -1083,13 +1075,15 @@ async fn send_image_record_to_forge(
     })
 }
 
+/// Indexes freshly generated images and stamps their lineage edges. Returns a user-facing warning
+/// when anything was not indexed, so a silent gap in lineage can never look like success.
 async fn ingest_forge_children(
     children: &[ChildResult],
     state: &AppState,
     app: Option<&tauri::AppHandle>,
-) {
+) -> Option<String> {
     if children.is_empty() {
-        return;
+        return None;
     }
 
     let saved_paths: Vec<String> = children.iter().map(|c| c.saved_path.clone()).collect();
@@ -1115,13 +1109,16 @@ async fn ingest_forge_children(
         .map(|p| *p)
         .unwrap_or(StorageProfile::Hdd);
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let outcome = tauri::async_runtime::spawn_blocking(move || -> Option<String> {
+        let mut warning: Option<String> = None;
+        let mut missing = 0usize;
         let mut items = Vec::with_capacity(children_clone.len());
         let mut pathbufs = Vec::with_capacity(children_clone.len());
 
         for child in &children_clone {
             let path = PathBuf::from(&child.saved_path);
             if !path.exists() {
+                missing += 1;
                 continue;
             }
             let (file_size, file_mtime) = match path.metadata() {
@@ -1198,9 +1195,22 @@ async fn ingest_forge_children(
             pathbufs.push(path);
         }
 
+        if missing > 0 {
+            warning = Some(format!(
+                "{} generated image(s) could not be found on disk and were not indexed",
+                missing
+            ));
+        }
         if !items.is_empty() {
             if let Err(e) = db.bulk_upsert_with_lineage(&items) {
                 log::error!("Failed to ingest Forge generated images into database: {}", e);
+                // The files exist but are unindexed and have no lineage edge: say so.
+                pathbufs.clear();
+                warning = Some(format!(
+                    "{} image(s) were generated but could not be indexed (no lineage recorded): {}",
+                    items.len(),
+                    e
+                ));
             } else {
                 log::info!("Successfully ingested {} Forge generated image(s)", items.len());
             }
@@ -1220,31 +1230,29 @@ async fn ingest_forge_children(
                 }
             }
         }
+        warning
     })
-    .await
-    .ok();
+    .await;
 
-    if let Some(app) = app {
-        let _ = app.emit("forge-images-ingested", saved_paths);
+    let warning = match outcome {
+        Ok(w) => w,
+        Err(e) => Some(format!("Indexing generated images failed: {}", e)),
+    };
+
+    if warning.is_none() {
+        if let Some(app) = app {
+            let _ = app.emit("forge-images-ingested", saved_paths);
+        }
     }
+    warning
 }
 
-#[allow(dead_code)]
-async fn ingest_forge_saved_paths(
-    saved_paths: &[String],
-    state: &AppState,
-    app: Option<&tauri::AppHandle>,
-) {
-    let dummy_children: Vec<ChildResult> = saved_paths
-        .iter()
-        .map(|p| ChildResult {
-            parent_image_id: 0,
-            saved_path: p.clone(),
-            mutation_ops: None,
-            variant_label: None,
-        })
-        .collect();
-    ingest_forge_children(&dummy_children, state, app).await;
+/// Appends an ingest warning to a result message.
+fn with_ingest_warning(message: String, warning: Option<String>) -> String {
+    match warning {
+        Some(w) => format!("{} — Warning: {}", message, w),
+        None => message,
+    }
 }
 
 #[tauri::command]
@@ -1276,9 +1284,10 @@ pub async fn forge_send_to_image(
         mutation_ops: normalized.mutation_ops.as_ref(),
     };
 
-    let result = send_image_record_to_forge(&image, &context).await?;
+    let mut result = send_image_record_to_forge(&image, &context).await?;
     if !result.children.is_empty() {
-        ingest_forge_children(&result.children, &state, Some(&app)).await;
+        let warning = ingest_forge_children(&result.children, &state, Some(&app)).await;
+        result.message = with_ingest_warning(result.message, warning);
     }
     Ok(result)
 }
@@ -1360,14 +1369,16 @@ pub async fn forge_send_to_images(
                 if result.ok {
                     succeeded += 1;
                 }
+                let mut message = result.message;
                 if !result.children.is_empty() {
-                    ingest_forge_children(&result.children, &state, Some(&app)).await;
+                    let warning = ingest_forge_children(&result.children, &state, Some(&app)).await;
+                    message = with_ingest_warning(message, warning);
                 }
                 items.push(ForgeBatchItemOutput {
                     image_id,
                     filename: image.filename.clone(),
                     ok: result.ok,
-                    message: result.message,
+                    message,
                     generated_count: result.generated_count,
                     saved_paths: result.saved_paths,
                     children: result.children,
@@ -1486,10 +1497,11 @@ pub async fn forge_requeue_image(
             variant_label: None,
         })
         .collect();
+    let mut message = api_result.message.clone();
     if !children.is_empty() {
-        ingest_forge_children(&children, &state, Some(&app)).await;
+        let warning = ingest_forge_children(&children, &state, Some(&app)).await;
+        message = with_ingest_warning(message, warning);
     }
-    let message = api_result.message.clone();
     Ok(ForgeSendOutput {
         ok: true,
         message,

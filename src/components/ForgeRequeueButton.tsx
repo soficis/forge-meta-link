@@ -178,6 +178,7 @@ export function ForgeRequeueButton({
         loraTokens,
         loraWeight,
         overrides,
+        mutationOps,
         isBatch,
         validate,
         onQueued,

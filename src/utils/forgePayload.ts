@@ -96,7 +96,7 @@ export function buildForgePayload(
         override_settings: overrideSettings,
         alwayson_scripts: alwaysonScripts,
         send_images: true,
-        save_images: true,
+        save_images: false,
         batch_size: 1,
         n_iter: 1,
     };

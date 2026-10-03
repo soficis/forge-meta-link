@@ -62,7 +62,10 @@ export function applyOps(
     for (const op of ops) {
         switch (op.kind) {
             case "seed_step": {
-                if (!params.seed || params.seed.trim() === "" || params.seed.trim() === "-1") {
+                if (!params.seed || params.seed.trim() === "") {
+                    throw new Error("Cannot apply a seed step: the source image has no seed recorded");
+                }
+                if (params.seed.trim() === "-1") {
                     throw new Error("Cannot apply seed step to random seed (-1)");
                 }
                 const trimmed = params.seed.trim();
@@ -83,15 +86,20 @@ export function applyOps(
                 break;
             }
             case "cfg_delta": {
-                const current = Number(next.cfg_scale?.trim() ?? "7.0");
-                const baseCfg = Number.isFinite(current) ? current : 7.0;
+                const raw = next.cfg_scale?.trim();
+                const baseCfg = raw ? Number(raw) : NaN;
+                if (!Number.isFinite(baseCfg)) {
+                    throw new Error("Cannot apply a CFG delta: the source image has no CFG scale recorded");
+                }
                 const clamped = Math.max(1.0, Math.min(30.0, baseCfg + op.value));
                 next.cfg_scale = Number(clamped.toFixed(2)).toString();
                 break;
             }
             case "steps_delta": {
-                const current = parseInt(next.steps?.trim() ?? "20", 10);
-                const baseSteps = Number.isFinite(current) ? current : 20;
+                const baseSteps = parseInt(next.steps?.trim() ?? "", 10);
+                if (!Number.isFinite(baseSteps)) {
+                    throw new Error("Cannot apply a steps delta: the source image has no step count recorded");
+                }
                 const clamped = Math.max(1, Math.min(150, baseSteps + op.value));
                 next.steps = clamped.toString();
                 break;
@@ -186,4 +194,24 @@ export function expandSweep(selection: SweepSelection): MutationOp[][] {
     }
 
     return combinations;
+}
+
+/**
+ * Only the fields a mutation actually changed. Sending just these as overrides lets the backend
+ * take every other value (including the scheduler, which the UI record does not carry) from the
+ * stored image, so nothing is guessed or defaulted on the client.
+ */
+export function changedOverrides(
+    base: GenerationParams,
+    mutated: GenerationParams
+): Partial<Record<"steps" | "sampler_name" | "scheduler" | "cfg_scale" | "seed", string>> {
+    const out: Partial<Record<"steps" | "sampler_name" | "scheduler" | "cfg_scale" | "seed", string>> = {};
+    if (mutated.steps != null && mutated.steps !== base.steps) out.steps = mutated.steps;
+    if (mutated.sampler != null && mutated.sampler !== base.sampler) out.sampler_name = mutated.sampler;
+    if (mutated.schedule_type != null && mutated.schedule_type !== base.schedule_type) {
+        out.scheduler = mutated.schedule_type;
+    }
+    if (mutated.cfg_scale != null && mutated.cfg_scale !== base.cfg_scale) out.cfg_scale = mutated.cfg_scale;
+    if (mutated.seed != null && mutated.seed !== base.seed) out.seed = mutated.seed;
+    return out;
 }

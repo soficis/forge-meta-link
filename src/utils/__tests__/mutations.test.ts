@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
     applyOps,
+    changedOverrides,
     expandSweep,
     calculateSweepSize,
     isConfirmRequired,
     SWEEP_HARD_CAP,
     SWEEP_CONFIRM_THRESHOLD,
-    type MutationOp,
     type SweepSelection,
 } from "../mutations";
 import type { GenerationParams } from "../forgePayload";
@@ -149,6 +149,44 @@ describe("mutations pure module", () => {
             expect(isConfirmRequired(9)).toBe(true);
             expect(isConfirmRequired(16)).toBe(true);
             expect(SWEEP_CONFIRM_THRESHOLD).toBe(8);
+        });
+    });
+
+    describe("no fabricated defaults", () => {
+        it("refuses a CFG delta when the source has no CFG", () => {
+            expect(() =>
+                applyOps({ ...baseParams, cfg_scale: null }, [{ kind: "cfg_delta", value: 1 }])
+            ).toThrow(/no CFG/);
+        });
+        it("refuses a steps delta when the source has no steps", () => {
+            expect(() =>
+                applyOps({ ...baseParams, steps: null }, [{ kind: "steps_delta", value: 5 }])
+            ).toThrow(/no step count/);
+        });
+        it("refuses a seed step when the source has no seed", () => {
+            expect(() =>
+                applyOps({ ...baseParams, seed: null }, [{ kind: "seed_step", value: 1 }])
+            ).toThrow(/no seed recorded/);
+        });
+    });
+
+    describe("changedOverrides", () => {
+        it("returns only the fields a mutation changed", () => {
+            const mutated = applyOps(baseParams, [
+                { kind: "seed_step", value: 2 },
+                { kind: "cfg_delta", value: 1 },
+            ]);
+            expect(changedOverrides(baseParams, mutated)).toEqual({ seed: "12347", cfg_scale: "8" });
+        });
+        it("never sends a scheduler the operator did not swap", () => {
+            const base = { ...baseParams, schedule_type: null };
+            const mutated = applyOps(base, [{ kind: "sampler_scheduler_swap", sampler: "Euler" }]);
+            const out = changedOverrides(base, mutated);
+            expect(out).toEqual({ sampler_name: "Euler" });
+            expect("scheduler" in out).toBe(false);
+        });
+        it("is empty when nothing changed", () => {
+            expect(changedOverrides(baseParams, { ...baseParams })).toEqual({});
         });
     });
 });

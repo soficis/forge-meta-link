@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { CompareLab } from "../CompareLab";
 import { useCompareLabStore } from "../../store/compareLabStore";
 import type { GalleryImageRecord } from "../../types/metadata";

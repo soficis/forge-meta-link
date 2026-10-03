@@ -593,7 +593,8 @@ fn lineage_e2e_chain_compare_requeue_loop() {
             payload
                 .alwayson_scripts
                 .as_ref()
-                .map_or(true, |a| a.get("LoRA").is_none()),
+                .and_then(|a| a.get("LoRA"))
+                .is_none(),
             "{} must not send a LoRA always-on script",
             label
         );

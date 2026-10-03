@@ -212,6 +212,52 @@ pub fn resolve_scheduler(override_scheduler: Option<&str>, raw_metadata: &str) -
         .and_then(|s| parse_optional_text(Some(&s)))
 }
 
+/// Per-field overrides applied on top of a stored image when re-generating it. `None` means
+/// "use the stored value" (for the scheduler: the Schedule type in the stored metadata).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecordOverrides<'a> {
+    pub negative_prompt: Option<&'a str>,
+    pub steps: Option<&'a str>,
+    pub sampler: Option<&'a str>,
+    pub scheduler: Option<&'a str>,
+    pub cfg_scale: Option<&'a str>,
+    pub seed: Option<&'a str>,
+    pub model_name: Option<&'a str>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// The one place that decides which value wins when re-generating a stored image
+/// (override first, else the stored record, scheduler via [`resolve_scheduler`]).
+/// `prompt` is passed in already resolved because callers may append LoRA tags to it.
+pub fn build_payload_for_record(
+    image: &crate::database::ImageRecord,
+    prompt: &str,
+    overrides: &RecordOverrides<'_>,
+    include_seed: bool,
+    adetailer_face_enabled: bool,
+    adetailer_face_model: Option<&str>,
+) -> ForgePayload {
+    let scheduler = resolve_scheduler(overrides.scheduler, &image.raw_metadata);
+    build_payload_from_image_record(ForgePayloadBuildInput {
+        prompt,
+        negative_prompt: overrides
+            .negative_prompt
+            .unwrap_or(image.negative_prompt.as_str()),
+        steps: overrides.steps.or(image.steps.as_deref()),
+        sampler: overrides.sampler.or(image.sampler.as_deref()),
+        scheduler: scheduler.as_deref(),
+        cfg_scale: overrides.cfg_scale.or(image.cfg_scale.as_deref()),
+        seed: overrides.seed.or(image.seed.as_deref()),
+        width: overrides.width.or(image.width),
+        height: overrides.height.or(image.height),
+        model_name: overrides.model_name.or(image.model_name.as_deref()),
+        include_seed,
+        adetailer_face_enabled,
+        adetailer_face_model,
+    })
+}
+
 pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> ForgePayload {
     let ForgePayloadBuildInput {
         prompt,
@@ -247,7 +293,8 @@ pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> For
         height,
         override_settings,
         send_images: Some(true),
-        save_images: Some(true),
+        // The app writes the returned images itself; don't also leave a copy in Forge's outputs folder.
+        save_images: Some(false),
         alwayson_scripts,
         batch_size: Some(1),
         n_iter: Some(1),
@@ -322,7 +369,8 @@ pub fn build_payload_from_generation_params(
         height: params.height,
         override_settings,
         send_images: Some(true),
-        save_images: Some(true),
+        // The app writes the returned images itself; don't also leave a copy in Forge's outputs folder.
+        save_images: Some(false),
         alwayson_scripts,
         batch_size: Some(1),
         n_iter: Some(1),
@@ -739,7 +787,8 @@ mod tests {
             payload
                 .alwayson_scripts
                 .as_ref()
-                .map_or(true, |a| a.get("LoRA").is_none()),
+                .and_then(|a| a.get("LoRA"))
+                .is_none(),
             "must not send a LoRA always-on script"
         );
     }
@@ -785,7 +834,8 @@ mod tests {
             payload
                 .alwayson_scripts
                 .as_ref()
-                .map_or(true, |a| a.get("LoRA").is_none()),
+                .and_then(|a| a.get("LoRA"))
+                .is_none(),
             "must not send a LoRA always-on script"
         );
     }

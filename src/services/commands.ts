@@ -25,7 +25,6 @@ import type {
     StorageProfile,
     LineageCursor,
     LineageTrace,
-    LineageTraceNode,
     TagProvenance,
     PromptEntry,
     SavePromptResult,

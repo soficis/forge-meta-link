@@ -4,9 +4,9 @@ import {
     applyOps,
     expandSweep,
     calculateSweepSize,
+    changedOverrides,
     isConfirmRequired,
     SWEEP_HARD_CAP,
-    SWEEP_CONFIRM_THRESHOLD,
     COMMON_SAMPLERS,
     ACCEPTED_SCHEDULERS,
     type SweepSelection,
@@ -113,20 +113,23 @@ export function MutationPopover({
         setIsSending(true);
         setErrorMessage(null);
 
-        // Build base generation params from winner
+        // Base params hold only what the winner's record actually carries. Nothing is defaulted:
+        // an operator that needs a missing value fails loudly instead of sweeping from a guess.
+        // The scheduler is not on the UI record; the backend reads it from the stored image
+        // unless a swap overrides it.
         const baseParams: GenerationParams = {
             prompt: winnerDetails?.prompt ?? "",
             negative_prompt: winnerDetails?.negative_prompt ?? "",
-            steps: winnerDetails?.steps ?? "20",
-            sampler: winnerDetails?.sampler ?? winner.model_name ?? "Euler a",
-            schedule_type: winnerDetails?.schedule_type ?? "karras",
-            cfg_scale: winnerDetails?.cfg_scale ?? "7.0",
-            seed: winnerDetails?.seed ?? winner.seed ?? "12345",
-            width: winnerDetails?.width ?? winner.width ?? 512,
-            height: winnerDetails?.height ?? winner.height ?? 512,
+            steps: winnerDetails?.steps ?? null,
+            sampler: winnerDetails?.sampler ?? null,
+            schedule_type: null,
+            cfg_scale: winnerDetails?.cfg_scale ?? null,
+            seed: winnerDetails?.seed ?? winner.seed ?? null,
+            width: winnerDetails?.width ?? winner.width ?? null,
+            height: winnerDetails?.height ?? winner.height ?? null,
             model_hash: winnerDetails?.model_hash ?? null,
             model_name: winnerDetails?.model_name ?? winner.model_name ?? null,
-            generation_type: winnerDetails?.generation_type ?? "txt2img",
+            generation_type: null,
             extra_params: {},
             raw_metadata: winnerDetails?.raw_metadata ?? "",
         };
@@ -137,16 +140,7 @@ export function MutationPopover({
                 const ops = combinations[i];
                 setSendProgress(`Generating variant ${i + 1}/${combinations.length}...`);
                 const mutated = applyOps(baseParams, ops);
-
-                const overrides = {
-                    prompt: mutated.prompt,
-                    negative_prompt: mutated.negative_prompt,
-                    steps: mutated.steps ?? undefined,
-                    sampler_name: mutated.sampler ?? undefined,
-                    scheduler: mutated.schedule_type ?? undefined,
-                    cfg_scale: mutated.cfg_scale ?? undefined,
-                    seed: mutated.seed ?? undefined,
-                };
+                const overrides = changedOverrides(baseParams, mutated);
 
                 const res = await forgeSendToImage(
                     winner.id,
@@ -166,7 +160,11 @@ export function MutationPopover({
             onQueued?.(results);
             onClose();
         } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
+            const reason = err instanceof Error ? err.message : String(err);
+            const msg =
+                results.length > 0
+                    ? `Variant ${results.length + 1}/${combinations.length} failed after ${results.length} were sent (those are already in your library): ${reason}`
+                    : reason;
             setErrorMessage(msg);
             onError?.(msg);
         } finally {
