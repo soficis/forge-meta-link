@@ -916,10 +916,14 @@ const FAMILY_PATTERNS_PIXART: &[&str] = &["%pixart%"];
 const FAMILY_PATTERNS_KOLORS: &[&str] = &["%kolors%"];
 const FAMILY_PATTERNS_AURAFLOW: &[&str] = &["%auraflow%"];
 const FAMILY_PATTERNS_HUNYUAN: &[&str] = &["%hunyuan%"];
-const FAMILY_PATTERNS_SANA: &[&str] =
-    &["%sana_%", "%sana-%", "%_sana%", "%-sana%", "%sana.safetensors%"];
-const FAMILY_PATTERNS_WAN: &[&str] =
-    &["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"];
+const FAMILY_PATTERNS_SANA: &[&str] = &[
+    "%sana_%",
+    "%sana-%",
+    "%_sana%",
+    "%-sana%",
+    "%sana.safetensors%",
+];
+const FAMILY_PATTERNS_WAN: &[&str] = &["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
 const FAMILY_PATTERNS_VACE: &[&str] = &["%vace%"];
 

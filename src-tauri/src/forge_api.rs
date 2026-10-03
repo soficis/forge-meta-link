@@ -295,7 +295,8 @@ pub fn enrich_override_settings_from_forge_options(
     let is_forge_neo = opts.get("forge_preset").is_some()
         || opts.get("forge_additional_modules").is_some()
         || opts.as_object().is_some_and(|map| {
-            map.keys().any(|k| k.starts_with("forge_additional_modules_"))
+            map.keys()
+                .any(|k| k.starts_with("forge_additional_modules_"))
         });
 
     if !is_forge_neo {
@@ -303,7 +304,8 @@ pub fn enrich_override_settings_from_forge_options(
     }
 
     const FORGE_PRESETS: &[&str] = &[
-        "zit", "krea", "qwen", "flux", "klein", "anima", "lumina", "wan", "ernie", "pid", "xl", "sd",
+        "zit", "krea", "qwen", "flux", "klein", "anima", "lumina", "wan", "ernie", "pid", "xl",
+        "sd",
     ];
 
     let target_lower = target_model.to_ascii_lowercase();
@@ -386,10 +388,7 @@ pub fn enrich_override_settings_from_forge_options(
         let modules_key = format!("forge_additional_modules_{}", preset);
         let dtype_key = format!("forge_unet_storage_dtype_{}", preset);
 
-        let modules_val = opts
-            .get(&modules_key)
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        let modules_val = opts.get(&modules_key).cloned().unwrap_or_else(|| json!([]));
 
         let mut overrides = match payload.override_settings.take() {
             Some(serde_json::Value::Object(map)) => map,
@@ -1448,21 +1447,31 @@ Steps: 20, Sampler: Euler"
             seed: None,
             width: Some(512),
             height: Some(512),
-            override_settings: Some(json!({ "sd_model_checkpoint": "z_image_turbo_bf16.safetensors" })),
+            override_settings: Some(
+                json!({ "sd_model_checkpoint": "z_image_turbo_bf16.safetensors" }),
+            ),
             send_images: Some(true),
             save_images: Some(false),
             alwayson_scripts: None,
             batch_size: Some(1),
             n_iter: Some(1),
         };
-        super::enrich_override_settings_from_forge_options(&mut payload_zit, "z_image_turbo_bf16.safetensors", &forge_neo_opts);
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_zit,
+            "z_image_turbo_bf16.safetensors",
+            &forge_neo_opts,
+        );
         let ov_zit = payload_zit.override_settings.unwrap();
         assert_eq!(
             ov_zit.get("forge_additional_modules").unwrap(),
             &json!(["ae.safetensors", "Qwen3-4B-Q8_0.gguf"])
         );
         assert_eq!(
-            ov_zit.get("forge_unet_storage_dtype").unwrap().as_str().unwrap(),
+            ov_zit
+                .get("forge_unet_storage_dtype")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "Automatic (fp16 LoRA)"
         );
 
@@ -1477,18 +1486,27 @@ Steps: 20, Sampler: Euler"
             seed: None,
             width: Some(512),
             height: Some(512),
-            override_settings: Some(json!({ "sd_model_checkpoint": "krea2_turbo_fp8_scaled.safetensors" })),
+            override_settings: Some(
+                json!({ "sd_model_checkpoint": "krea2_turbo_fp8_scaled.safetensors" }),
+            ),
             send_images: Some(true),
             save_images: Some(false),
             alwayson_scripts: None,
             batch_size: Some(1),
             n_iter: Some(1),
         };
-        super::enrich_override_settings_from_forge_options(&mut payload_krea, "krea2_turbo_fp8_scaled.safetensors", &forge_neo_opts);
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_krea,
+            "krea2_turbo_fp8_scaled.safetensors",
+            &forge_neo_opts,
+        );
         let ov_krea = payload_krea.override_settings.unwrap();
         assert_eq!(
             ov_krea.get("forge_additional_modules").unwrap(),
-            &json!(["qwen_image_vae.safetensors", "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors"])
+            &json!([
+                "qwen_image_vae.safetensors",
+                "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors"
+            ])
         );
 
         // 3. Target model is SDXL -> should inject empty list [] to unload extra modules
@@ -1509,7 +1527,11 @@ Steps: 20, Sampler: Euler"
             batch_size: Some(1),
             n_iter: Some(1),
         };
-        super::enrich_override_settings_from_forge_options(&mut payload_xl, "sd_xl_base_1.0.safetensors", &forge_neo_opts);
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_xl,
+            "sd_xl_base_1.0.safetensors",
+            &forge_neo_opts,
+        );
         let ov_xl = payload_xl.override_settings.unwrap();
         assert_eq!(ov_xl.get("forge_additional_modules").unwrap(), &json!([]));
 
@@ -1535,7 +1557,11 @@ Steps: 20, Sampler: Euler"
             batch_size: Some(1),
             n_iter: Some(1),
         };
-        super::enrich_override_settings_from_forge_options(&mut payload_std, "v1-5-pruned.safetensors", &standard_opts);
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_std,
+            "v1-5-pruned.safetensors",
+            &standard_opts,
+        );
         let ov_std = payload_std.override_settings.unwrap();
         assert!(ov_std.get("forge_additional_modules").is_none());
     }

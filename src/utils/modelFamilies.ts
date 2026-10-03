@@ -72,7 +72,7 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
     },
     {
         id: "sd35",
-        test: (s) => /sd[\s_-]*3[\._-]?5/.test(s),
+        test: (s) => /sd[\s_-]*3[._-]?5/.test(s),
     },
     {
         id: "sd3",
@@ -89,7 +89,7 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
     {
         id: "sd15",
         test: (s) =>
-            /sd[\s_-]*1[\._-]?5/.test(s) ||
+            /sd[\s_-]*1[._-]?5/.test(s) ||
             s.includes("sd15") ||
             s.includes("stable diffusion 1.5") ||
             s.includes("v1-5"),
@@ -97,7 +97,7 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
     {
         id: "sd21",
         test: (s) =>
-            /sd[\s_-]*2[\._-]?1/.test(s) ||
+            /sd[\s_-]*2[._-]?1/.test(s) ||
             s.includes("sd21") ||
             s.includes("stable diffusion 2.1") ||
             s.includes("v2-1"),
@@ -127,11 +127,11 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
         test: (s) =>
             /wan[\s_-]*2/.test(s) ||
             s.includes("wanvideo") ||
-            /(?:^|[\s_-])wan(?:[\s_\.-]|$)/.test(s),
+            /(?:^|[\s_-])wan(?:[\s_.-]|$)/.test(s),
     },
     {
         id: "sana",
-        test: (s) => /(?:^|[\s_-])sana(?:[\s_\.-]|$)/.test(s),
+        test: (s) => /(?:^|[\s_-])sana(?:[\s_.-]|$)/.test(s),
     },
     {
         id: "chroma",
