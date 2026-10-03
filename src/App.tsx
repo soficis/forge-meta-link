@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, useMemo, useRef } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./queryClient";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Gallery } from "./components/Gallery";
 import { PhotoViewer } from "./components/PhotoViewer";
@@ -54,15 +55,6 @@ import type {
     StorageProfile,
 } from "./types/metadata";
 import { needsBulkTrashConfirm } from "./utils/deleteHelpers";
-
-const queryClient = new QueryClient({
-    defaultOptions: {
-        queries: {
-            retry: 1,
-            refetchOnWindowFocus: false,
-        },
-    },
-});
 
 const DELETE_UNDO_WINDOW_MS = 6000;
 

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { PhotoViewer } from "../PhotoViewer";
 import { installTauriMock, type Handlers, type TauriMock } from "../../test/tauriMock";
-import type { GalleryImageRecord, ImageRecord, LineageTrace } from "../../types/metadata";
+import type { GalleryImageRecord, ImageRecord, LineageTrace, PromptEntry } from "../../types/metadata";
 
 const gallery = (id: number, name: string): GalleryImageRecord => ({
     id,
@@ -183,5 +183,93 @@ describe("PhotoViewer trace-back", () => {
         expect(screen.getByTestId("lineage-trace-ghost-51")).toBeTruthy();
         expect(screen.queryByTestId("lineage-trace-ghost-thumb-51")).toBeNull();
         expect(screen.getAllByText(/culled ancestor/).length).toBe(2);
+    });
+});
+
+const savedPrompt = (over: Partial<PromptEntry> = {}): PromptEntry => ({
+    id: 7,
+    title: "Studio portrait",
+    prompt: "studio portrait, soft light",
+    negative_prompt: "harsh shadows",
+    tags: "portrait",
+    notes: "",
+    source_image_id: null,
+    use_count: 0,
+    created_at: 0,
+    updated_at: 0,
+    ...over,
+});
+
+describe("PhotoViewer prompt library wiring", () => {
+    const libraryHandlers = (entries: PromptEntry[]) =>
+        baseHandlers({
+            list_prompts: () => entries,
+            list_prompt_tags: () => [],
+            use_prompt: () => null,
+            save_prompt: ({ prompt: text }) => ({
+                created: true,
+                entry: savedPrompt({ prompt: String(text) }),
+            }),
+        });
+
+    it("Apply from the viewer's Library fills prompt and negative prompt, records the use and closes", async () => {
+        mock = installTauriMock(libraryHandlers([savedPrompt()]));
+        render(viewer(0));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
+
+        fireEvent.click(screen.getByRole("button", { name: "Library" }));
+        const dialog = await screen.findByRole("dialog", { name: "Prompt library" });
+        await within(dialog).findByText("Studio portrait");
+        fireEvent.click(within(dialog).getByText("Apply"));
+
+        await waitFor(() => expect(promptBox().value).toBe("studio portrait, soft light"));
+        const negative = screen.getByPlaceholderText("Negative prompt") as HTMLTextAreaElement;
+        expect(negative.value).toBe("harsh shadows");
+        await waitFor(() => expect(screen.queryByRole("dialog", { name: "Prompt library" })).toBeNull());
+        expect(mock.argsOf("use_prompt")).toEqual([{ id: 7 }]);
+        expect(screen.getByText(/Applied "Studio portrait"/)).toBeTruthy();
+    });
+
+    it("an applied prompt is not overwritten when the same image's detail finishes loading later", async () => {
+        mock = installTauriMock(libraryHandlers([savedPrompt()]));
+        render(viewer(0));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
+        fireEvent.click(screen.getByRole("button", { name: "Library" }));
+        const dialog = await screen.findByRole("dialog", { name: "Prompt library" });
+        await within(dialog).findByText("Studio portrait");
+        fireEvent.click(within(dialog).getByText("Apply"));
+        await waitFor(() => expect(promptBox().value).toBe("studio portrait, soft light"));
+        await sleep(300);
+        expect(promptBox().value).toBe("studio portrait, soft light");
+    });
+
+    it("Save to library sends the text in the box (edited or not) with the current image as source", async () => {
+        mock = installTauriMock(libraryHandlers([]));
+        render(viewer(1));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a misty forest"));
+        fireEvent.change(promptBox(), { target: { value: "a misty forest, volumetric fog" } });
+
+        fireEvent.click(screen.getByRole("button", { name: "Save to library" }));
+        await waitFor(() => expect(mock.count("save_prompt")).toBe(1));
+        expect(mock.argsOf("save_prompt")[0]).toMatchObject({
+            prompt: "a misty forest, volumetric fog",
+            negativePrompt: "blurry",
+            sourceImageId: 2,
+        });
+        expect(await screen.findByText("Saved to prompt library.")).toBeTruthy();
+    });
+
+    it("Save to library refuses an empty prompt without calling the backend", async () => {
+        mock = installTauriMock(libraryHandlers([]));
+        render(viewer(0));
+        fireEvent.click(await screen.findByTestId("viewer-tab-forge"));
+        await waitFor(() => expect(promptBox().value).toBe("a lighthouse at dusk"));
+        fireEvent.change(promptBox(), { target: { value: "   " } });
+        fireEvent.click(screen.getByRole("button", { name: "Save to library" }));
+        expect(await screen.findByText(/Nothing to save/)).toBeTruthy();
+        expect(mock.count("save_prompt")).toBe(0);
     });
 });
