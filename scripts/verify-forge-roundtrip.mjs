@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { applyOps, expandSweep, changedOverrides } from '../src/utils/mutations.ts';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -56,12 +57,46 @@ async function main() {
     // 64-bit seed. This replaces the earlier hand-copied JS builder, which proved nothing about the app.
     console.log(`Running app payload-path gate (cargo test --test forge_live_gate)...`);
     const jsonDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-gate-'));
+
+    // Mutation sweep fixture, computed by the app's real operator code (src/utils/mutations.ts),
+    // exactly as MutationPopover does: base holds only what the record carries (no scheduler),
+    // and only the fields an operator changed are sent as overrides.
+    const SOURCE_BASE = { steps: '4', sampler: 'Euler a', schedule_type: 'exponential', cfg_scale: '5.5', seed: '4294967299', width: 64, height: 64 };
+    const uiBase = {
+        prompt: '', negative_prompt: '', steps: SOURCE_BASE.steps, sampler: SOURCE_BASE.sampler,
+        schedule_type: null, cfg_scale: SOURCE_BASE.cfg_scale, seed: SOURCE_BASE.seed,
+        width: SOURCE_BASE.width, height: SOURCE_BASE.height, model_hash: null, model_name: null,
+        generation_type: null, extra_params: {}, raw_metadata: '',
+    };
+    const sweepVariants = expandSweep({
+        seedSteps: [1, 2, 4],
+        cfgDeltas: [1],
+        stepsDeltas: [2],
+        swaps: [{ sampler: 'Euler' }, { scheduler: 'karras' }, { sampler: 'DPM++ 2M', scheduler: 'simple' }],
+    }).map(ops => {
+        const mutated = applyOps(uiBase, ops);
+        const overrides = changedOverrides(uiBase, mutated);
+        return {
+            ops,
+            overrides,
+            expected: {
+                steps: mutated.steps,
+                sampler: mutated.sampler,
+                scheduler: mutated.schedule_type ?? SOURCE_BASE.schedule_type,
+                cfg_scale: mutated.cfg_scale,
+                seed: mutated.seed,
+            },
+        };
+    });
+    const sweepFixture = path.join(jsonDir, 'sweep-fixture.in');
+    fs.writeFileSync(sweepFixture, JSON.stringify({ base: SOURCE_BASE, variants: sweepVariants }, null, 2));
+    console.log(`  sweep fixture: ${sweepVariants.length} variants from real operator code`);
     const cargo = spawnSync(
         'cargo',
         ['test', '--manifest-path', path.join(REPO_ROOT, 'src-tauri', 'Cargo.toml'),
          '--test', 'forge_live_gate', '--', '--nocapture', '--test-threads=1'],
         {
-            env: { ...process.env, FORGE_LIVE_URL: BASE_URL, FORGE_GATE_JSON: jsonDir },
+            env: { ...process.env, FORGE_LIVE_URL: BASE_URL, FORGE_GATE_JSON: jsonDir, FORGE_SWEEP_JSON: sweepFixture },
             encoding: 'utf-8',
         }
     );
@@ -186,7 +221,7 @@ Target: \`${BASE_URL}\`
 
 ## Executive Summary
 - **Ship Gate Status**: **${gatePassed ? 'PASSED' : 'FAILED'}** for G9 requeue round-trip (${gateChecks.length} field checks across the app's real payload paths, ${gateFailures.length} mismatch(es)).
-- **Scope**: Send-to/batch path, requeue path, three per-variant requests with distinct seed/CFG, ADetailer variant, LoRA, and a 64-bit seed (above 2^32). Built by the app's own Rust builders from a real ingested PNG, not a copy.
+- **Scope**: Send-to/batch path, requeue path, three per-variant requests with distinct seed/CFG, a mutation sweep (${sweepVariants.length} variants from the real operator code: seed step, CFG and steps deltas, sampler/scheduler swaps), ADetailer variant, LoRA, and a 64-bit seed (above 2^32). Built by the app's own Rust builders from a real ingested PNG, not a copy.
 - **Scheduler Round-Trip**: Forge reports display labels (e.g. \`karras\` -> \`Karras\`); comparison is case-insensitive.
 - **Matrices below** only show which names Forge accepts for a trivial request; they do not prove the app preserves them.
 

@@ -98,12 +98,7 @@ pub async fn scan_directory(
         let mut files_to_process: Vec<PendingFile> = image_files
             .into_iter()
             .filter_map(|scanned| {
-                let filepath_str = scanned.path.to_string_lossy();
-                let is_unchanged = matches!(
-                    (scanned.file_mtime, existing_mtimes.get(filepath_str.as_ref())),
-                    (Some(cur), Some(existing)) if cur == *existing
-                );
-                if is_unchanged {
+                if scanner::is_unchanged(&scanned, &existing_mtimes) {
                     None
                 } else {
                     Some(PendingFile {

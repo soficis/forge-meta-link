@@ -228,3 +228,50 @@ fn test_p2_scan_mtime_map_excludes_culled_rows_so_restored_file_is_reprocessed()
     assert!(map.contains_key("/gallery/live.png"));
     assert!(!map.contains_key("/gallery/culled.png"), "culled row must not mask a restored file");
 }
+
+#[test]
+fn test_p2_real_scan_after_trash_restore_reingests_the_file() {
+    use forge_meta_link_lib::scanner;
+
+    let dir = std::env::temp_dir().join(format!(
+        "forge_p2_restore_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("restored.png");
+    std::fs::write(&file, b"not a real png, extension is enough for the scanner").unwrap();
+
+    let db = test_db();
+    let scan = |db: &Database| {
+        let existing = db.get_all_file_mtimes().unwrap();
+        scanner::scan_directory(&dir)
+            .into_iter()
+            .filter(|f| !scanner::is_unchanged(f, &existing))
+            .collect::<Vec<_>>()
+    };
+
+    // First scan: new file is picked up; index it the way the scan command does.
+    let first = scan(&db);
+    assert_eq!(first.len(), 1);
+    let mtime = first[0].file_mtime;
+    let p = GenerationParams { prompt: "restore me".into(), raw_metadata: "restore me".into(), ..Default::default() };
+    let path_str = first[0].path.to_string_lossy().to_string();
+    let id = db.upsert_image(&path_str, "restored.png", dir.to_str().unwrap(), &p, mtime).unwrap();
+
+    // Unchanged live file is skipped.
+    assert!(scan(&db).is_empty(), "an unchanged live file must be skipped");
+
+    // User deletes to Trash (tombstone), then restores it: same path, same mtime, file untouched.
+    db.cull_images(&[id], CullMode::Trash).unwrap();
+    assert_eq!(db.get_total_count().unwrap(), 0);
+    let after_restore = scan(&db);
+    assert_eq!(after_restore.len(), 1, "a restored file must be re-processed, not skipped");
+
+    // Re-ingesting it brings the same row back into the live view.
+    let again = db.upsert_image(&path_str, "restored.png", dir.to_str().unwrap(), &p, mtime).unwrap();
+    assert_eq!(again, id);
+    assert_eq!(db.get_total_count().unwrap(), 1);
+    assert!(scan(&db).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

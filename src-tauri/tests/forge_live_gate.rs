@@ -12,7 +12,7 @@
 
 use forge_meta_link_lib::{
     database::{Database, ImageRecord},
-    forge_api::{self, ForgePayload, ForgePayloadBuildInput},
+    forge_api::{self, ForgePayload},
     parser::{self, GenerationParams},
     scanner, StorageProfile,
 };
@@ -137,7 +137,7 @@ fn make_source(url: &str) -> Source {
             negative_prompt: "blurry, lowres".into(),
             steps: Some("4".into()),
             sampler: Some("Euler a".into()),
-            schedule_type: Some("karras".into()),
+            schedule_type: Some("exponential".into()),
             cfg_scale: Some("5.5".into()),
             seed: Some(SOURCE_SEED.into()),
             width: Some(64),
@@ -164,34 +164,37 @@ fn make_source(url: &str) -> Source {
     })
 }
 
-/// Mirrors `build_payload_for_image` in commands/forge.rs (the Send-to / batch path):
-/// scheduler resolves through `forge_api::resolve_scheduler`, everything else straight from the record.
-fn send_to_payload(
-    rec: &ImageRecord,
-    include_seed: bool,
-    adetailer: bool,
-    seed_override: Option<&str>,
-    cfg_override: Option<&str>,
-) -> ForgePayload {
-    let scheduler = forge_api::resolve_scheduler(None, &rec.raw_metadata);
-    forge_api::build_payload_from_image_record(ForgePayloadBuildInput {
-        prompt: &rec.prompt,
-        negative_prompt: &rec.negative_prompt,
-        steps: rec.steps.as_deref(),
-        sampler: rec.sampler.as_deref(),
-        scheduler: scheduler.as_deref(),
-        cfg_scale: cfg_override.or(rec.cfg_scale.as_deref()),
-        seed: seed_override.or(rec.seed.as_deref()),
-        width: rec.width,
-        height: rec.height,
-        model_name: rec.model_name.as_deref(),
-        include_seed,
-        adetailer_face_enabled: adetailer,
-        adetailer_face_model: Some("face_yolov8n.pt"),
-    })
+/// Overrides a caller may apply on top of a stored image (same shape the UI sends).
+#[derive(Default, Clone)]
+struct Ov {
+    seed: Option<String>,
+    cfg: Option<String>,
+    steps: Option<String>,
+    sampler: Option<String>,
+    scheduler: Option<String>,
 }
 
-/// Mirrors `forge_requeue_image` in commands/forge.rs.
+/// Calls the production `forge_api::build_payload_for_record`, the same function the Send-to
+/// commands use for override precedence (override, else stored record, scheduler from metadata).
+fn send_to_payload(rec: &ImageRecord, include_seed: bool, adetailer: bool, ov: &Ov) -> ForgePayload {
+    forge_api::build_payload_for_record(
+        rec,
+        &rec.prompt,
+        &forge_api::RecordOverrides {
+            seed: ov.seed.as_deref(),
+            cfg_scale: ov.cfg.as_deref(),
+            steps: ov.steps.as_deref(),
+            sampler: ov.sampler.as_deref(),
+            scheduler: ov.scheduler.as_deref(),
+            ..Default::default()
+        },
+        include_seed,
+        adetailer,
+        Some("face_yolov8n.pt"),
+    )
+}
+
+/// Mirrors `forge_requeue_image` in commands/forge.rs (it assembles GenerationParams inline).
 fn requeue_params(rec: &ImageRecord) -> GenerationParams {
     let stored = parser::parse_generation_metadata(&rec.raw_metadata);
     GenerationParams {
@@ -262,7 +265,7 @@ fn live_requeue_paths_roundtrip_every_field() {
 
     run(async {
         // 1. Send-to / batch path (forge_send_to_image(s)).
-        let (_, info) = generate(&send_to_payload(&src.record, true, false, None, None), &url).await;
+        let (_, info) = generate(&send_to_payload(&src.record, true, false, &Ov::default()), &url).await;
         all.extend(compare("send_to", &src.params, &parse_infotext(&info)));
 
         // 2. Requeue path (forge_requeue_image).
@@ -279,7 +282,16 @@ fn live_requeue_paths_roundtrip_every_field() {
             expect.seed = Some((*seed).into());
             expect.cfg_scale = Some((*cfg).into());
             let (_, info) =
-                generate(&send_to_payload(&src.record, true, false, Some(seed), Some(cfg)), &url).await;
+                generate(
+                    &send_to_payload(
+                        &src.record,
+                        true,
+                        false,
+                        &Ov { seed: Some((*seed).into()), cfg: Some((*cfg).into()), ..Ov::default() },
+                    ),
+                    &url,
+                )
+                .await;
             all.extend(compare(&format!("variant{}", i + 1), &expect, &parse_infotext(&info)));
         }
     });
@@ -291,19 +303,19 @@ fn live_requeue_paths_roundtrip_every_field() {
 #[test]
 fn live_adetailer_variant_keeps_params_and_is_actually_applied() {
     let Some(url) = live_url() else { return };
-    run(async {
+    let has_adetailer = run(async {
         let scripts = get_json(&format!("{url}/sdapi/v1/scripts")).await;
-        let has_adetailer = scripts["txt2img"]
+        scripts["txt2img"]
             .as_array()
-            .map(|a| a.iter().any(|s| s.as_str().map(|n| n.eq_ignore_ascii_case("adetailer")).unwrap_or(false)))
-            .unwrap_or(false);
-        if !has_adetailer {
-            eprintln!("ADetailer not installed on this Forge; skipping");
-            return;
-        }
+            .map(|a| a.iter().any(|s| s.as_str().is_some_and(|n| n.eq_ignore_ascii_case("adetailer"))))
+            .unwrap_or(false)
     });
+    if !has_adetailer {
+        eprintln!("ADetailer not installed on this Forge; skipping");
+        return;
+    }
     let src = make_source(&url);
-    let (_, info) = run(generate(&send_to_payload(&src.record, true, true, None, None), &url));
+    let (_, info) = run(generate(&send_to_payload(&src.record, true, true, &Ov::default()), &url));
     let mut all = compare("adetailer", &src.params, &parse_infotext(&info));
     let applied = info.contains("ADetailer");
     all.push(CheckResult {
@@ -325,13 +337,58 @@ fn live_lora_survives_requeue() {
         eprintln!("No LoRA installed on this Forge; skipping");
         return;
     };
-    let (_, info) = run(generate(&send_to_payload(&src.record, true, false, None, None), &url));
+    let (_, info) = run(generate(&send_to_payload(&src.record, true, false, &Ov::default()), &url));
     let got = parse_infotext(&info);
     let in_prompt = got.prompt.contains(&format!("<lora:{name}"));
     let hashes = got.extra_params.get("Lora hashes").cloned().unwrap_or_default();
     assert!(in_prompt, "LoRA tag missing from regenerated prompt: {}", got.prompt);
     assert!(
-        hashes.contains(&name) || src.params.extra_params.get("Lora hashes").is_none(),
+        hashes.contains(&name),
         "LoRA was not loaded by Forge on requeue (Lora hashes: {hashes:?})"
     );
+}
+
+/// Mutation sweep: every variant produced by the app's real operator code (see the node script,
+/// which writes the fixture) must come back from Forge with exactly the mutated parameters and
+/// nothing else changed. In particular an unswapped scheduler must stay the source's scheduler.
+#[test]
+fn live_sweep_variants_apply_exactly_the_mutated_fields() {
+    let Some(url) = live_url() else { return };
+    let Ok(path) = std::env::var("FORGE_SWEEP_JSON") else {
+        eprintln!("FORGE_SWEEP_JSON not set (run via scripts/verify-forge-roundtrip.mjs); skipping sweep");
+        return;
+    };
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("fixture unreadable"))
+        .expect("fixture is not JSON");
+    let src = make_source(&url);
+    let base = &fixture["base"];
+    assert_eq!(base["seed"].as_str(), src.params.seed.as_deref(), "fixture base seed drifted from the source image");
+    assert_eq!(base["cfg_scale"].as_str(), src.params.cfg_scale.as_deref(), "fixture base cfg drifted");
+    assert_eq!(base["schedule_type"].as_str().map(str::to_lowercase), src.params.schedule_type.as_deref().map(str::to_lowercase));
+
+    let variants = fixture["variants"].as_array().expect("variants missing");
+    assert!(!variants.is_empty(), "empty sweep fixture");
+    let mut all = Vec::new();
+    run(async {
+        for (i, v) in variants.iter().enumerate() {
+            let get = |o: &Value, k: &str| o[k].as_str().map(String::from);
+            let ov = Ov {
+                seed: get(&v["overrides"], "seed"),
+                cfg: get(&v["overrides"], "cfg_scale"),
+                steps: get(&v["overrides"], "steps"),
+                sampler: get(&v["overrides"], "sampler_name"),
+                scheduler: get(&v["overrides"], "scheduler"),
+            };
+            let mut expect = src.params.clone();
+            expect.steps = get(&v["expected"], "steps");
+            expect.sampler = get(&v["expected"], "sampler");
+            expect.schedule_type = get(&v["expected"], "scheduler");
+            expect.cfg_scale = get(&v["expected"], "cfg_scale");
+            expect.seed = get(&v["expected"], "seed");
+            let (_, info) = generate(&send_to_payload(&src.record, true, false, &ov), &url).await;
+            all.extend(compare(&format!("sweep{:02}", i + 1), &expect, &parse_infotext(&info)));
+        }
+    });
+    report("sweep", &all);
+    assert_all_ok(&all);
 }
