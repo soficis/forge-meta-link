@@ -100,6 +100,8 @@ impl Database {
                     let seed_int: Option<i64> =
                         record.params.seed.as_deref().and_then(parse_seed_int);
 
+                    demote_stale_culled_row(&tx, &record.filepath, record.quick_hash.as_deref())?;
+
                     let id: i64 = upsert_image_stmt.query_row(
                         params![
                             record.filepath,
@@ -319,14 +321,14 @@ impl Database {
             [],
         )?;
 
-        // 3. Apply culling per mode
-        match mode {
+        // 3. Apply culling per mode; `culled` counts rows actually changed.
+        let culled = match mode {
             CullMode::Trash => {
                 let sql = format!(
                     "UPDATE images SET culled_at = strftime('%s','now') WHERE id IN ({})",
                     placeholders
                 );
-                tx.execute(&sql, params_from_iter(params_ids))?;
+                tx.execute(&sql, params_from_iter(params_ids))?
             }
             CullMode::Permanent => {
                 let mut select_stmt = tx.prepare(
@@ -343,6 +345,9 @@ impl Database {
                         extra_params = NULL,
                         model_name = NULL,
                         model_hash = NULL,
+                        filename = 'ghost',
+                        directory = '',
+                        quick_hash = NULL,
                         filepath = ?2
                      WHERE id = ?3",
                 )?;
@@ -353,6 +358,7 @@ impl Database {
                     "DELETE FROM lineage_overrides WHERE child_filepath = ?1 OR parent_filepath = ?1",
                 )?;
 
+                let mut culled = 0usize;
                 for id in ids {
                     let row_res = select_stmt.query_row(params![id], |row| {
                         Ok((
@@ -366,7 +372,14 @@ impl Database {
                         ))
                     });
 
-                    if let Ok((old_fp, seed, cfg, steps, sampler, scheduler, model)) = row_res {
+                    // A missing row is skipped (and not counted); any other error aborts the whole
+                    // transaction so a file that is already gone is never left fully indexed.
+                    let found = match row_res {
+                        Ok(row) => Some(row),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some((old_fp, seed, cfg, steps, sampler, scheduler, model)) = found {
                         del_lineage.execute(params![old_fp])?;
                         del_lineage_overrides.execute(params![old_fp])?;
 
@@ -380,13 +393,15 @@ impl Database {
                         });
                         let ghost_path = format!("ghost://{}", id);
                         update_stmt.execute(params![recipe.to_string(), ghost_path, id])?;
+                        culled += 1;
                     }
                 }
+                culled
             }
-        }
+        };
 
         tx.commit()?;
-        Ok(ids.len())
+        Ok(culled)
     }
 
     // ────────────────────────────── Reads ──────────────────────────────
@@ -590,4 +605,33 @@ impl Database {
         tx.commit()?;
         Ok(updated > 0)
     }
+}
+
+/// A Trash-culled row keeps its unique `filepath`. If a DIFFERENT file (different content
+/// fingerprint) is later saved at that path, upserting would resurrect the old row, and the old
+/// row's children would then claim the unrelated new image as their parent. Move the culled row
+/// aside to a `ghost://` path first; a restored copy of the same file (same fingerprint) is left
+/// alone so the normal resurrection still applies.
+fn demote_stale_culled_row(
+    tx: &rusqlite::Transaction<'_>,
+    filepath: &str,
+    new_hash: Option<&str>,
+) -> SqlResult<()> {
+    let Some(new_hash) = new_hash else { return Ok(()) };
+    let existing: Option<(i64, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT id, quick_hash, culled_at FROM images WHERE filepath = ?1",
+            params![filepath],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    if let Some((id, Some(old_hash), Some(_))) = existing {
+        if old_hash != new_hash {
+            tx.execute(
+                "UPDATE images SET filepath = ?1 WHERE id = ?2",
+                params![format!("ghost://{}", id), id],
+            )?;
+        }
+    }
+    Ok(())
 }

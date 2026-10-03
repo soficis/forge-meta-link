@@ -3,9 +3,51 @@ use std::path::Path;
 const SERVICE: &str = "com.forgemetalink.app";
 const ACCOUNT: &str = "forge-api-key";
 
+/// Keyring service name. A debug run that redirects its data folder (`FORGE_META_LINK_DATA_DIR`)
+/// also gets its own keyring entry, so an isolated test instance can never read or overwrite the
+/// real Forge API key.
+pub(crate) fn service_name(isolated: bool) -> String {
+    if isolated {
+        format!("{SERVICE}.isolated")
+    } else {
+        SERVICE.to_string()
+    }
+}
+
+/// Debug builds only: a non-empty `FORGE_META_LINK_DATA_DIR` means an isolated run.
+pub(crate) fn isolated_from_env(raw: Option<String>) -> bool {
+    cfg!(debug_assertions) && raw.is_some_and(|v| !v.trim().is_empty())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread stand-in for the environment so tests can flip isolation without touching the
+    /// process-wide environment (which other tests read concurrently).
+    static TEST_DATA_DIR_ENV: std::cell::RefCell<Option<Option<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn data_dir_env() -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_DATA_DIR_ENV.with(|cell| cell.borrow().clone()) {
+            return value;
+        }
+    }
+    std::env::var("FORGE_META_LINK_DATA_DIR").ok()
+}
+
+/// The keyring service this process must use. Both the real keyring entry and the test mock
+/// derive their key from this one function, so isolation cannot be wired in one and missed in
+/// the other.
+fn keyring_service() -> String {
+    service_name(isolated_from_env(data_dir_env()))
+}
+
 #[cfg(not(test))]
 fn keyring_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| format!("keyring entry error: {}", e))
+    keyring::Entry::new(&keyring_service(), ACCOUNT)
+        .map_err(|e| format!("keyring entry error: {}", e))
 }
 
 #[cfg(test)]
@@ -203,8 +245,8 @@ mod mock_store {
         STORE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn key() -> String {
-        format!("{}:{}", super::SERVICE, super::ACCOUNT)
+    pub(super) fn key() -> String {
+        format!("{}:{}", super::keyring_service(), super::ACCOUNT)
     }
 
     pub fn set_fail_get(fail: bool) {
@@ -254,5 +296,53 @@ mod mock_store {
         if let Ok(mut map) = store().lock() {
             map.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod service_name_tests {
+    use super::{isolated_from_env, keyring_service, mock_store, service_name, TEST_DATA_DIR_ENV};
+
+    fn with_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        TEST_DATA_DIR_ENV.with(|c| *c.borrow_mut() = Some(value.map(String::from)));
+        let result = f();
+        TEST_DATA_DIR_ENV.with(|c| *c.borrow_mut() = None);
+        result
+    }
+
+    #[test]
+    fn isolated_runs_never_share_the_real_keyring_entry() {
+        assert_eq!(service_name(false), "com.forgemetalink.app");
+        assert_ne!(service_name(true), service_name(false));
+        assert!(service_name(true).starts_with("com.forgemetalink.app"));
+    }
+
+    #[test]
+    fn only_a_non_empty_data_dir_override_counts_as_isolated() {
+        if !cfg!(debug_assertions) {
+            assert!(!isolated_from_env(Some("C:/x".into())), "release builds ignore the override");
+            return;
+        }
+        assert!(isolated_from_env(Some("C:/x".into())));
+        assert!(!isolated_from_env(None));
+        assert!(!isolated_from_env(Some(String::new())));
+        assert!(!isolated_from_env(Some("   ".into())));
+    }
+
+    #[test]
+    fn the_service_and_the_mock_store_key_both_follow_the_environment() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let real_service = with_env(None, keyring_service);
+        let iso_service = with_env(Some("C:/isolated"), keyring_service);
+        assert_eq!(real_service, "com.forgemetalink.app");
+        assert_ne!(real_service, iso_service);
+
+        // the mock (and therefore every load/persist path under test) keys off the same service
+        let real_key = with_env(None, mock_store::key);
+        let iso_key = with_env(Some("C:/isolated"), mock_store::key);
+        assert_ne!(real_key, iso_key, "an isolated run must not read or write the real key");
+        assert!(iso_key.starts_with(&iso_service));
     }
 }

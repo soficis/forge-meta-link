@@ -275,3 +275,84 @@ fn test_p2_real_scan_after_trash_restore_reingests_the_file() {
     assert!(scan(&db).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn bulk(path: &str, hash: &str) -> forge_meta_link_lib::database::BulkRecord {
+    forge_meta_link_lib::database::BulkRecord {
+        filepath: path.to_string(),
+        filename: path.rsplit('/').next().unwrap().to_string(),
+        directory: "/private/folder".to_string(),
+        params: GenerationParams {
+            prompt: "secret prompt".into(),
+            raw_metadata: "secret prompt".into(),
+            seed: Some("42".into()),
+            ..Default::default()
+        },
+        file_mtime: Some(1),
+        file_size: Some(10),
+        quick_hash: Some(hash.to_string()),
+        tags: vec![],
+    }
+}
+
+#[test]
+fn test_p2_permanent_cull_also_blanks_file_name_folder_and_content_fingerprint() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/private/folder/holiday.png", "hash-1")]).unwrap();
+    let id = db.get_image_id_by_filepath("/private/folder/holiday.png").unwrap().unwrap();
+
+    assert_eq!(db.cull_images(&[id], CullMode::Permanent).unwrap(), 1);
+
+    let conn = db.pool_get_for_test().unwrap();
+    let (filename, directory, hash, filepath): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT filename, directory, quick_hash, filepath FROM images WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(!filename.contains("holiday"), "file name must not survive a permanent delete");
+    assert!(!directory.contains("private"), "folder must not survive a permanent delete");
+    assert!(hash.is_none(), "content fingerprint must not survive a permanent delete");
+    assert_eq!(filepath, format!("ghost://{id}"));
+}
+
+#[test]
+fn test_p2_cull_counts_only_rows_that_exist() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/a/one.png", "h1")]).unwrap();
+    let id = db.get_image_id_by_filepath("/a/one.png").unwrap().unwrap();
+    assert_eq!(db.cull_images(&[id, 9999], CullMode::Permanent).unwrap(), 1);
+    assert_eq!(db.cull_images(&[424242], CullMode::Trash).unwrap(), 0);
+}
+
+#[test]
+fn test_p2_different_file_at_a_trashed_path_does_not_inherit_the_old_row_or_its_children() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-old")]).unwrap();
+    let old_id = db.get_image_id_by_filepath("/lib/same.png").unwrap().unwrap();
+    db.cull_images(&[old_id], CullMode::Trash).unwrap();
+
+    // a different image (different fingerprint) is later written to the same path
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-new")]).unwrap();
+    let new_id = db.get_image_id_by_filepath("/lib/same.png").unwrap().unwrap();
+    assert_ne!(new_id, old_id, "an unrelated file must get its own row");
+
+    let conn = db.pool_get_for_test().unwrap();
+    let (old_path, old_culled): (String, Option<i64>) = conn
+        .query_row("SELECT filepath, culled_at FROM images WHERE id = ?1", params![old_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(old_path, format!("ghost://{old_id}"));
+    assert!(old_culled.is_some(), "the old row stays a ghost");
+    assert_eq!(db.get_total_count().unwrap(), 1, "only the new image is live");
+}
+
+#[test]
+fn test_p2_restoring_the_same_file_still_resurrects_the_same_row() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-1")]).unwrap();
+    let id = db.get_image_id_by_filepath("/lib/same.png").unwrap().unwrap();
+    db.cull_images(&[id], CullMode::Trash).unwrap();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-1")]).unwrap();
+    assert_eq!(db.get_image_id_by_filepath("/lib/same.png").unwrap(), Some(id));
+    assert_eq!(db.get_total_count().unwrap(), 1);
+}

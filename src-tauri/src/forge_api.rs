@@ -227,6 +227,11 @@ pub struct RecordOverrides<'a> {
     pub height: Option<u32>,
 }
 
+/// An override that is `None` or only whitespace counts as unset.
+fn present(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 /// The one place that decides which value wins when re-generating a stored image
 /// (override first, else the stored record, scheduler via [`resolve_scheduler`]).
 /// `prompt` is passed in already resolved because callers may append LoRA tags to it.
@@ -239,19 +244,22 @@ pub fn build_payload_for_record(
     adetailer_face_model: Option<&str>,
 ) -> ForgePayload {
     let scheduler = resolve_scheduler(overrides.scheduler, &image.raw_metadata);
+    // A blank override means "not set", never "send nothing": a cleared Steps box must not
+    // silently turn into Forge's default. (The negative prompt is the exception: blank there is
+    // a legitimate "no negative prompt".)
     build_payload_from_image_record(ForgePayloadBuildInput {
         prompt,
         negative_prompt: overrides
             .negative_prompt
             .unwrap_or(image.negative_prompt.as_str()),
-        steps: overrides.steps.or(image.steps.as_deref()),
-        sampler: overrides.sampler.or(image.sampler.as_deref()),
+        steps: present(overrides.steps).or(image.steps.as_deref()),
+        sampler: present(overrides.sampler).or(image.sampler.as_deref()),
         scheduler: scheduler.as_deref(),
-        cfg_scale: overrides.cfg_scale.or(image.cfg_scale.as_deref()),
-        seed: overrides.seed.or(image.seed.as_deref()),
+        cfg_scale: present(overrides.cfg_scale).or(image.cfg_scale.as_deref()),
+        seed: present(overrides.seed).or(image.seed.as_deref()),
         width: overrides.width.or(image.width),
         height: overrides.height.or(image.height),
-        model_name: overrides.model_name.or(image.model_name.as_deref()),
+        model_name: present(overrides.model_name).or(image.model_name.as_deref()),
         include_seed,
         adetailer_face_enabled,
         adetailer_face_model,
@@ -838,6 +846,61 @@ mod tests {
                 .is_none(),
             "must not send a LoRA always-on script"
         );
+    }
+
+    fn stored_image() -> crate::database::ImageRecord {
+        crate::database::ImageRecord {
+            id: 1,
+            filepath: "/lib/a.png".into(),
+            filename: "a.png".into(),
+            directory: "/lib".into(),
+            prompt: "a cat".into(),
+            negative_prompt: "blurry".into(),
+            steps: Some("20".into()),
+            sampler: Some("Euler a".into()),
+            cfg_scale: Some("7".into()),
+            seed: Some("4294967299".into()),
+            width: Some(512),
+            height: Some(512),
+            model_hash: None,
+            model_name: Some("m.safetensors".into()),
+            raw_metadata: "a cat
+Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 4294967299".into(),
+            is_favorite: false,
+            is_locked: false,
+        }
+    }
+
+    #[test]
+    fn blank_overrides_fall_back_to_the_stored_values() {
+        let img = stored_image();
+        let blank = crate::forge_api::RecordOverrides {
+            steps: Some("  "),
+            sampler: Some(""),
+            cfg_scale: Some(" "),
+            seed: Some(""),
+            model_name: Some(""),
+            ..Default::default()
+        };
+        let p = crate::forge_api::build_payload_for_record(&img, &img.prompt, &blank, true, false, None);
+        assert_eq!(p.steps, Some(20), "a cleared Steps box must not become Forge's default");
+        assert_eq!(p.sampler_name.as_deref(), Some("Euler a"));
+        assert_eq!(p.cfg_scale, Some(7.0));
+        assert_eq!(p.seed, Some(4294967299));
+        assert_eq!(p.scheduler.as_deref(), Some("Karras"));
+    }
+
+    #[test]
+    fn real_overrides_still_win_and_a_blank_negative_prompt_is_respected() {
+        let img = stored_image();
+        let ov = crate::forge_api::RecordOverrides {
+            steps: Some("30"),
+            negative_prompt: Some(""),
+            ..Default::default()
+        };
+        let p = crate::forge_api::build_payload_for_record(&img, &img.prompt, &ov, true, false, None);
+        assert_eq!(p.steps, Some(30));
+        assert_eq!(p.negative_prompt, "", "blank negative prompt is a legitimate choice");
     }
 
     #[test]

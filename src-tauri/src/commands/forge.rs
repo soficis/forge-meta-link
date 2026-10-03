@@ -1109,142 +1109,305 @@ async fn ingest_forge_children(
         .map(|p| *p)
         .unwrap_or(StorageProfile::Hdd);
 
-    let outcome = tauri::async_runtime::spawn_blocking(move || -> Option<String> {
-        let mut warning: Option<String> = None;
-        let mut missing = 0usize;
-        let mut items = Vec::with_capacity(children_clone.len());
-        let mut pathbufs = Vec::with_capacity(children_clone.len());
-
-        for child in &children_clone {
-            let path = PathBuf::from(&child.saved_path);
-            if !path.exists() {
-                missing += 1;
-                continue;
-            }
-            let (file_size, file_mtime) = match path.metadata() {
-                Ok(m) => {
-                    let size = m.len() as i64;
-                    let mtime = m
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    (size, mtime)
-                }
-                Err(_) => (0, 0),
-            };
-
-            let raw_metadata = extract_parameters_metadata(&path, None);
-            let params = if raw_metadata.trim().is_empty() {
-                parser::GenerationParams {
-                    raw_metadata: String::new(),
-                    ..Default::default()
-                }
-            } else {
-                parser::parse_generation_metadata(&raw_metadata)
-            };
-            let mut tags = parser::extract_tags(&params.prompt);
-            if let Some(sidecar_data) = sidecar::read_sidecar(&path) {
-                tags.extend(sidecar_data.tags);
-            }
-
-            let quick_hash = scanner::compute_quick_hash(&path, Some(file_size));
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let directory = path
-                .parent()
-                .unwrap_or(Path::new(""))
-                .to_string_lossy()
-                .to_string();
-
-            let record = BulkRecord {
-                filepath: child.saved_path.clone(),
-                filename,
-                directory,
-                params,
-                file_mtime: Some(file_mtime),
-                file_size: Some(file_size),
-                quick_hash,
-                tags,
-            };
-
-            let edge = if child.parent_image_id > 0 {
-                let ops_value = match &child.mutation_ops {
-                    Some(v) if v.is_array() => v.clone(),
-                    Some(v) => serde_json::json!([v]),
-                    None => serde_json::json!([]),
-                };
-                let ops_obj = serde_json::json!({
-                    "ops": ops_value,
-                    "variant_label": child.variant_label,
-                });
-                Some(LineageEdgeRecord {
-                    parent_id: child.parent_image_id,
-                    ops_json: serde_json::to_string(&ops_obj).ok(),
-                    source: "forge_requeue".to_string(),
-                })
-            } else {
-                None
-            };
-
-            items.push(BulkRecordWithLineage { record, edge });
-            pathbufs.push(path);
-        }
-
-        if missing > 0 {
-            warning = Some(format!(
-                "{} generated image(s) could not be found on disk and were not indexed",
-                missing
-            ));
-        }
-        if !items.is_empty() {
-            if let Err(e) = db.bulk_upsert_with_lineage(&items) {
-                log::error!("Failed to ingest Forge generated images into database: {}", e);
-                // The files exist but are unindexed and have no lineage edge: say so.
-                pathbufs.clear();
-                warning = Some(format!(
-                    "{} image(s) were generated but could not be indexed (no lineage recorded): {}",
-                    items.len(),
-                    e
-                ));
-            } else {
-                log::info!("Successfully ingested {} Forge generated image(s)", items.len());
-            }
-        }
-
-        if !pathbufs.is_empty() {
-            let generated = image_processing::generate_thumbnails(
-                &pathbufs,
-                &cache_dir,
-                storage_profile,
-            );
-            if !generated.is_empty() {
-                if let Ok(mut idx) = thumbnail_index.write() {
-                    for (_, thumb_path) in generated {
-                        idx.insert(thumb_path.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-        warning
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        ingest_children_blocking(&children_clone, &db, &cache_dir, &thumbnail_index, storage_profile)
     })
     .await;
 
-    let warning = match outcome {
-        Ok(w) => w,
-        Err(e) => Some(format!("Indexing generated images failed: {}", e)),
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => IngestOutcome {
+            warning: Some(format!("Indexing generated images failed: {}", e)),
+            ingested: 0,
+        },
     };
 
-    if warning.is_none() {
+    // Refresh the gallery whenever ANY image was indexed, even if another one was missing:
+    // the warning is reported separately and must not hide the images that did arrive.
+    finish_ingest(outcome, saved_paths, |paths| {
         if let Some(app) = app {
-            let _ = app.emit("forge-images-ingested", saved_paths);
+            let _ = app.emit("forge-images-ingested", paths);
+        }
+    })
+}
+
+/// Notifies the UI (through `emit`) when anything was indexed, then hands back the warning.
+fn finish_ingest(
+    outcome: IngestOutcome,
+    saved_paths: Vec<String>,
+    emit: impl FnOnce(Vec<String>),
+) -> Option<String> {
+    if outcome.should_notify() {
+        emit(saved_paths);
+    }
+    outcome.warning
+}
+
+/// Indexes the generated images, stamps lineage edges, and builds thumbnails. Blocking; callers
+/// run it on a blocking thread. Kept free of Tauri state so it can be tested directly.
+fn ingest_children_blocking(
+    children: &[ChildResult],
+    db: &crate::database::Database,
+    cache_dir: &Path,
+    thumbnail_index: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    storage_profile: StorageProfile,
+) -> IngestOutcome {
+    let mut warning: Option<String> = None;
+    let mut ingested = 0usize;
+    let mut missing = 0usize;
+    let mut items = Vec::with_capacity(children.len());
+    let mut pathbufs = Vec::with_capacity(children.len());
+
+    for child in children {
+        let path = PathBuf::from(&child.saved_path);
+        if !path.exists() {
+            missing += 1;
+            continue;
+        }
+        let (file_size, file_mtime) = match path.metadata() {
+            Ok(m) => {
+                let size = m.len() as i64;
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (size, mtime)
+            }
+            Err(_) => (0, 0),
+        };
+
+        let raw_metadata = extract_parameters_metadata(&path, None);
+        let params = if raw_metadata.trim().is_empty() {
+            parser::GenerationParams {
+                raw_metadata: String::new(),
+                ..Default::default()
+            }
+        } else {
+            parser::parse_generation_metadata(&raw_metadata)
+        };
+        let mut tags = parser::extract_tags(&params.prompt);
+        if let Some(sidecar_data) = sidecar::read_sidecar(&path) {
+            tags.extend(sidecar_data.tags);
+        }
+
+        let quick_hash = scanner::compute_quick_hash(&path, Some(file_size));
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let directory = path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_string_lossy()
+            .to_string();
+
+        let record = BulkRecord {
+            filepath: child.saved_path.clone(),
+            filename,
+            directory,
+            params,
+            file_mtime: Some(file_mtime),
+            file_size: Some(file_size),
+            quick_hash,
+            tags,
+        };
+
+        let edge = if child.parent_image_id > 0 {
+            let ops_value = match &child.mutation_ops {
+                Some(v) if v.is_array() => v.clone(),
+                Some(v) => serde_json::json!([v]),
+                None => serde_json::json!([]),
+            };
+            let ops_obj = serde_json::json!({
+                "ops": ops_value,
+                "variant_label": child.variant_label,
+            });
+            Some(LineageEdgeRecord {
+                parent_id: child.parent_image_id,
+                ops_json: serde_json::to_string(&ops_obj).ok(),
+                source: "forge_requeue".to_string(),
+            })
+        } else {
+            None
+        };
+
+        items.push(BulkRecordWithLineage { record, edge });
+        pathbufs.push(path);
+    }
+
+    if missing > 0 {
+        warning = Some(format!(
+            "{} generated image(s) could not be found on disk and were not indexed",
+            missing
+        ));
+    }
+    if !items.is_empty() {
+        if let Err(e) = db.bulk_upsert_with_lineage(&items) {
+            log::error!("Failed to ingest Forge generated images into database: {}", e);
+            // The files exist but are unindexed and have no lineage edge: say so.
+            pathbufs.clear();
+            warning = Some(format!(
+                "{} image(s) were generated but could not be indexed (no lineage recorded): {}",
+                items.len(),
+                e
+            ));
+        } else {
+            ingested = items.len();
+            log::info!("Successfully ingested {} Forge generated image(s)", items.len());
         }
     }
-    warning
+
+    if !pathbufs.is_empty() {
+        let generated = image_processing::generate_thumbnails(
+            &pathbufs,
+            cache_dir,
+            storage_profile,
+        );
+        if !generated.is_empty() {
+            if let Ok(mut idx) = thumbnail_index.write() {
+                for (_, thumb_path) in generated {
+                    idx.insert(thumb_path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    IngestOutcome { warning, ingested }
+}
+
+struct IngestOutcome {
+    warning: Option<String>,
+    ingested: usize,
+}
+
+impl IngestOutcome {
+    fn should_notify(&self) -> bool {
+        self.ingested > 0
+    }
+}
+
+#[cfg(test)]
+mod ingest_outcome_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn notifies_when_something_was_indexed_even_with_a_warning() {
+        let partial = IngestOutcome { warning: Some("1 missing".into()), ingested: 2 };
+        assert!(partial.should_notify());
+        let clean = IngestOutcome { warning: None, ingested: 3 };
+        assert!(clean.should_notify());
+    }
+
+    #[test]
+    fn stays_quiet_when_nothing_was_indexed() {
+        assert!(!IngestOutcome { warning: Some("db error".into()), ingested: 0 }.should_notify());
+        assert!(!IngestOutcome { warning: None, ingested: 0 }.should_notify());
+    }
+
+    struct Rig {
+        dir: PathBuf,
+        db: crate::database::Database,
+        index: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    }
+
+    fn rig() -> Rig {
+        let dir = std::env::temp_dir().join(format!(
+            "fml_ingest_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        let db = crate::database::Database::new(&dir.join("t.db"), StorageProfile::Hdd).unwrap();
+        Rig { dir, db, index: Default::default() }
+    }
+
+    fn child(path: &Path, parent: i64) -> ChildResult {
+        ChildResult {
+            parent_image_id: parent,
+            saved_path: path.to_string_lossy().to_string(),
+            mutation_ops: Some(serde_json::json!([{ "kind": "seed_step", "value": 1 }])),
+            variant_label: None,
+        }
+    }
+
+    fn run(rig: &Rig, children: &[ChildResult]) -> IngestOutcome {
+        ingest_children_blocking(children, &rig.db, &rig.dir.join("cache"), &rig.index, StorageProfile::Hdd)
+    }
+
+    fn edge_count(rig: &Rig) -> i64 {
+        let conn = rig.db.pool_get_for_test().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM lineage_edges", [], |r| r.get(0)).unwrap()
+    }
+
+    /// Runs `finish_ingest` and reports (warning, whether the UI event fired).
+    fn finish(outcome: IngestOutcome) -> (Option<String>, bool) {
+        let fired = Cell::new(false);
+        let warning = finish_ingest(outcome, vec!["x".into()], |_| fired.set(true));
+        (warning, fired.get())
+    }
+
+    #[test]
+    fn one_missing_file_still_indexes_the_rest_stamps_the_edge_and_fires_the_event() {
+        let rig = rig();
+        let good = rig.dir.join("good.png");
+        std::fs::write(&good, b"not really a png").unwrap();
+        let gone = rig.dir.join("never-written.png");
+
+        let outcome = run(&rig, &[child(&good, 5), child(&gone, 5)]);
+        assert_eq!(outcome.ingested, 1);
+        assert!(outcome.warning.as_deref().unwrap_or("").contains("could not be found"));
+        assert_eq!(rig.db.get_total_count().unwrap(), 1, "the image that exists is indexed");
+        assert_eq!(edge_count(&rig), 1, "its parent edge is stamped in the same step");
+
+        let (warning, fired) = finish(outcome);
+        assert!(fired, "the gallery must be told about the image that did arrive");
+        assert!(warning.is_some(), "and the warning is still returned");
+        let _ = std::fs::remove_dir_all(&rig.dir);
+    }
+
+    #[test]
+    fn a_database_failure_reports_it_records_no_lineage_and_stays_silent() {
+        let rig = rig();
+        let good = rig.dir.join("good.png");
+        std::fs::write(&good, b"not really a png").unwrap();
+        rig.db
+            .pool_get_for_test()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_inserts BEFORE INSERT ON images BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+
+        let outcome = run(&rig, &[child(&good, 5)]);
+        assert_eq!(outcome.ingested, 0);
+        let message = outcome.warning.clone().unwrap_or_default();
+        assert!(message.contains("could not be indexed"), "{message}");
+        assert!(message.contains("forced failure"), "{message}");
+        assert_eq!(edge_count(&rig), 0, "no image row means no edge");
+        assert_eq!(rig.db.get_total_count().unwrap(), 0);
+
+        let (warning, fired) = finish(outcome);
+        assert!(!fired, "nothing was indexed, so there is nothing to refresh");
+        assert!(warning.is_some());
+        let _ = std::fs::remove_dir_all(&rig.dir);
+    }
+
+    #[test]
+    fn a_clean_ingest_has_no_warning_and_fires_the_event() {
+        let rig = rig();
+        let good = rig.dir.join("good.png");
+        std::fs::write(&good, b"not really a png").unwrap();
+        let outcome = run(&rig, &[child(&good, 0)]);
+        assert_eq!(outcome.ingested, 1);
+        let (warning, fired) = finish(outcome);
+        assert!(fired);
+        assert!(warning.is_none());
+        assert_eq!(edge_count(&rig), 0, "parent id 0 means no edge");
+        let _ = std::fs::remove_dir_all(&rig.dir);
+    }
 }
 
 /// Appends an ingest warning to a result message.

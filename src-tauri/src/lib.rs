@@ -288,8 +288,10 @@ pub(crate) fn persist_forge_api_key(path: &Path, api_key: &str) -> Result<(), St
     forge_keychain::persist_forge_api_key_secure(path, api_key)
 }
 
-/// Debug builds only: `FORGE_META_LINK_DATA_DIR` redirects the database, thumbnails and settings
-/// to another folder so the app can be exercised without touching a real library. Tauri finds the
+/// Debug builds only: `FORGE_META_LINK_DATA_DIR` redirects the database, thumbnails and the
+/// Forge outputs to another folder (and the keyring entry to a separate name) so the app can be
+/// exercised without touching a real library. Webview storage (UI settings) is separate: also set
+/// `WEBVIEW2_USER_DATA_FOLDER` on Windows, as `launch-isolated.ps1` does. Tauri finds the
 /// default folder through a Windows API, so overriding `APPDATA` does NOT work. Release builds
 /// ignore the variable, and a relative or empty value is rejected rather than guessed at.
 fn data_dir_override(raw: Option<String>) -> Option<PathBuf> {
@@ -345,11 +347,9 @@ mod tests {
     #[test]
     fn data_dir_override_accepts_only_absolute_paths() {
         let abs = std::env::temp_dir().join("fml_override_test");
-        assert_eq!(
-            data_dir_override(Some(abs.to_string_lossy().to_string())),
-            Some(abs.clone()),
-            "debug builds honour an absolute override"
-        );
+        // Release builds ignore the variable entirely, so only debug builds honour it.
+        let expected = if cfg!(debug_assertions) { Some(abs.clone()) } else { None };
+        assert_eq!(data_dir_override(Some(abs.to_string_lossy().to_string())), expected);
         assert_eq!(data_dir_override(None), None);
         assert_eq!(data_dir_override(Some(String::new())), None);
         assert_eq!(data_dir_override(Some("   ".to_string())), None);
