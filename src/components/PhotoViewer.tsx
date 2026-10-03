@@ -21,6 +21,7 @@ import {
     setLineageOverride,
 } from "../services/commands";
 import { PromptLibraryDialog } from "./PromptLibraryDialog";
+import { REJECTED_SCHEDULERS } from "../utils/mutations";
 import {
     copyJpegImageToClipboard,
     copyCompressedImageForDiscord,
@@ -35,7 +36,6 @@ import type {
     LineageCursor,
     LineageEdge,
     LineageTrace,
-    LineageTraceNode,
 } from "../types/metadata";
 import { usePersistedState } from "../hooks/usePersistedState";
 import type { ShowToastOptions } from "../hooks/useToast";
@@ -581,12 +581,14 @@ export function PhotoViewer({
 
     const schedulerDropdownOptions = useMemo(() => {
         const current = forgeOverrides.scheduler.trim();
+        // Schedulers Forge Neo lists but rejects with HTTP 500 are not offered for new picks.
+        const usable = forgeSchedulerOptions.filter(
+            (name) => !(REJECTED_SCHEDULERS as readonly string[]).includes(name.trim().toLowerCase())
+        );
         if (!current) {
-            return forgeSchedulerOptions;
+            return usable;
         }
-        return forgeSchedulerOptions.includes(current)
-            ? forgeSchedulerOptions
-            : [current, ...forgeSchedulerOptions];
+        return usable.includes(current) ? usable : [current, ...usable];
     }, [forgeOverrides.scheduler, forgeSchedulerOptions]);
 
     const loraDropdownOptions = useMemo(() => {
@@ -1128,12 +1130,11 @@ export function PhotoViewer({
                     for (const m of mappings) {
                         if (m.thumbnail_path !== m.filepath) next[m.filepath] = m.thumbnail_path;
                     }
-                    setLineageThumbs(next);
+                    // Merge: replacing would drop the trace-back nodes' thumbnails loaded elsewhere.
+                    setLineageThumbs((prev) => ({ ...prev, ...next }));
                 } catch (_e) {
                     void _e;
                 }
-            } else {
-                setLineageThumbs({});
             }
         } catch (_e) {
             void _e;
@@ -2995,6 +2996,22 @@ export function PhotoViewer({
                                                                                 gap: "2px",
                                                                             }}
                                                                         >
+                                                                            {node.thumbnail_path && (
+                                                                                <img
+                                                                                    src={toAssetSrc(node.thumbnail_path)}
+                                                                                    alt="Culled ancestor thumbnail"
+                                                                                    data-testid={`lineage-trace-ghost-thumb-${node.id}`}
+                                                                                    loading="lazy"
+                                                                                    decoding="async"
+                                                                                    style={{
+                                                                                        width: "64px",
+                                                                                        height: "64px",
+                                                                                        objectFit: "cover",
+                                                                                        borderRadius: "4px",
+                                                                                        opacity: 0.75,
+                                                                                    }}
+                                                                                />
+                                                                            )}
                                                                             <span style={{ fontSize: "11px", fontWeight: 600, color: "#fbbf24" }}>
                                                                                 👻 {formatGhostRecipeText(node)}
                                                                             </span>

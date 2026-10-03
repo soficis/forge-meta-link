@@ -105,6 +105,10 @@ pub struct LineageTraceNode {
     pub scheduler: Option<String>,
     pub model_name: Option<String>,
     pub prompt: Option<String>,
+    /// Cached thumbnail of a Trash-culled ancestor, filled in by the command layer (which knows
+    /// the cache dir). Never set for live nodes (the UI resolves those) or Permanent ghosts.
+    #[serde(default)]
+    pub thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -245,21 +249,16 @@ impl Database {
                             });
                             match p_id_res {
                                 Ok(p_id) => (Some(p_id), None, "inferred".to_string()),
-                                Err(_) => (None, None, if depth == 0 { "root".to_string() } else { "inferred".to_string() }),
+                                Err(_) => (None, None, "root".to_string()),
                             }
                         }
-                        Err(_) => (None, None, if depth == 0 { "root".to_string() } else { "inferred".to_string() }),
+                        Err(_) => (None, None, "root".to_string()),
                     }
                 }
             };
 
-            let node_prompt = if is_ghost && ghost_recipe.is_some() && prompt.trim().is_empty() {
-                None
-            } else if prompt.trim().is_empty() {
-                None
-            } else {
-                Some(prompt)
-            };
+            // Permanent ghosts have a blanked prompt; an empty prompt is simply not shown.
+            let node_prompt = if prompt.trim().is_empty() { None } else { Some(prompt) };
 
             nodes.push(LineageTraceNode {
                 id,
@@ -278,6 +277,7 @@ impl Database {
                 scheduler,
                 model_name: model,
                 prompt: node_prompt,
+                thumbnail_path: None,
             });
 
             match next_parent_id {

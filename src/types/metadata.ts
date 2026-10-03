@@ -248,6 +248,8 @@ export interface LineageTraceNode {
     scheduler: string | null;
     model_name: string | null;
     prompt: string | null;
+    /** Cached thumbnail of a Trash-culled ancestor; null when none exists (e.g. Permanent). */
+    thumbnail_path?: string | null;
 }
 
 export interface LineageTrace {

@@ -298,20 +298,6 @@ impl Database {
                 INSERT OR IGNORE INTO app_migrations (name) VALUES ('lineage_edges_v1');",
             )?;
         }
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS lineage_edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                child_id INTEGER NOT NULL REFERENCES images(id),
-                parent_id INTEGER NOT NULL,
-                ops_json TEXT,
-                source TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                UNIQUE(child_id, parent_id, source)
-            );
-            CREATE INDEX IF NOT EXISTS idx_lineage_edges_child ON lineage_edges(child_id);
-            CREATE INDEX IF NOT EXISTS idx_lineage_edges_parent ON lineage_edges(parent_id);",
-        )?;
-
         // ── Migration: prompt_library_v1 (N2 prompt library) ──
         let prompt_library_migrated: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'prompt_library_v1')",

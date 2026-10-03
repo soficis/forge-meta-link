@@ -294,31 +294,6 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes images by id and prunes orphaned tags in one transaction.
-    pub fn delete_images_by_ids(&self, ids: &[i64]) -> SqlResult<usize> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-
-        let mut conn = self.pool.get().map_err(pool_error)?;
-        let tx = conn.transaction()?;
-        let placeholders = vec!["?"; ids.len()].join(", ");
-        let sql = format!("DELETE FROM images WHERE id IN ({})", placeholders);
-        let params: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
-        let deleted = tx.execute(&sql, params_from_iter(params))?;
-
-        tx.execute(
-            "DELETE FROM tags
-             WHERE id NOT IN (
-                SELECT DISTINCT tag_id FROM image_tags
-             )",
-            [],
-        )?;
-
-        tx.commit()?;
-        Ok(deleted)
-    }
-
     /// Culls images using either Trash mode (culled_at tombstone) or Permanent mode
     /// (ghost recipe + blank text + ghost://<id> filepath to evict FTS while preserving lineage).
     pub fn cull_images(&self, ids: &[i64], mode: CullMode) -> SqlResult<usize> {
