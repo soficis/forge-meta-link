@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -31,23 +33,6 @@ function parseInfotext(infotext) {
     return result;
 }
 
-export function buildForgePayload(params, options = {}) {
-    const includeSeed = options.includeSeed ?? true;
-    return {
-        prompt: params.prompt,
-        negative_prompt: params.negative_prompt || '',
-        steps: params.steps ? parseInt(params.steps, 10) : 20,
-        sampler_name: params.sampler || undefined,
-        scheduler: params.schedule_type || undefined,
-        cfg_scale: params.cfg_scale ? parseFloat(params.cfg_scale) : 7.0,
-        seed: includeSeed && params.seed != null ? Number(params.seed) : undefined,
-        width: params.width || 512,
-        height: params.height || 512,
-        send_images: true,
-        save_images: false
-    };
-}
-
 async function main() {
     console.log(`[verify-forge-roundtrip] Target API: ${BASE_URL}`);
     
@@ -66,66 +51,32 @@ async function main() {
 
     console.log(`Found ${samplers.length} samplers and ${schedulers.length} schedulers.`);
 
-    // 2. Round-trip baseline test
-    const sampleParams = {
-        prompt: 'a majestic mountain peak at sunset, digital painting',
-        negative_prompt: 'blurry, low quality',
-        steps: '1',
-        sampler: 'Euler a',
-        schedule_type: 'karras',
-        cfg_scale: '7.5',
-        seed: '987654321',
-        width: 64,
-        height: 64
-    };
-
-    const payload = buildForgePayload(sampleParams);
-    console.log(`Testing baseline round-trip generation...`);
-    const t0 = Date.now();
-    const txtRes = await fetch(`${BASE_URL}/sdapi/v1/txt2img`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-
-    if (!txtRes.ok) {
-        console.error(`Baseline txt2img request failed with status: ${txtRes.status}`);
-        process.exit(1);
-    }
-
-    const txtData = await txtRes.json();
-    const durationMs = Date.now() - t0;
-    console.log(`Baseline txt2img completed in ${durationMs}ms`);
-
-    let returnedInfo = {};
-    if (txtData.info) {
-        try {
-            const parsed = JSON.parse(txtData.info);
-            const infotext = parsed.infotexts?.[0] || '';
-            returnedInfo = parseInfotext(infotext);
-            returnedInfo._parsed = parsed;
-        } catch (e) {
-            console.warn('Failed to parse returned info JSON:', e);
+    // 2. App payload paths. Runs the real Rust payload builders + PNG parser + DB against this
+    // Forge (tests/forge_live_gate.rs): Send-to, requeue, per-variant params, ADetailer, LoRA,
+    // 64-bit seed. This replaces the earlier hand-copied JS builder, which proved nothing about the app.
+    console.log(`Running app payload-path gate (cargo test --test forge_live_gate)...`);
+    const jsonDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-gate-'));
+    const cargo = spawnSync(
+        'cargo',
+        ['test', '--manifest-path', path.join(REPO_ROOT, 'src-tauri', 'Cargo.toml'),
+         '--test', 'forge_live_gate', '--', '--nocapture', '--test-threads=1'],
+        {
+            env: { ...process.env, FORGE_LIVE_URL: BASE_URL, FORGE_GATE_JSON: jsonDir },
+            encoding: 'utf-8',
         }
+    );
+    const gateChecks = [];
+    for (const f of fs.readdirSync(jsonDir).filter(n => n.endsWith('.json')).sort()) {
+        gateChecks.push(...JSON.parse(fs.readFileSync(path.join(jsonDir, f), 'utf-8')));
     }
-
-    // Diff fields
-    const diffs = [];
-    const checkField = (field, expected, actual) => {
-        const match = String(expected).toLowerCase() === String(actual || '').toLowerCase();
-        diffs.push({ field, expected, actual: actual ?? 'MISSING', match });
-    };
-
-    checkField('Steps', sampleParams.steps, returnedInfo['Steps']);
-    checkField('Sampler', sampleParams.sampler, returnedInfo['Sampler']);
-    checkField('Scheduler', sampleParams.schedule_type, returnedInfo['Schedule type']);
-    checkField('CFG scale', sampleParams.cfg_scale, returnedInfo['CFG scale']);
-    checkField('Seed', sampleParams.seed, returnedInfo['Seed']);
-    checkField('Size', `${sampleParams.width}x${sampleParams.height}`, returnedInfo['Size']);
-
-    console.log(`Field comparison results:`);
-    for (const d of diffs) {
-        console.log(`  ${d.field}: expected=${d.expected} actual=${d.actual} -> ${d.match ? 'OK' : 'MISMATCH'}`);
+    const gateFailures = gateChecks.filter(c => !c.ok);
+    const gatePassed = cargo.status === 0 && gateChecks.length > 0 && gateFailures.length === 0;
+    for (const note of `${cargo.stdout}${cargo.stderr}`.split('\n').filter(l => /skipping/i.test(l))) {
+        console.log(`  note: ${note.trim()}`);
+    }
+    console.log(`  ${gateChecks.length} field checks, ${gateFailures.length} mismatch(es); cargo exit ${cargo.status}`);
+    if (!gatePassed) {
+        console.error(`${cargo.stdout}\n${cargo.stderr}`.split('\n').slice(-40).join('\n'));
     }
 
     // 3. Matrix test: test all schedulers with a reliable sampler ('Euler')
@@ -234,15 +185,15 @@ Date: ${new Date().toISOString()}
 Target: \`${BASE_URL}\`
 
 ## Executive Summary
-- **Baseline Round-Trip**: All generation fields (prompt, steps, sampler, scheduler, cfg, seed, size) verified against Forge Neo \`/sdapi/v1/txt2img\`.
-- **Scheduler Round-Trip**: Forge Neo preserves scheduler selection in \`Schedule type\` infotext chunk (e.g. \`karras\` -> \`Schedule type: Karras\`).
-- **Sampler Round-Trip**: Sampler names round-trip intact across standard Euler/DPM variants.
-- **Ship Gate Status**: **PASSED** for G8 operator mutation sweeps and G9 batch requeue.
+- **Ship Gate Status**: **${gatePassed ? 'PASSED' : 'FAILED'}** for G9 requeue round-trip (${gateChecks.length} field checks across the app's real payload paths, ${gateFailures.length} mismatch(es)).
+- **Scope**: Send-to/batch path, requeue path, three per-variant requests with distinct seed/CFG, ADetailer variant, LoRA, and a 64-bit seed (above 2^32). Built by the app's own Rust builders from a real ingested PNG, not a copy.
+- **Scheduler Round-Trip**: Forge reports display labels (e.g. \`karras\` -> \`Karras\`); comparison is case-insensitive.
+- **Matrices below** only show which names Forge accepts for a trivial request; they do not prove the app preserves them.
 
-## Field Verification Table
-| Field | Expected | Returned In Infotext | Status |
-|-------|----------|----------------------|--------|
-${diffs.map(d => `| ${d.field} | \`${d.expected}\` | \`${d.actual}\` | ${d.match ? '✅ MATCH' : '❌ MISMATCH'} |`).join('\n')}
+## App Payload Path Checks
+| Scenario | Field | Expected | Returned | Status |
+|----------|-------|----------|----------|--------|
+${gateChecks.map(c => `| ${c.scenario} | ${c.field} | \`${c.expected}\` | \`${c.actual}\` | ${c.ok ? '✅ MATCH' : '❌ MISMATCH'} |`).join('\n')}
 
 ## Schedulers Matrix (${schedulers.length} total)
 | API Name | Label | Status | Returned Infotext Name |
