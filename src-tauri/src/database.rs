@@ -127,6 +127,13 @@ pub struct CursorPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CullMode {
+    Trash,
+    Permanent,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CursorQueryOptions<'a> {
     pub cursor: Option<&'a str>,
@@ -166,6 +173,7 @@ pub struct ModelEntry {
 }
 
 /// Record for bulk insert operations.
+#[derive(Debug, Clone)]
 pub struct BulkRecord {
     pub filepath: String,
     pub filename: String,
@@ -175,6 +183,19 @@ pub struct BulkRecord {
     pub file_size: Option<i64>,
     pub quick_hash: Option<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LineageEdgeRecord {
+    pub parent_id: i64,
+    pub ops_json: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkRecordWithLineage {
+    pub record: BulkRecord,
+    pub edge: Option<LineageEdgeRecord>,
 }
 
 impl Database {
@@ -221,6 +242,8 @@ impl Database {
                 file_mtime INTEGER,
                 file_size INTEGER,
                 quick_hash TEXT,
+                culled_at INTEGER,
+                ghost_recipe TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );",
         )?;
@@ -234,6 +257,93 @@ impl Database {
                 applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );",
         )?;
+
+        // ── Migration: culled_at_v1 (G10/G11 tombstone & central view) ──
+        let culled_at_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'culled_at_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !culled_at_migrated {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_images_culled_at ON images(culled_at);
+                 DROP VIEW IF EXISTS images_live;
+                 CREATE VIEW images_live AS SELECT * FROM images WHERE culled_at IS NULL;
+                 INSERT OR IGNORE INTO app_migrations (name) VALUES ('culled_at_v1');",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE VIEW IF NOT EXISTS images_live AS SELECT * FROM images WHERE culled_at IS NULL;",
+        )?;
+
+        // ── Migration: lineage_edges_v1 (G9/G10 id-keyed lineage edges) ──
+        let lineage_edges_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'lineage_edges_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !lineage_edges_migrated {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS lineage_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    child_id INTEGER NOT NULL REFERENCES images(id),
+                    parent_id INTEGER NOT NULL,
+                    ops_json TEXT,
+                    source TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    UNIQUE(child_id, parent_id, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lineage_edges_child ON lineage_edges(child_id);
+                CREATE INDEX IF NOT EXISTS idx_lineage_edges_parent ON lineage_edges(parent_id);
+                INSERT OR IGNORE INTO app_migrations (name) VALUES ('lineage_edges_v1');",
+            )?;
+        }
+        // ── Migration: prompt_library_v1 (N2 prompt library) ──
+        let prompt_library_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'prompt_library_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !prompt_library_migrated {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS prompt_library (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    negative_prompt TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    source_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    use_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_prompt_library_updated ON prompt_library(updated_at DESC);
+                 CREATE VIRTUAL TABLE IF NOT EXISTS prompt_library_fts USING fts5(
+                    title, prompt, negative_prompt, tags, notes,
+                    content='prompt_library', content_rowid='id', tokenize='porter unicode61'
+                 );
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_ai AFTER INSERT ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES (new.id, new.title, new.prompt, new.negative_prompt, new.tags, new.notes);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_ad AFTER DELETE ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(prompt_library_fts, rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES ('delete', old.id, old.title, old.prompt, old.negative_prompt, old.tags, old.notes);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_au
+                    AFTER UPDATE OF title, prompt, negative_prompt, tags, notes ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(prompt_library_fts, rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES ('delete', old.id, old.title, old.prompt, old.negative_prompt, old.tags, old.notes);
+                    INSERT INTO prompt_library_fts(rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES (new.id, new.title, new.prompt, new.negative_prompt, new.tags, new.notes);
+                 END;
+                 INSERT OR IGNORE INTO app_migrations (name) VALUES ('prompt_library_v1');
+                 COMMIT;",
+            )?;
+        }
 
         // ── Migration: scope FTS update triggers to text columns ──
         let fts_migrated: bool = conn.query_row(
@@ -461,6 +571,8 @@ impl Database {
             ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
             ("is_locked", "INTEGER NOT NULL DEFAULT 0"),
             ("seed_int", "INTEGER"),
+            ("culled_at", "INTEGER"),
+            ("ghost_recipe", "TEXT"),
         ] {
             if existing_columns.contains(name) {
                 continue;
@@ -538,10 +650,14 @@ impl Database {
 mod bulk_operations;
 mod cursor_queries;
 mod lineage;
+mod prompt_library;
 mod read_queries;
 mod timeline;
 
-pub use lineage::{LineageCursor, LineageEdge, TagProvenance};
+pub use lineage::{LineageCursor, LineageEdge, LineageTrace, LineageTraceNode, TagProvenance};
+pub use prompt_library::{
+    normalize_tags, prompt_content_hash, ImportPromptsResult, PromptEntry, SavePromptResult,
+};
 pub use read_queries::DuplicateGroup;
 
 impl Database {
@@ -761,13 +877,53 @@ fn append_model_filter(
     params.push(Value::Text(normalized.to_string()));
 }
 
+const FAMILY_PATTERNS_QWEN_IMAGE: &[&str] = &[
+    "%qwen2512%",
+    "%qwen_2512%",
+    "%qwen-2512%",
+    "%qwen-image%",
+    "%qwen_image%",
+    "%qwen2.5%",
+    "%qwen%",
+];
 const FAMILY_PATTERNS_PONYXL: &[&str] = &["%ponyxl%", "%pony xl%", "%pony diffusion%", "%pony%"];
-const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%"];
+const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%", "%sd_xl%", "%sd-xl%"];
 const FAMILY_PATTERNS_FLUX: &[&str] = &["%flux%"];
 const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] =
     &["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"];
-const FAMILY_PATTERNS_SD15: &[&str] = &["%sd1.5%", "%sd15%", "%stable diffusion 1.5%"];
-const FAMILY_PATTERNS_SD21: &[&str] = &["%sd2.1%", "%sd21%", "%stable diffusion 2.1%"];
+// "_" is a single-character LIKE wildcard, so "%krea_2%" covers "krea 2", "krea-2" and "krea_2".
+const FAMILY_PATTERNS_KREA2_TURBO: &[&str] = &["%krea2%", "%krea_2%"];
+const FAMILY_PATTERNS_SD35: &[&str] = &["%sd3.5%", "%sd35%", "%sd_3.5%", "%sd-3.5%"];
+const FAMILY_PATTERNS_SD3: &[&str] = &["%sd3%", "%sd_3%", "%sd-3%", "%stable diffusion 3%"];
+const FAMILY_PATTERNS_SD15: &[&str] = &[
+    "%sd1.5%",
+    "%sd15%",
+    "%sd_1.5%",
+    "%sd-1.5%",
+    "%stable diffusion 1.5%",
+    "%v1-5%",
+];
+const FAMILY_PATTERNS_SD21: &[&str] = &[
+    "%sd2.1%",
+    "%sd21%",
+    "%sd_2.1%",
+    "%sd-2.1%",
+    "%stable diffusion 2.1%",
+    "%v2-1%",
+];
+const FAMILY_PATTERNS_LUMINA: &[&str] = &["%lumina%"];
+const FAMILY_PATTERNS_PIXART: &[&str] = &["%pixart%"];
+const FAMILY_PATTERNS_KOLORS: &[&str] = &["%kolors%"];
+const FAMILY_PATTERNS_AURAFLOW: &[&str] = &["%auraflow%"];
+const FAMILY_PATTERNS_HUNYUAN: &[&str] = &["%hunyuan%"];
+const FAMILY_PATTERNS_SANA: &[&str] = &[
+    "%sana_%",
+    "%sana-%",
+    "%_sana%",
+    "%-sana%",
+    "%sana.safetensors%",
+];
+const FAMILY_PATTERNS_WAN: &[&str] = &["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
 const FAMILY_PATTERNS_VACE: &[&str] = &["%vace%"];
 
@@ -780,12 +936,25 @@ fn normalize_model_family(value: &str) -> Option<&'static str> {
         .collect();
 
     match compact.as_str() {
-        "pony" | "ponyxl" => Some("ponyxl"),
-        "sdxl" => Some("sdxl"),
-        "flux" => Some("flux"),
+        "qwen" | "qwenimage" | "qwen2512" | "qwen25" | "qwen25image" | "qwen2512b" => {
+            Some("qwen_image")
+        }
+        "pony" | "ponyxl" | "ponydiffusion" => Some("ponyxl"),
+        "sdxl" | "stablediffusionxl" => Some("sdxl"),
+        "flux" | "flux1" | "fluxdev" | "fluxschnell" | "fluxkontext" => Some("flux"),
         "zimage" | "zimageturbo" => Some("zimage_turbo"),
-        "sd15" | "stablediffusion15" | "sdv15" => Some("sd15"),
-        "sd21" | "stablediffusion21" | "sdv21" => Some("sd21"),
+        "krea2" | "krea2turbo" => Some("krea2_turbo"),
+        "sd35" | "sd35large" | "sd35medium" => Some("sd35"),
+        "sd3" | "sd3medium" | "stablediffusion3" => Some("sd3"),
+        "sd15" | "stablediffusion15" | "sdv15" | "sd1" => Some("sd15"),
+        "sd21" | "stablediffusion21" | "sdv21" | "sd2" => Some("sd21"),
+        "lumina" | "luminanext" | "lumina2" => Some("lumina"),
+        "pixart" | "pixartalpha" | "pixartsigma" => Some("pixart"),
+        "kolors" => Some("kolors"),
+        "auraflow" => Some("auraflow"),
+        "hunyuan" | "hunyuandit" | "hunyuanvideo" => Some("hunyuan"),
+        "sana" => Some("sana"),
+        "wan" | "wan2" | "wan21" | "wan22" | "wanvideo" => Some("wan"),
         "chroma" => Some("chroma"),
         "vace" => Some("vace"),
         _ => None,
@@ -813,12 +982,23 @@ fn normalize_model_family_filters(model_family_filters: Option<&[String]>) -> Ve
 
 fn family_patterns(family: &str) -> &'static [&'static str] {
     match family {
+        "qwen_image" | "qwen" => FAMILY_PATTERNS_QWEN_IMAGE,
         "ponyxl" => FAMILY_PATTERNS_PONYXL,
         "sdxl" => FAMILY_PATTERNS_SDXL,
         "flux" => FAMILY_PATTERNS_FLUX,
         "zimage_turbo" => FAMILY_PATTERNS_ZIMAGE_TURBO,
+        "krea2_turbo" => FAMILY_PATTERNS_KREA2_TURBO,
+        "sd35" => FAMILY_PATTERNS_SD35,
+        "sd3" => FAMILY_PATTERNS_SD3,
         "sd15" => FAMILY_PATTERNS_SD15,
         "sd21" => FAMILY_PATTERNS_SD21,
+        "lumina" => FAMILY_PATTERNS_LUMINA,
+        "pixart" => FAMILY_PATTERNS_PIXART,
+        "kolors" => FAMILY_PATTERNS_KOLORS,
+        "auraflow" => FAMILY_PATTERNS_AURAFLOW,
+        "hunyuan" => FAMILY_PATTERNS_HUNYUAN,
+        "sana" => FAMILY_PATTERNS_SANA,
+        "wan" => FAMILY_PATTERNS_WAN,
         "chroma" => FAMILY_PATTERNS_CHROMA,
         "vace" => FAMILY_PATTERNS_VACE,
         _ => &[],
@@ -875,6 +1055,50 @@ fn append_model_family_filter(
 /// - `word*` -> preserved as explicit prefix wildcard
 /// - Multiple terms are ANDed together
 pub(crate) fn sanitize_fts_query(query: &str) -> String {
+    let parts = fts_query_parts(query);
+    let has_positive = parts.iter().any(|p| !p.starts_with("NOT "));
+    if !has_positive {
+        return String::new();
+    }
+    parts.join(" ")
+}
+
+/// How the gallery should run a user search against the FTS index.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GalleryFtsPlan {
+    /// Nothing searchable in the query.
+    Empty,
+    /// Normal MATCH expression (may include scoped `NOT` terms).
+    Match(String),
+    /// Only `-term` words: FTS5 cannot express a bare NOT, so the caller keeps every
+    /// image whose id is NOT in `SELECT rowid ... MATCH <expr>` (expr is the negated
+    /// terms joined with OR).
+    ExcludeOnly(String),
+}
+
+pub(crate) fn plan_gallery_fts_query(query: &str) -> GalleryFtsPlan {
+    let parts = fts_query_parts(query);
+    if parts.is_empty() {
+        return GalleryFtsPlan::Empty;
+    }
+    if parts.iter().any(|p| !p.starts_with("NOT ")) {
+        return GalleryFtsPlan::Match(parts.join(" "));
+    }
+    let expr = parts
+        .iter()
+        .filter_map(|p| p.strip_prefix("NOT "))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    GalleryFtsPlan::ExcludeOnly(expr)
+}
+
+/// True when the query contains a `-term`. Used to skip the trigram fallback, which
+/// searches the raw text and would treat the `-` as a literal character.
+pub(crate) fn query_has_negation(query: &str) -> bool {
+    fts_query_parts(query).iter().any(|p| p.starts_with("NOT "))
+}
+
+fn fts_query_parts(query: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut remaining = query.trim();
 
@@ -909,12 +1133,7 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
         }
     }
 
-    let has_positive = parts.iter().any(|p| !p.starts_with("NOT "));
-    if !has_positive {
-        return String::new();
-    }
-
-    parts.join(" ")
+    parts
 }
 
 pub(crate) fn process_unquoted_words(text: &str, parts: &mut Vec<String>) {
@@ -931,16 +1150,16 @@ pub(crate) fn process_unquoted_words(text: &str, parts: &mut Vec<String>) {
             continue;
         }
 
-        let term = if has_wildcard {
-            cleaned.to_lowercase()
-        } else {
-            format!("{}*", cleaned.to_lowercase())
-        };
-
         if is_negated {
-            parts.push(format!("NOT {}", term));
+            // Exclusions are whole-word (the porter tokenizer already folds "girls" into
+            // "girl"; "girlfriend" is kept) unless the user wrote an explicit `*`, and are
+            // scoped to the positive prompt so a negative prompt like "girl, blurry" does
+            // not hide an image.
+            parts.push(format!("NOT prompt : {}", cleaned.to_lowercase()));
+        } else if has_wildcard {
+            parts.push(cleaned.to_lowercase());
         } else {
-            parts.push(term);
+            parts.push(format!("{}*", cleaned.to_lowercase()));
         }
     }
 }
@@ -952,6 +1171,42 @@ pub(crate) fn contains_search_token(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn krea2_turbo_family_normalizes_and_has_patterns() {
+        for raw in ["krea2_turbo", "Krea 2 Turbo", "krea-2", "krea2"] {
+            assert_eq!(normalize_model_family(raw), Some("krea2_turbo"), "{raw}");
+        }
+        assert_eq!(family_patterns("krea2_turbo"), FAMILY_PATTERNS_KREA2_TURBO);
+        // Plain FLUX.1 Krea [dev] is not Krea 2.
+        assert_eq!(normalize_model_family("flux1-krea-dev"), None);
+    }
+
+    #[test]
+    fn qwen_and_all_model_families_normalize_and_have_patterns() {
+        for raw in ["qwen2512", "qwen-image", "Qwen 2.5", "qwen25", "qwen"] {
+            assert_eq!(normalize_model_family(raw), Some("qwen_image"), "{raw}");
+        }
+        assert_eq!(family_patterns("qwen_image"), FAMILY_PATTERNS_QWEN_IMAGE);
+
+        assert_eq!(normalize_model_family("sd35"), Some("sd35"));
+        assert_eq!(normalize_model_family("sd3.5"), Some("sd35"));
+        assert_eq!(normalize_model_family("sd3"), Some("sd3"));
+
+        assert_eq!(normalize_model_family("sd15"), Some("sd15"));
+        assert_eq!(normalize_model_family("sd21"), Some("sd21"));
+        assert_eq!(normalize_model_family("lumina"), Some("lumina"));
+        assert_eq!(normalize_model_family("pixart"), Some("pixart"));
+        assert_eq!(normalize_model_family("kolors"), Some("kolors"));
+        assert_eq!(normalize_model_family("auraflow"), Some("auraflow"));
+        assert_eq!(normalize_model_family("hunyuan"), Some("hunyuan"));
+        assert_eq!(normalize_model_family("sana"), Some("sana"));
+        assert_eq!(normalize_model_family("wan2"), Some("wan"));
+
+        // Unknown models must return None
+        assert_eq!(normalize_model_family("custom_random_model_v1"), None);
+        assert_eq!(normalize_model_family("unknown"), None);
+    }
 
     fn insert_with_prompt(db: &Database, filepath: &str, prompt: &str, tags: &[&str]) {
         let params = GenerationParams {
@@ -967,6 +1222,200 @@ mod tests {
         let normalized_tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
         db.replace_image_tags(image_id, &normalized_tags)
             .expect("failed to insert tags");
+    }
+
+    fn negation_fixture() -> Database {
+        let db = Database::new(Path::new(":memory:"), StorageProfile::Hdd).expect("db");
+        let mk = |path: &str, prompt: &str, neg: &str| {
+            let params = GenerationParams {
+                prompt: prompt.to_string(),
+                negative_prompt: neg.to_string(),
+                raw_metadata: format!("{prompt}\nNegative prompt: {neg}\nSteps: 20"),
+                ..Default::default()
+            };
+            db.upsert_image(path, path, "c:\\images", &params, Some(1))
+                .unwrap();
+        };
+        mk("a_girl.png", "portrait of a girl", "blurry");
+        mk("b_girls.png", "portrait of girls", "blurry");
+        mk("c_boy.png", "portrait of a boy", "blurry");
+        mk("d_neg_girl.png", "portrait of a boy", "girl, blurry");
+        mk("e_girlfriend.png", "portrait of a girlfriend", "blurry");
+        db
+    }
+
+    fn search_paths(db: &Database, q: &str) -> Vec<String> {
+        let page = db
+            .search_cursor(SearchCursorParams {
+                query: q,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn filter_paths(db: &Database, q: &str, exclude_tags: &[String]) -> Vec<String> {
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: Some(q),
+                include_tags: &[],
+                exclude_tags,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn negated_term_excludes_prompt_matches_but_not_negative_prompt_or_longer_words() {
+        let db = negation_fixture();
+        // "girls" is folded to "girl" by the porter tokenizer, so both go. The image that
+        // only has "girl" in its NEGATIVE prompt stays, and so does "girlfriend".
+        assert_eq!(
+            search_paths(&db, "portrait -girl"),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        // an explicit wildcard widens the exclusion to prefixes
+        assert_eq!(
+            search_paths(&db, "portrait -girl*"),
+            vec!["c_boy.png", "d_neg_girl.png"]
+        );
+    }
+
+    #[test]
+    fn negation_only_query_returns_everything_except_matches() {
+        let db = negation_fixture();
+        assert_eq!(
+            search_paths(&db, "-girl"),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        // several exclusions combine
+        assert_eq!(search_paths(&db, "-girl -boy"), vec!["e_girlfriend.png"]);
+        // excluding something nothing has returns the whole library
+        assert_eq!(search_paths(&db, "-unicorn").len(), 5);
+        // a query of only punctuation is still empty
+        assert!(search_paths(&db, "- ?").is_empty());
+    }
+
+    #[test]
+    fn negation_only_query_works_through_filter_path_with_tag_exclusion() {
+        let db = negation_fixture();
+        assert_eq!(
+            filter_paths(&db, "-girl", &[]),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        db.replace_image_tags(
+            db.search_cursor(SearchCursorParams {
+                query: "boy",
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 1,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap()
+            .items[0]
+                .id,
+            &["keepout".to_string()],
+        )
+        .unwrap();
+        let after = filter_paths(&db, "-girl", &["keepout".to_string()]);
+        assert_eq!(after.len(), 2, "{after:?}");
+    }
+
+    #[test]
+    fn tag_filters_match_the_prompt_not_the_negative_prompt() {
+        let db = negation_fixture();
+        // no tag rows at all: only the FTS fallback decides. "girl" is in the prompt of
+        // a/b, and only in the NEGATIVE prompt of d.
+        let excluded = filter_paths_tags(&db, &[], &["girl".to_string()]);
+        assert_eq!(
+            excluded,
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        let included = filter_paths_tags(&db, &["girl".to_string()], &[]);
+        assert_eq!(included, vec!["a_girl.png", "b_girls.png"]);
+
+        // "ortrai" is a substring, not a word prefix, so the porter index finds nothing and
+        // the trigram fallback runs: its tag clauses must be scoped the same way.
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: Some("ortrai"),
+                include_tags: &[],
+                exclude_tags: &["girl".to_string()],
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut tri: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        tri.sort();
+        // trigram matching is substring-based, so "girlfriend" is excluded here too
+        assert_eq!(tri, vec!["c_boy.png", "d_neg_girl.png"]);
+    }
+
+    fn filter_paths_tags(db: &Database, include: &[String], exclude: &[String]) -> Vec<String> {
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: None,
+                include_tags: include,
+                exclude_tags: exclude,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn plan_distinguishes_match_exclude_only_and_empty() {
+        assert_eq!(
+            plan_gallery_fts_query("cat -dog"),
+            GalleryFtsPlan::Match("cat* NOT prompt : dog".to_string())
+        );
+        assert_eq!(
+            plan_gallery_fts_query("-dog -cat"),
+            GalleryFtsPlan::ExcludeOnly("prompt : dog OR prompt : cat".to_string())
+        );
+        assert_eq!(plan_gallery_fts_query(" ??? "), GalleryFtsPlan::Empty);
+        // the legacy sanitizer still yields nothing for exclude-only (other callers)
+        assert!(sanitize_fts_query("-dog").is_empty());
+        assert!(query_has_negation("cat -dog"));
+        assert!(!query_has_negation("cat dog"));
     }
 
     #[test]
@@ -1789,7 +2238,7 @@ mod tests {
         for (fp, new_mtime) in &pending {
             delta_records.push(BulkRecord {
                 filepath: fp.clone(),
-                filename: fp.split('/').last().unwrap_or(fp).to_string(),
+                filename: fp.split('/').next_back().unwrap_or(fp).to_string(),
                 directory: "bench".to_string(),
                 params: GenerationParams {
                     prompt: "bench updated".to_string(),
@@ -1811,7 +2260,7 @@ mod tests {
             "1k delta bulk_upsert (500/tx): inserted={} elapsed={:.2?} tx_count={}",
             delta_inserted,
             delta_bulk_elapsed,
-            (delta + 499) / 500
+            delta.div_ceil(500)
         );
         assert_eq!(delta_inserted, delta);
         assert!(

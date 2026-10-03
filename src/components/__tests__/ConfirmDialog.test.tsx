@@ -22,7 +22,7 @@ describe("ConfirmDialog", () => {
 
         expect(screen.getByText("Delete 5 images permanently?")).not.toBeNull();
         expect(screen.getByText("image1.png, image2.png, image3.png, and 2 more.")).not.toBeNull();
-        expect(screen.getByText("They will not go to the Recycle Bin.")).not.toBeNull();
+        expect(screen.getByText("Prompt text is removed; seed, CFG, steps, sampler, scheduler and model are kept so lineage can still be traced.")).not.toBeNull();
         expect(screen.getByText("Delete 5 permanently")).not.toBeNull();
     });
 

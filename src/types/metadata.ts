@@ -113,6 +113,13 @@ export interface SidecarData {
     rating?: number | null;
 }
 
+export interface ChildResult {
+    parent_image_id: number;
+    saved_path: string;
+    mutation_ops?: Record<string, unknown> | null;
+    variant_label?: string | null;
+}
+
 export interface ForgePayload {
     prompt: string;
     negative_prompt: string;
@@ -127,6 +134,8 @@ export interface ForgePayload {
     alwayson_scripts?: Record<string, unknown>;
     send_images?: boolean;
     save_images?: boolean;
+    batch_size?: number;
+    n_iter?: number;
 }
 
 export interface ForgeStatus {
@@ -140,6 +149,7 @@ export interface ForgeSendResult {
     output_dir: string;
     generated_count: number;
     saved_paths: string[];
+    children: ChildResult[];
 }
 
 export interface ForgeBatchItemResult {
@@ -149,6 +159,7 @@ export interface ForgeBatchItemResult {
     message: string;
     generated_count: number;
     saved_paths: string[];
+    children: ChildResult[];
 }
 
 export interface ForgeBatchSendResult {
@@ -220,10 +231,69 @@ export interface LineageCursor {
     children: LineageEdge[];
 }
 
+export interface LineageTraceNode {
+    id: number;
+    filepath: string;
+    filename: string;
+    is_ghost: boolean;
+    ghost_recipe: string | null;
+    ops_json: string | null;
+    source: string;
+    parent_id: number | null;
+    depth: number;
+    seed: string | null;
+    cfg_scale: string | null;
+    steps: string | null;
+    sampler: string | null;
+    scheduler: string | null;
+    model_name: string | null;
+    prompt: string | null;
+    /** Cached thumbnail of a Trash-culled ancestor; null when none exists (e.g. Permanent). */
+    thumbnail_path?: string | null;
+}
+
+export interface LineageTrace {
+    target_id: number;
+    nodes: LineageTraceNode[];
+}
+
 export interface TagProvenance {
     tag: string;
     count: number;
     first_seen: number | null;
     last_seen: number | null;
     sample_filepaths: string[];
+}
+
+// ── Prompt library (N2) ────────────────────────────────────────────────
+
+export interface PromptEntry {
+    id: number;
+    title: string;
+    prompt: string;
+    negative_prompt: string;
+    /** Normalized: lowercase, comma-separated. */
+    tags: string;
+    notes: string;
+    source_image_id: number | null;
+    use_count: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface SavePromptResult {
+    entry: PromptEntry;
+    /** False when an identical prompt already existed. */
+    created: boolean;
+}
+
+export interface ImportPromptsResult {
+    inserted: number;
+    skipped_duplicates: number;
+    skipped_invalid: number;
+}
+
+export interface PromptTagCount {
+    tag: string;
+    count: number;
 }

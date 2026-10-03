@@ -5,10 +5,12 @@ impl Database {
 
     /// Fetches all stored file mtimes in a single query for fast lookup.
     /// Returns a HashMap<filepath, mtime> enabling O(1) changed-file detection.
+    /// Culled (tombstoned) rows are excluded so a file restored from the OS trash
+    /// with an unchanged mtime is re-processed and resurrected instead of skipped.
     pub fn get_all_file_mtimes(&self) -> SqlResult<HashMap<String, i64>> {
         let conn = self.pool.get().map_err(pool_error)?;
         let mut stmt =
-            conn.prepare("SELECT filepath, file_mtime FROM images WHERE file_mtime IS NOT NULL")?;
+            conn.prepare("SELECT filepath, file_mtime FROM images WHERE file_mtime IS NOT NULL AND culled_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -21,19 +23,18 @@ impl Database {
         Ok(map)
     }
 
-    /// Batch upsert images and their tags in a single transaction.
-    /// Dramatically faster than individual upserts (10-50x for large libraries)
-    /// because SQLite only syncs to disk once at commit time.
-    pub fn bulk_upsert_with_tags(&self, records: &[BulkRecord]) -> SqlResult<usize> {
-        if records.is_empty() {
-            return Ok(0);
+    /// Batch upsert images and their tags (and optional lineage edges) in a single transaction.
+    /// Returns the inserted/updated image ids.
+    pub fn bulk_upsert_with_lineage(&self, items: &[BulkRecordWithLineage]) -> SqlResult<Vec<i64>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut conn = self.pool.get().map_err(pool_error)?;
-        let mut total = 0usize;
+        let mut inserted_ids = Vec::with_capacity(items.len());
         let mut tag_id_cache: HashMap<String, i64> = HashMap::with_capacity(4096);
 
-        for chunk in records.chunks(500) {
+        for chunk in items.chunks(500) {
             let tx = conn.transaction()?;
             {
                 let mut upsert_image_stmt = tx.prepare_cached(
@@ -62,7 +63,9 @@ impl Database {
                          extra_params=excluded.extra_params,
                          file_mtime=excluded.file_mtime,
                          file_size=excluded.file_size,
-                         quick_hash=excluded.quick_hash
+                         quick_hash=excluded.quick_hash,
+                         culled_at=NULL,
+                         ghost_recipe=NULL
                      RETURNING id",
                 )?;
                 let mut delete_image_tags_stmt =
@@ -75,8 +78,15 @@ impl Database {
                 let mut insert_image_tag_stmt = tx.prepare_cached(
                     "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
                 )?;
+                let mut insert_lineage_edge_stmt = tx.prepare_cached(
+                    "INSERT INTO lineage_edges (child_id, parent_id, ops_json, source)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(child_id, parent_id, source) DO UPDATE SET
+                         ops_json = excluded.ops_json",
+                )?;
 
-                for record in chunk {
+                for item in chunk {
+                    let record = &item.record;
                     let extra =
                         serde_json::to_string(&record.params.extra_params).unwrap_or_default();
                     let generation_type = record
@@ -86,6 +96,8 @@ impl Database {
                         .unwrap_or_else(|| infer_generation_type(&record.params.raw_metadata));
                     let seed_int: Option<i64> =
                         record.params.seed.as_deref().and_then(parse_seed_int);
+
+                    demote_stale_culled_row(&tx, &record.filepath, record.quick_hash.as_deref())?;
 
                     let id: i64 = upsert_image_stmt.query_row(
                         params![
@@ -137,14 +149,35 @@ impl Database {
                         insert_image_tag_stmt.execute(params![id, tag_id])?;
                     }
 
-                    total += 1;
+                    if let Some(edge) = &item.edge {
+                        insert_lineage_edge_stmt.execute(params![
+                            id,
+                            edge.parent_id,
+                            edge.ops_json,
+                            edge.source
+                        ])?;
+                    }
+
+                    inserted_ids.push(id);
                 }
             }
 
             tx.commit()?;
         }
 
-        Ok(total)
+        Ok(inserted_ids)
+    }
+
+    /// Batch upsert images and their tags in a single transaction.
+    /// Dramatically faster than individual upserts (10-50x for large libraries)
+    /// because SQLite only syncs to disk once at commit time.
+    pub fn bulk_upsert_with_tags(&self, records: &[BulkRecord]) -> SqlResult<usize> {
+        let items: Vec<BulkRecordWithLineage> = records
+            .iter()
+            .cloned()
+            .map(|record| BulkRecordWithLineage { record, edge: None })
+            .collect();
+        self.bulk_upsert_with_lineage(&items).map(|ids| ids.len())
     }
 
     // ────────────────────────────── Writes ──────────────────────────────
@@ -193,7 +226,9 @@ impl Database {
                  extra_params=excluded.extra_params,
                  file_mtime=excluded.file_mtime,
                  file_size=excluded.file_size,
-                 quick_hash=excluded.quick_hash
+                 quick_hash=excluded.quick_hash,
+                 culled_at=NULL,
+                 ghost_recipe=NULL
              RETURNING id",
             params![
                 filepath,
@@ -258,29 +293,115 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes images by id and prunes orphaned tags in one transaction.
-    pub fn delete_images_by_ids(&self, ids: &[i64]) -> SqlResult<usize> {
+    /// Culls images using either Trash mode (culled_at tombstone) or Permanent mode
+    /// (ghost recipe + blank text + ghost://<id> filepath to evict FTS while preserving lineage).
+    pub fn cull_images(&self, ids: &[i64], mode: CullMode) -> SqlResult<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
 
         let mut conn = self.pool.get().map_err(pool_error)?;
         let tx = conn.transaction()?;
-        let placeholders = vec!["?"; ids.len()].join(", ");
-        let sql = format!("DELETE FROM images WHERE id IN ({})", placeholders);
-        let params: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
-        let deleted = tx.execute(&sql, params_from_iter(params))?;
 
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let params_ids: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
+
+        // 1. Remove image_tags for the culled ids
         tx.execute(
-            "DELETE FROM tags
-             WHERE id NOT IN (
-                SELECT DISTINCT tag_id FROM image_tags
-             )",
+            &format!(
+                "DELETE FROM image_tags WHERE image_id IN ({})",
+                placeholders
+            ),
+            params_from_iter(params_ids.clone()),
+        )?;
+
+        // 2. Prune orphaned tags
+        tx.execute(
+            "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)",
             [],
         )?;
 
+        // 3. Apply culling per mode; `culled` counts rows actually changed.
+        let culled = match mode {
+            CullMode::Trash => {
+                let sql = format!(
+                    "UPDATE images SET culled_at = strftime('%s','now') WHERE id IN ({})",
+                    placeholders
+                );
+                tx.execute(&sql, params_from_iter(params_ids))?
+            }
+            CullMode::Permanent => {
+                let mut select_stmt = tx.prepare(
+                    "SELECT filepath, seed, cfg_scale, steps, sampler, schedule_type, model_name
+                     FROM images WHERE id = ?1",
+                )?;
+                let mut update_stmt = tx.prepare(
+                    "UPDATE images SET
+                        culled_at = strftime('%s','now'),
+                        ghost_recipe = ?1,
+                        prompt = '',
+                        negative_prompt = '',
+                        raw_metadata = '',
+                        extra_params = NULL,
+                        model_name = NULL,
+                        model_hash = NULL,
+                        filename = 'ghost',
+                        directory = '',
+                        quick_hash = NULL,
+                        filepath = ?2
+                     WHERE id = ?3",
+                )?;
+                let mut del_lineage = tx.prepare(
+                    "DELETE FROM lineage WHERE child_filepath = ?1 OR parent_filepath = ?1",
+                )?;
+                let mut del_lineage_overrides = tx.prepare(
+                    "DELETE FROM lineage_overrides WHERE child_filepath = ?1 OR parent_filepath = ?1",
+                )?;
+
+                let mut culled = 0usize;
+                for id in ids {
+                    let row_res = select_stmt.query_row(params![id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    });
+
+                    // A missing row is skipped (and not counted); any other error aborts the whole
+                    // transaction so a file that is already gone is never left fully indexed.
+                    let found = match row_res {
+                        Ok(row) => Some(row),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some((old_fp, seed, cfg, steps, sampler, scheduler, model)) = found {
+                        del_lineage.execute(params![old_fp])?;
+                        del_lineage_overrides.execute(params![old_fp])?;
+
+                        let recipe = serde_json::json!({
+                            "seed": seed,
+                            "cfg": cfg,
+                            "steps": steps,
+                            "sampler": sampler,
+                            "scheduler": scheduler,
+                            "model": model,
+                        });
+                        let ghost_path = format!("ghost://{}", id);
+                        update_stmt.execute(params![recipe.to_string(), ghost_path, id])?;
+                        culled += 1;
+                    }
+                }
+                culled
+            }
+        };
+
         tx.commit()?;
-        Ok(deleted)
+        Ok(culled)
     }
 
     // ────────────────────────────── Reads ──────────────────────────────
@@ -484,4 +605,35 @@ impl Database {
         tx.commit()?;
         Ok(updated > 0)
     }
+}
+
+/// A Trash-culled row keeps its unique `filepath`. If a DIFFERENT file (different content
+/// fingerprint) is later saved at that path, upserting would resurrect the old row, and the old
+/// row's children would then claim the unrelated new image as their parent. Move the culled row
+/// aside to a `ghost://` path first; a restored copy of the same file (same fingerprint) is left
+/// alone so the normal resurrection still applies.
+fn demote_stale_culled_row(
+    tx: &rusqlite::Transaction<'_>,
+    filepath: &str,
+    new_hash: Option<&str>,
+) -> SqlResult<()> {
+    let Some(new_hash) = new_hash else {
+        return Ok(());
+    };
+    let existing: Option<(i64, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT id, quick_hash, culled_at FROM images WHERE filepath = ?1",
+            params![filepath],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    if let Some((id, Some(old_hash), Some(_))) = existing {
+        if old_hash != new_hash {
+            tx.execute(
+                "UPDATE images SET filepath = ?1 WHERE id = ?2",
+                params![format!("ghost://{}", id), id],
+            )?;
+        }
+    }
+    Ok(())
 }

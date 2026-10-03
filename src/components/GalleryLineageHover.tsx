@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { GalleryImageRecord, LineageCursor } from "../types/metadata";
+import { GhostIcon } from "./icons";
 
 function toAssetSrc(filepath: string): string {
     return convertFileSrc(filepath.replace(/\\/g, "/"));
@@ -37,11 +38,27 @@ function LineageThumb({
     onClick: () => void;
     label: string;
 }) {
+    const isGhost = filepath.startsWith("ghost://");
     const src = useMemo(
-        () => lineageThumbSrc(filepath, thumbnailCache),
-        [filepath, thumbnailCache]
+        () => (isGhost ? "" : lineageThumbSrc(filepath, thumbnailCache)),
+        [filepath, thumbnailCache, isGhost]
     );
     const filename = filepath.replace(/\\/g, "/").split("/").pop() ?? filepath;
+
+    if (isGhost) {
+        return (
+            <div
+                className="gallery-lineage-thumb is-ghost"
+                title="culled ancestor"
+                aria-label={`Culled ${label}`}
+                data-testid="gallery-lineage-ghost-thumb"
+            >
+                <GhostIcon size={16} />
+                <span className="gallery-lineage-ghost-label">culled</span>
+            </div>
+        );
+    }
+
     return (
         <button
             type="button"

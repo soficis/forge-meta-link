@@ -1,0 +1,467 @@
+use forge_meta_link_lib::{
+    database::{CullMode, Database},
+    parser::GenerationParams,
+    StorageProfile,
+};
+use rusqlite::params;
+
+fn test_db() -> Database {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tid = std::thread::current().id();
+    let path = std::env::temp_dir().join(format!(
+        "forge_p2_test_{}_{}_{:?}.db",
+        std::process::id(),
+        nanos,
+        tid
+    ));
+    Database::new(&path, StorageProfile::Hdd).expect("failed to create test db")
+}
+
+#[test]
+fn test_p2_trash_cull_hides_from_live_keeps_columns_removes_tags() {
+    let db = test_db();
+    let conn = db.pool_get_for_test().expect("pool get");
+
+    let p = GenerationParams {
+        prompt: "cyberpunk skyline with neon rain".to_string(),
+        negative_prompt: "bad quality".to_string(),
+        steps: Some("25".to_string()),
+        sampler: Some("Euler a".to_string()),
+        schedule_type: Some("karras".to_string()),
+        cfg_scale: Some("7.5".to_string()),
+        seed: Some("123456".to_string()),
+        width: Some(512),
+        height: Some(512),
+        model_name: Some("dreamshaper_v8".to_string()),
+        model_hash: Some("deadbeef".to_string()),
+        raw_metadata: "cyberpunk skyline with neon rain".to_string(),
+        ..Default::default()
+    };
+
+    let id = db
+        .upsert_image(
+            "/images/skyline.png",
+            "skyline.png",
+            "/images",
+            &p,
+            Some(1000),
+        )
+        .expect("upsert image");
+    db.replace_image_tags(id, &["cyberpunk".to_string(), "neon".to_string()])
+        .expect("set tags");
+
+    // Cull with Trash mode
+    let count = db.cull_images(&[id], CullMode::Trash).expect("cull trash");
+    assert_eq!(count, 1);
+
+    // Live count must be 0
+    assert_eq!(db.get_total_count().unwrap(), 0);
+    assert!(db.get_image_by_id(id).unwrap().is_none());
+
+    // Row in images table still has culled_at set and prompt intact
+    let (culled_at, prompt, filepath): (Option<i64>, String, String) = conn
+        .query_row(
+            "SELECT culled_at, prompt, filepath FROM images WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("select culled row");
+
+    assert!(culled_at.is_some(), "culled_at must be populated");
+    assert_eq!(
+        prompt, "cyberpunk skyline with neon rain",
+        "prompt preserved in trash mode"
+    );
+    assert_eq!(
+        filepath, "/images/skyline.png",
+        "original filepath preserved in trash mode"
+    );
+
+    // Tags for that image removed
+    let tag_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM image_tags WHERE image_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .expect("count image_tags");
+    assert_eq!(tag_count, 0, "image_tags must be removed on cull");
+}
+
+#[test]
+fn test_p2_permanent_cull_blanks_text_evicts_fts_and_assigns_ghost_path() {
+    let db = test_db();
+    let conn = db.pool_get_for_test().expect("pool get");
+
+    let p1 = GenerationParams {
+        prompt: "secret confidential prompt text one".to_string(),
+        negative_prompt: "bad stuff".to_string(),
+        steps: Some("30".to_string()),
+        sampler: Some("DPM++ 2M".to_string()),
+        schedule_type: Some("exponential".to_string()),
+        cfg_scale: Some("6.0".to_string()),
+        seed: Some("999001".to_string()),
+        width: Some(768),
+        height: Some(768),
+        model_name: Some("sd_xl_base_1.0".to_string()),
+        model_hash: Some("31e35c80".to_string()),
+        raw_metadata: "secret confidential prompt text one".to_string(),
+        ..Default::default()
+    };
+    let id1 = db
+        .upsert_image("/images/img1.png", "img1.png", "/images", &p1, Some(1000))
+        .expect("upsert image 1");
+
+    let p2 = GenerationParams {
+        prompt: "secret confidential prompt text two".to_string(),
+        negative_prompt: "bad stuff".to_string(),
+        steps: Some("30".to_string()),
+        sampler: Some("DPM++ 2M".to_string()),
+        schedule_type: Some("exponential".to_string()),
+        cfg_scale: Some("6.0".to_string()),
+        seed: Some("999002".to_string()),
+        width: Some(768),
+        height: Some(768),
+        model_name: Some("sd_xl_base_1.0".to_string()),
+        model_hash: Some("31e35c80".to_string()),
+        raw_metadata: "secret confidential prompt text two".to_string(),
+        ..Default::default()
+    };
+    let id2 = db
+        .upsert_image("/images/img2.png", "img2.png", "/images", &p2, Some(2000))
+        .expect("upsert image 2");
+
+    // Permanent cull both
+    let count = db
+        .cull_images(&[id1, id2], CullMode::Permanent)
+        .expect("cull permanent");
+    assert_eq!(count, 2);
+
+    // Verify row 1
+    let (prompt1, neg1, raw1, fp1, recipe1_str): (String, String, String, String, Option<String>) = conn
+        .query_row(
+            "SELECT prompt, negative_prompt, raw_metadata, filepath, ghost_recipe FROM images WHERE id = ?1",
+            params![id1],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("query id1");
+
+    assert_eq!(prompt1, "", "prompt must be blanked");
+    assert_eq!(neg1, "", "negative_prompt must be blanked");
+    assert_eq!(raw1, "", "raw_metadata must be blanked");
+    assert_eq!(
+        fp1,
+        format!("ghost://{}", id1),
+        "filepath must be ghost://<id>"
+    );
+    assert!(recipe1_str.is_some(), "ghost_recipe must be present");
+
+    let recipe1: serde_json::Value =
+        serde_json::from_str(&recipe1_str.unwrap()).expect("parse recipe");
+    assert_eq!(recipe1["seed"], "999001");
+    assert_eq!(recipe1["cfg"], "6.0");
+    assert_eq!(recipe1["steps"], "30");
+    assert_eq!(recipe1["sampler"], "DPM++ 2M");
+    assert_eq!(recipe1["scheduler"], "exponential");
+    assert_eq!(recipe1["model"], "sd_xl_base_1.0");
+
+    // Verify row 2 filepath does not collide with row 1
+    let fp2: String = conn
+        .query_row(
+            "SELECT filepath FROM images WHERE id = ?1",
+            params![id2],
+            |r| r.get(0),
+        )
+        .expect("query id2 fp");
+    assert_eq!(fp2, format!("ghost://{}", id2));
+    assert_ne!(
+        fp1, fp2,
+        "two permanent ghosts must not collide on unique filepath"
+    );
+
+    // Verify FTS eviction: searching for 'confidential' must return 0 results
+    let fts_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM images_fts WHERE images_fts MATCH 'confidential'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("fts count");
+    assert_eq!(
+        fts_count, 0,
+        "FTS table must evict confidential prompt text upon permanent cull"
+    );
+}
+
+#[test]
+fn test_p2_rescan_upsert_resurrects_trash_culled_image() {
+    let db = test_db();
+
+    let p = GenerationParams {
+        prompt: "vintage astronaut painting".to_string(),
+        steps: Some("20".to_string()),
+        sampler: Some("Euler".to_string()),
+        seed: Some("55555".to_string()),
+        raw_metadata: "vintage astronaut painting".to_string(),
+        ..Default::default()
+    };
+    let path = "/gallery/astronaut.png";
+    let id = db
+        .upsert_image(path, "astronaut.png", "/gallery", &p, Some(1000))
+        .unwrap();
+
+    // Cull with Trash
+    db.cull_images(&[id], CullMode::Trash).unwrap();
+    assert_eq!(db.get_total_count().unwrap(), 0);
+
+    // Rescan / re-upsert same filepath
+    let updated_p = GenerationParams {
+        prompt: "vintage astronaut painting restored".to_string(),
+        steps: Some("22".to_string()),
+        sampler: Some("Euler".to_string()),
+        seed: Some("55555".to_string()),
+        raw_metadata: "vintage astronaut painting restored".to_string(),
+        ..Default::default()
+    };
+    let res_id = db
+        .upsert_image(path, "astronaut.png", "/gallery", &updated_p, Some(1500))
+        .unwrap();
+    assert_eq!(
+        res_id, id,
+        "upsert must preserve same row id on resurrection"
+    );
+
+    // Live count is back to 1
+    assert_eq!(
+        db.get_total_count().unwrap(),
+        1,
+        "image must be resurrected into images_live"
+    );
+    let rec = db.get_image_by_id(id).unwrap().expect("record exists");
+    assert_eq!(rec.prompt, "vintage astronaut painting restored");
+}
+
+#[test]
+fn test_p2_scan_mtime_map_excludes_culled_rows_so_restored_file_is_reprocessed() {
+    let db = test_db();
+    let p = GenerationParams {
+        prompt: "restored from recycle bin".to_string(),
+        raw_metadata: "restored from recycle bin".to_string(),
+        ..Default::default()
+    };
+    let live = db
+        .upsert_image("/gallery/live.png", "live.png", "/gallery", &p, Some(1000))
+        .unwrap();
+    let culled = db
+        .upsert_image(
+            "/gallery/culled.png",
+            "culled.png",
+            "/gallery",
+            &p,
+            Some(2000),
+        )
+        .unwrap();
+    assert_ne!(live, culled);
+
+    db.cull_images(&[culled], CullMode::Trash).unwrap();
+
+    // The scanner skips files whose mtime matches this map. A culled row must not be in it,
+    // otherwise an OS-trash restore (mtime preserved) is never re-ingested.
+    let map = db.get_all_file_mtimes().unwrap();
+    assert!(map.contains_key("/gallery/live.png"));
+    assert!(
+        !map.contains_key("/gallery/culled.png"),
+        "culled row must not mask a restored file"
+    );
+}
+
+#[test]
+fn test_p2_real_scan_after_trash_restore_reingests_the_file() {
+    use forge_meta_link_lib::scanner;
+
+    let dir = std::env::temp_dir().join(format!(
+        "forge_p2_restore_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("restored.png");
+    std::fs::write(
+        &file,
+        b"not a real png, extension is enough for the scanner",
+    )
+    .unwrap();
+
+    let db = test_db();
+    let scan = |db: &Database| {
+        let existing = db.get_all_file_mtimes().unwrap();
+        scanner::scan_directory(&dir)
+            .into_iter()
+            .filter(|f| !scanner::is_unchanged(f, &existing))
+            .collect::<Vec<_>>()
+    };
+
+    // First scan: new file is picked up; index it the way the scan command does.
+    let first = scan(&db);
+    assert_eq!(first.len(), 1);
+    let mtime = first[0].file_mtime;
+    let p = GenerationParams {
+        prompt: "restore me".into(),
+        raw_metadata: "restore me".into(),
+        ..Default::default()
+    };
+    let path_str = first[0].path.to_string_lossy().to_string();
+    let id = db
+        .upsert_image(&path_str, "restored.png", dir.to_str().unwrap(), &p, mtime)
+        .unwrap();
+
+    // Unchanged live file is skipped.
+    assert!(
+        scan(&db).is_empty(),
+        "an unchanged live file must be skipped"
+    );
+
+    // User deletes to Trash (tombstone), then restores it: same path, same mtime, file untouched.
+    db.cull_images(&[id], CullMode::Trash).unwrap();
+    assert_eq!(db.get_total_count().unwrap(), 0);
+    let after_restore = scan(&db);
+    assert_eq!(
+        after_restore.len(),
+        1,
+        "a restored file must be re-processed, not skipped"
+    );
+
+    // Re-ingesting it brings the same row back into the live view.
+    let again = db
+        .upsert_image(&path_str, "restored.png", dir.to_str().unwrap(), &p, mtime)
+        .unwrap();
+    assert_eq!(again, id);
+    assert_eq!(db.get_total_count().unwrap(), 1);
+    assert!(scan(&db).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn bulk(path: &str, hash: &str) -> forge_meta_link_lib::database::BulkRecord {
+    forge_meta_link_lib::database::BulkRecord {
+        filepath: path.to_string(),
+        filename: path.rsplit('/').next().unwrap().to_string(),
+        directory: "/private/folder".to_string(),
+        params: GenerationParams {
+            prompt: "secret prompt".into(),
+            raw_metadata: "secret prompt".into(),
+            seed: Some("42".into()),
+            ..Default::default()
+        },
+        file_mtime: Some(1),
+        file_size: Some(10),
+        quick_hash: Some(hash.to_string()),
+        tags: vec![],
+    }
+}
+
+#[test]
+fn test_p2_permanent_cull_also_blanks_file_name_folder_and_content_fingerprint() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/private/folder/holiday.png", "hash-1")])
+        .unwrap();
+    let id = db
+        .get_image_id_by_filepath("/private/folder/holiday.png")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(db.cull_images(&[id], CullMode::Permanent).unwrap(), 1);
+
+    let conn = db.pool_get_for_test().unwrap();
+    let (filename, directory, hash, filepath): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT filename, directory, quick_hash, filepath FROM images WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(
+        !filename.contains("holiday"),
+        "file name must not survive a permanent delete"
+    );
+    assert!(
+        !directory.contains("private"),
+        "folder must not survive a permanent delete"
+    );
+    assert!(
+        hash.is_none(),
+        "content fingerprint must not survive a permanent delete"
+    );
+    assert_eq!(filepath, format!("ghost://{id}"));
+}
+
+#[test]
+fn test_p2_cull_counts_only_rows_that_exist() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/a/one.png", "h1")])
+        .unwrap();
+    let id = db.get_image_id_by_filepath("/a/one.png").unwrap().unwrap();
+    assert_eq!(db.cull_images(&[id, 9999], CullMode::Permanent).unwrap(), 1);
+    assert_eq!(db.cull_images(&[424242], CullMode::Trash).unwrap(), 0);
+}
+
+#[test]
+fn test_p2_different_file_at_a_trashed_path_does_not_inherit_the_old_row_or_its_children() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-old")])
+        .unwrap();
+    let old_id = db
+        .get_image_id_by_filepath("/lib/same.png")
+        .unwrap()
+        .unwrap();
+    db.cull_images(&[old_id], CullMode::Trash).unwrap();
+
+    // a different image (different fingerprint) is later written to the same path
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-new")])
+        .unwrap();
+    let new_id = db
+        .get_image_id_by_filepath("/lib/same.png")
+        .unwrap()
+        .unwrap();
+    assert_ne!(new_id, old_id, "an unrelated file must get its own row");
+
+    let conn = db.pool_get_for_test().unwrap();
+    let (old_path, old_culled): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT filepath, culled_at FROM images WHERE id = ?1",
+            params![old_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(old_path, format!("ghost://{old_id}"));
+    assert!(old_culled.is_some(), "the old row stays a ghost");
+    assert_eq!(
+        db.get_total_count().unwrap(),
+        1,
+        "only the new image is live"
+    );
+}
+
+#[test]
+fn test_p2_restoring_the_same_file_still_resurrects_the_same_row() {
+    let db = test_db();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-1")])
+        .unwrap();
+    let id = db
+        .get_image_id_by_filepath("/lib/same.png")
+        .unwrap()
+        .unwrap();
+    db.cull_images(&[id], CullMode::Trash).unwrap();
+    db.bulk_upsert_with_tags(&[bulk("/lib/same.png", "hash-1")])
+        .unwrap();
+    assert_eq!(
+        db.get_image_id_by_filepath("/lib/same.png").unwrap(),
+        Some(id)
+    );
+    assert_eq!(db.get_total_count().unwrap(), 1);
+}

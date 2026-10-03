@@ -75,3 +75,25 @@ export const stringArrayStorage = {
         }
     },
 };
+
+/** Convenience serializer/deserializer pair for JSON string-to-string records. */
+export const stringRecordStorage = {
+    serialize: (value: Record<string, string>) => JSON.stringify(value),
+    deserialize: (raw: string): Record<string, string> | undefined => {
+        try {
+            const parsed: unknown = JSON.parse(raw);
+            if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                return undefined;
+            }
+            const out: Record<string, string> = {};
+            for (const [key, value] of Object.entries(parsed)) {
+                if (typeof value === "string") {
+                    out[key] = value;
+                }
+            }
+            return out;
+        } catch {
+            return undefined;
+        }
+    },
+};

@@ -1,0 +1,368 @@
+[
+  {
+    "id": "qwen_image",
+    "label": "Qwen-Image / Qwen2512",
+    "compact_names": ["qwen", "qwenimage", "qwen2512", "qwen25", "qwen25image", "qwen2512b"],
+    "like_patterns": ["%qwen2512%", "%qwen_2512%", "%qwen-2512%", "%qwen-image%", "%qwen_image%", "%qwen2.5%", "%qwen%"],
+    "match_regex": "qwen(?:[\\s_-]*image)?(?:[\\s_-]*2512|[\\s_-]*2[\\._-]?5)?",
+    "presets": [
+      { "label": "1024 x 1024 (1:1 1.0M)", "width": "1024", "height": "1024" },
+      { "label": "1152 x 896 (4:3 1.0M)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4 1.0M)", "width": "896", "height": "1152" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1344 x 768 (16:9 1.0M)", "width": "1344", "height": "768" },
+      { "label": "768 x 1344 (9:16 1.0M)", "width": "768", "height": "1344" },
+      { "label": "1216 x 832 (3:2 1.0M)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3 1.0M)", "width": "832", "height": "1216" },
+      { "label": "1440 x 720 (2:1 1.0M)", "width": "1440", "height": "720" },
+      { "label": "720 x 1440 (1:2 1.0M)", "width": "720", "height": "1440" },
+      { "label": "1536 x 1024 (3:2 1.5M)", "width": "1536", "height": "1024" },
+      { "label": "1024 x 1536 (2:3 1.5M)", "width": "1024", "height": "1536" },
+      { "label": "1280 x 1280 (1:1 1.6M)", "width": "1280", "height": "1280" },
+      { "label": "1920 x 1080 (16:9 1080p)", "width": "1920", "height": "1080" },
+      { "label": "1080 x 1920 (9:16 1080p)", "width": "1080", "height": "1920" }
+    ]
+  },
+  {
+    "id": "flux",
+    "label": "FLUX.1 (Dev / Schnell / Kontext)",
+    "compact_names": ["flux", "flux1", "fluxdev", "fluxschnell", "fluxkontext"],
+    "like_patterns": ["%flux%"],
+    "match_regex": "flux(?:[\\s_-]*1)?",
+    "presets": [
+      { "label": "1024 x 1024 (1:1 1.0M)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4 1.0M)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3 1.0M)", "width": "1152", "height": "896" },
+      { "label": "832 x 1216 (2:3 1.0M)", "width": "832", "height": "1216" },
+      { "label": "1216 x 832 (3:2 1.0M)", "width": "1216", "height": "832" },
+      { "label": "768 x 1344 (9:16 1.0M)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9 1.0M)", "width": "1344", "height": "768" },
+      { "label": "704 x 1408 (1:2 1.0M)", "width": "704", "height": "1408" },
+      { "label": "1408 x 704 (2:1 1.0M)", "width": "1408", "height": "704" },
+      { "label": "1280 x 768 (5:3 0.98M)", "width": "1280", "height": "768" },
+      { "label": "768 x 1280 (3:5 0.98M)", "width": "768", "height": "1280" },
+      { "label": "1280 x 1280 (1:1 1.6M)", "width": "1280", "height": "1280" },
+      { "label": "1536 x 1024 (3:2 1.6M)", "width": "1536", "height": "1024" },
+      { "label": "1024 x 1536 (2:3 1.6M)", "width": "1024", "height": "1536" },
+      { "label": "1920 x 1080 (16:9 2.1M)", "width": "1920", "height": "1080" },
+      { "label": "1080 x 1920 (9:16 2.1M)", "width": "1080", "height": "1920" }
+    ]
+  },
+  {
+    "id": "krea2_turbo",
+    "label": "Krea 2 Turbo",
+    "compact_names": ["krea2", "krea2turbo"],
+    "like_patterns": ["%krea2%", "%krea_2%"],
+    "match_regex": "krea[\\s_-]*2(?:[\\s_-]*turbo)?",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "1184 x 896 (4:3)", "width": "1184", "height": "896" },
+      { "label": "1248 x 832 (3:2)", "width": "1248", "height": "832" },
+      { "label": "1376 x 768 (16:9)", "width": "1376", "height": "768" },
+      { "label": "1568 x 672 (2.35:1)", "width": "1568", "height": "672" },
+      { "label": "928 x 1152 (4:5)", "width": "928", "height": "1152" },
+      { "label": "832 x 1248 (2:3)", "width": "832", "height": "1248" },
+      { "label": "768 x 1376 (9:16)", "width": "768", "height": "1376" },
+      { "label": "2048 x 2048 (1:1 2K)", "width": "2048", "height": "2048" },
+      { "label": "2368 x 1792 (4:3 2K)", "width": "2368", "height": "1792" },
+      { "label": "2496 x 1664 (3:2 2K)", "width": "2496", "height": "1664" },
+      { "label": "2752 x 1536 (16:9 2K)", "width": "2752", "height": "1536" },
+      { "label": "1792 x 2368 (3:4 2K)", "width": "1792", "height": "2368" },
+      { "label": "1664 x 2496 (2:3 2K)", "width": "1664", "height": "2496" },
+      { "label": "1536 x 2752 (9:16 2K)", "width": "1536", "height": "2752" }
+    ]
+  },
+  {
+    "id": "zimage_turbo",
+    "label": "Z-Image Turbo",
+    "compact_names": ["zimage", "zimageturbo"],
+    "like_patterns": ["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"],
+    "match_regex": "z[\\s_-]*image(?:[\\s_-]*turbo)?",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" }
+    ]
+  },
+  {
+    "id": "ponyxl",
+    "label": "PonyXL",
+    "compact_names": ["pony", "ponyxl", "ponydiffusion"],
+    "like_patterns": ["%ponyxl%", "%pony xl%", "%pony diffusion%", "%pony%"],
+    "match_regex": "(?:pony[\\s_-]*xl|pony[\\s_-]*diffusion|pony)",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "704 x 1472 (1:2)", "width": "704", "height": "1472" },
+      { "label": "1472 x 704 (2:1)", "width": "1472", "height": "704" },
+      { "label": "640 x 1536 (9:21)", "width": "640", "height": "1536" },
+      { "label": "1536 x 640 (21:9)", "width": "1536", "height": "640" }
+    ]
+  },
+  {
+    "id": "sdxl",
+    "label": "SDXL",
+    "compact_names": ["sdxl", "stablediffusionxl"],
+    "like_patterns": ["%sdxl%", "%stable diffusion xl%", "%sd_xl%", "%sd-xl%"],
+    "match_regex": "(?:sd[\\s_-]*xl|stable[\\s_-]*diffusion[\\s_-]*xl)",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "704 x 1472 (1:2)", "width": "704", "height": "1472" },
+      { "label": "1472 x 704 (2:1)", "width": "1472", "height": "704" },
+      { "label": "640 x 1536 (9:21)", "width": "640", "height": "1536" },
+      { "label": "1536 x 640 (21:9)", "width": "1536", "height": "640" }
+    ]
+  },
+  {
+    "id": "sd35",
+    "label": "SD 3.5 (Large / Medium)",
+    "compact_names": ["sd35", "sd35large", "sd35medium"],
+    "like_patterns": ["%sd3.5%", "%sd35%", "%sd_3.5%", "%sd-3.5%"],
+    "match_regex": "sd[\\s_-]*3[\\._-]?5",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "640 x 1536 (9:21)", "width": "640", "height": "1536" },
+      { "label": "1536 x 640 (21:9)", "width": "1536", "height": "640" }
+    ]
+  },
+  {
+    "id": "sd3",
+    "label": "SD 3 (Medium)",
+    "compact_names": ["sd3", "sd3medium", "stablediffusion3"],
+    "like_patterns": ["%sd3%", "%sd_3%", "%sd-3%", "%stable diffusion 3%"],
+    "match_regex": "(?:sd[\\s_-]*3(?:[^0-9.]|$)|stable[\\s_-]*diffusion[\\s_-]*3)",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" }
+    ]
+  },
+  {
+    "id": "sd15",
+    "label": "SD 1.5",
+    "compact_names": ["sd15", "stablediffusion15", "sdv15", "sd1"],
+    "like_patterns": ["%sd1.5%", "%sd15%", "%sd_1.5%", "%sd-1.5%", "%stable diffusion 1.5%", "%v1-5%"],
+    "match_regex": "(?:sd[\\s_-]*1[\\._-]?5|stable[\\s_-]*diffusion[\\s_-]*1[\\._-]?5|v1[\\._-]5)",
+    "presets": [
+      { "label": "512 x 512 (1:1 base)", "width": "512", "height": "512" },
+      { "label": "512 x 768 (2:3)", "width": "512", "height": "768" },
+      { "label": "768 x 512 (3:2)", "width": "768", "height": "512" },
+      { "label": "448 x 576 (4:5)", "width": "448", "height": "576" },
+      { "label": "576 x 448 (5:4)", "width": "576", "height": "448" },
+      { "label": "448 x 768 (9:16)", "width": "448", "height": "768" },
+      { "label": "768 x 448 (16:9)", "width": "768", "height": "448" },
+      { "label": "384 x 768 (1:2)", "width": "384", "height": "768" },
+      { "label": "768 x 384 (2:1)", "width": "768", "height": "384" }
+    ]
+  },
+  {
+    "id": "sd21",
+    "label": "SD 2.1",
+    "compact_names": ["sd21", "stablediffusion21", "sdv21", "sd2"],
+    "like_patterns": ["%sd2.1%", "%sd21%", "%sd_2.1%", "%sd-2.1%", "%stable diffusion 2.1%", "%v2-1%"],
+    "match_regex": "(?:sd[\\s_-]*2[\\._-]?1|stable[\\s_-]*diffusion[\\s_-]*2[\\._-]?1|v2[\\._-]1)",
+    "presets": [
+      { "label": "768 x 768 (1:1 base)", "width": "768", "height": "768" },
+      { "label": "640 x 896 (5:7)", "width": "640", "height": "896" },
+      { "label": "896 x 640 (7:5)", "width": "896", "height": "640" },
+      { "label": "576 x 1024 (9:16)", "width": "576", "height": "1024" },
+      { "label": "1024 x 576 (16:9)", "width": "1024", "height": "576" },
+      { "label": "640 x 1024 (5:8)", "width": "640", "height": "1024" },
+      { "label": "1024 x 640 (8:5)", "width": "1024", "height": "640" },
+      { "label": "512 x 512 (1:1 512px)", "width": "512", "height": "512" }
+    ]
+  },
+  {
+    "id": "lumina",
+    "label": "Lumina-Image-2.0 / Next",
+    "compact_names": ["lumina", "luminanext", "lumina2"],
+    "like_patterns": ["%lumina%"],
+    "match_regex": "lumina",
+    "presets": [
+      { "label": "1024 x 1024 (1:1 1.0M)", "width": "1024", "height": "1024" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1152 x 896 (4:3 1.0M)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4 1.0M)", "width": "896", "height": "1152" },
+      { "label": "1216 x 832 (3:2 1.0M)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3 1.0M)", "width": "832", "height": "1216" },
+      { "label": "1536 x 1024 (3:2 1.6M)", "width": "1536", "height": "1024" },
+      { "label": "1024 x 1536 (2:3 1.6M)", "width": "1024", "height": "1536" },
+      { "label": "1920 x 1080 (16:9 2.1M)", "width": "1920", "height": "1080" },
+      { "label": "1080 x 1920 (9:16 2.1M)", "width": "1080", "height": "1920" }
+    ]
+  },
+  {
+    "id": "pixart",
+    "label": "PixArt (Alpha / Sigma)",
+    "compact_names": ["pixart", "pixartalpha", "pixartsigma"],
+    "like_patterns": ["%pixart%"],
+    "match_regex": "pixart",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "2048 x 2048 (1:1 2K)", "width": "2048", "height": "2048" }
+    ]
+  },
+  {
+    "id": "kolors",
+    "label": "Kolors",
+    "compact_names": ["kolors"],
+    "like_patterns": ["%kolors%"],
+    "match_regex": "kolors",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" }
+    ]
+  },
+  {
+    "id": "auraflow",
+    "label": "AuraFlow",
+    "compact_names": ["auraflow"],
+    "like_patterns": ["%auraflow%"],
+    "match_regex": "auraflow",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" }
+    ]
+  },
+  {
+    "id": "hunyuan",
+    "label": "Hunyuan (DiT / Video)",
+    "compact_names": ["hunyuan", "hunyuandit", "hunyuanvideo"],
+    "like_patterns": ["%hunyuan%"],
+    "match_regex": "hunyuan",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1152 x 864 (4:3)", "width": "1152", "height": "864" },
+      { "label": "864 x 1152 (3:4)", "width": "864", "height": "1152" }
+    ]
+  },
+  {
+    "id": "sana",
+    "label": "Sana",
+    "compact_names": ["sana"],
+    "like_patterns": ["%sana_%", "%sana-%", "%_sana%", "%-sana%", "%sana.safetensors%"],
+    "match_regex": "(?:^|[\\s_-])sana(?:[\\s_\\.-]|$)",
+    "presets": [
+      { "label": "1024 x 1024 (1:1 1K)", "width": "1024", "height": "1024" },
+      { "label": "1152 x 896 (4:3 1K)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4 1K)", "width": "896", "height": "1152" },
+      { "label": "1344 x 768 (16:9 1K)", "width": "1344", "height": "768" },
+      { "label": "768 x 1344 (9:16 1K)", "width": "768", "height": "1344" },
+      { "label": "2048 x 2048 (1:1 2K)", "width": "2048", "height": "2048" },
+      { "label": "4096 x 4096 (1:1 4K)", "width": "4096", "height": "4096" }
+    ]
+  },
+  {
+    "id": "wan",
+    "label": "WAN 2.1 / 2.2",
+    "compact_names": ["wan", "wan2", "wan21", "wan22", "wanvideo"],
+    "like_patterns": ["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"],
+    "match_regex": "(?:wan[\\s_-]*2(?:[\\._-][12])?|wan[\\s_-]*video)",
+    "presets": [
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "960 x 544 (16:9 540p)", "width": "960", "height": "544" },
+      { "label": "544 x 960 (9:16 540p)", "width": "544", "height": "960" },
+      { "label": "832 x 480 (16:9 480p)", "width": "832", "height": "480" },
+      { "label": "480 x 832 (9:16 480p)", "width": "480", "height": "832" }
+    ]
+  },
+  {
+    "id": "chroma",
+    "label": "Chroma",
+    "compact_names": ["chroma"],
+    "like_patterns": ["%chroma%"],
+    "match_regex": "chroma",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" }
+    ]
+  },
+  {
+    "id": "vace",
+    "label": "Vace",
+    "compact_names": ["vace"],
+    "like_patterns": ["%vace%"],
+    "match_regex": "vace",
+    "presets": [
+      { "label": "1024 x 1024 (1:1)", "width": "1024", "height": "1024" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" }
+    ]
+  },
+  {
+    "id": "unknown",
+    "label": "Universal / Baseline",
+    "compact_names": ["unknown", "other", "generic"],
+    "like_patterns": [],
+    "match_regex": "",
+    "presets": [
+      { "label": "1024 x 1024 (1:1 1.0M)", "width": "1024", "height": "1024" },
+      { "label": "1152 x 896 (4:3)", "width": "1152", "height": "896" },
+      { "label": "896 x 1152 (3:4)", "width": "896", "height": "1152" },
+      { "label": "1280 x 720 (16:9 720p)", "width": "1280", "height": "720" },
+      { "label": "720 x 1280 (9:16 720p)", "width": "720", "height": "1280" },
+      { "label": "1216 x 832 (3:2)", "width": "1216", "height": "832" },
+      { "label": "832 x 1216 (2:3)", "width": "832", "height": "1216" },
+      { "label": "1344 x 768 (16:9)", "width": "1344", "height": "768" },
+      { "label": "768 x 1344 (9:16)", "width": "768", "height": "1344" },
+      { "label": "512 x 512 (1:1 512px)", "width": "512", "height": "512" },
+      { "label": "768 x 768 (1:1 768px)", "width": "768", "height": "768" },
+      { "label": "1920 x 1080 (16:9 1080p)", "width": "1920", "height": "1080" },
+      { "label": "1080 x 1920 (9:16 1080p)", "width": "1080", "height": "1920" },
+      { "label": "2048 x 2048 (1:1 2K)", "width": "2048", "height": "2048" }
+    ]
+  }
+]

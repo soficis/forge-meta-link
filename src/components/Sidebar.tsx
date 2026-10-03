@@ -3,6 +3,7 @@ import type { DeleteHistoryEntry, TagCount, TagProvenance } from "../types/metad
 import { getTagProvenance } from "../services/commands";
 import type { ScanProgress, ScanComplete } from "../services/commands";
 import { usePersistedState } from "../hooks/usePersistedState";
+import { BookmarkIcon, GearIcon } from "./icons";
 
 interface SidebarProps {
     isCollapsed: boolean;
@@ -18,6 +19,7 @@ interface SidebarProps {
     columnCount: number;
     onColumnCountChange: (count: number) => void;
     onOpenSettings: () => void;
+    onOpenPromptLibrary: () => void;
 }
 
 const SCAN_STAGE_LABELS: Record<ScanProgress["stage"], string> = {
@@ -119,6 +121,7 @@ export function Sidebar({
     columnCount,
     onColumnCountChange,
     onOpenSettings,
+    onOpenPromptLibrary,
 }: SidebarProps) {
     const [topTagsExpanded, setTopTagsExpanded] = useState(false);
     const [sectionExpanded, setSectionExpanded] = usePersistedState<
@@ -448,12 +451,22 @@ export function Sidebar({
             <div className="sidebar-footer">
                 <button
                     type="button"
+                    className="sidebar-button"
+                    onClick={onOpenPromptLibrary}
+                    title="Prompt library"
+                    aria-label="Prompt library"
+                >
+                    <BookmarkIcon />
+                    {!isCollapsed && <span>Prompt library</span>}
+                </button>
+                <button
+                    type="button"
                     className="sidebar-button sidebar-settings-button"
                     onClick={onOpenSettings}
                     title="Settings"
                     aria-label="Settings"
                 >
-                    <span aria-hidden="true">⚙</span>
+                    <GearIcon />
                     {!isCollapsed && <span>Settings</span>}
                 </button>
             </div>

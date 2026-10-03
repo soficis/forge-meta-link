@@ -43,6 +43,19 @@ pub struct ScannedFile {
     pub file_size: Option<i64>,
 }
 
+/// True when the scanner can skip `scanned`: the database already holds this exact path with the
+/// same modification time. `existing_mtimes` must come from `Database::get_all_file_mtimes`,
+/// which omits culled rows so a file restored from the OS trash is re-ingested.
+pub fn is_unchanged(
+    scanned: &ScannedFile,
+    existing_mtimes: &std::collections::HashMap<String, i64>,
+) -> bool {
+    matches!(
+        (scanned.file_mtime, existing_mtimes.get(scanned.path.to_string_lossy().as_ref())),
+        (Some(cur), Some(existing)) if cur == *existing
+    )
+}
+
 /// Extracts all PNG text chunks as key/value pairs.
 ///
 /// This is a zero-copy approach: we never decode pixel data (IDAT chunks).

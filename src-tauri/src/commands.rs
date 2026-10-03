@@ -1,6 +1,7 @@
 use crate::{
     database::{
-        BulkRecord, CursorPage, DirectoryEntry, DuplicateGroup, ImageRecord, ModelEntry, TagCount,
+        BulkRecord, BulkRecordWithLineage, CursorPage, DirectoryEntry, DuplicateGroup, ImageRecord,
+        LineageEdgeRecord, ModelEntry, TagCount,
     },
     forge_api, image_decode, image_processing, parser, scanner, sidecar, AppState, ExportResult,
     ScanResult, StorageProfile,
@@ -9,6 +10,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -224,11 +226,19 @@ pub fn set_forge_api_key(api_key: String, state: tauri::State<'_, AppState>) -> 
 /// Returns true if filepath is either an indexed image in the DB,
 /// or located under the thumbnail cache directory or the display cache directory.
 pub fn is_allowed_path(filepath: &str, db: &crate::database::Database, cache_dir: &Path) -> bool {
+    let path = Path::new(filepath);
+
+    // Reject any path containing '..' (ParentDir) components to prevent traversal
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+
     if db.is_indexed_path(filepath) {
         return true;
     }
-
-    let path = Path::new(filepath);
 
     // Allow files directly inside or subdirectories of cache_dir (thumbnails)
     if let (Ok(canonical_path), Ok(canonical_cache)) =
@@ -237,8 +247,6 @@ pub fn is_allowed_path(filepath: &str, db: &crate::database::Database, cache_dir
         if canonical_path.starts_with(&canonical_cache) {
             return true;
         }
-    } else if path.starts_with(cache_dir) {
-        return true;
     }
 
     // Allow files in display-cache
@@ -253,8 +261,6 @@ pub fn is_allowed_path(filepath: &str, db: &crate::database::Database, cache_dir
         if canonical_path.starts_with(&canonical_display) {
             return true;
         }
-    } else if path.starts_with(&display_cache) {
-        return true;
     }
 
     false
@@ -279,6 +285,8 @@ include!("commands/delete.rs");
 include!("commands/timeline.rs");
 
 include!("commands/lineage.rs");
+
+include!("commands/prompt_library.rs");
 
 #[cfg(test)]
 mod path_validation_tests {
@@ -358,6 +366,9 @@ mod path_validation_tests {
             &db,
             &cache_dir
         ));
+        // Traversal attempt with .. is rejected
+        let traversal_path = format!("{}/../unindexed.png", cache_dir.to_str().unwrap());
+        assert!(!is_allowed_path(&traversal_path, &db, &cache_dir));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

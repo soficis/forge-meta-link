@@ -467,9 +467,14 @@ pub fn delete_images_sync(
     let mut deleted_thumbnails = 0usize;
     let deleted_ids: Vec<i64> = deletable.iter().map(|(id, _)| *id).collect();
 
-    for (_, filepath) in &deletable {
-        let source_path = Path::new(filepath);
-        deleted_thumbnails += remove_thumbnail_cache_file(source_path, cache_dir, thumbnail_index);
+    // Trash keeps the cached thumbnail so the culled image can still be shown as a ghost
+    // ancestor in trace-back; Permanent removes it (the user chose to destroy the image).
+    if matches!(request.mode, DeleteMode::Permanent) {
+        for (_, filepath) in &deletable {
+            let source_path = Path::new(filepath);
+            deleted_thumbnails +=
+                remove_thumbnail_cache_file(source_path, cache_dir, thumbnail_index);
+        }
     }
 
     if let Ok(mut failed) = failed_thumbnail_sources.write() {
@@ -478,12 +483,16 @@ pub fn delete_images_sync(
         }
     }
 
-    let (removed_from_db, failed_paths, db_error) = match db.delete_images_by_ids(&deleted_ids) {
+    let cull_mode = match request.mode {
+        DeleteMode::Permanent => crate::database::CullMode::Permanent,
+        DeleteMode::Trash => crate::database::CullMode::Trash,
+    };
+    let (removed_from_db, failed_paths, db_error) = match db.cull_images(&deleted_ids, cull_mode) {
         Ok(count) => (count, failed_paths, None),
         Err(error) => {
-            log::error!("Failed to remove deleted images from database: {}", error);
+            log::error!("Failed to cull deleted images in database: {}", error);
             let mut paths = failed_paths;
-            let err_msg = format!("Database error removing rows: {}", error);
+            let err_msg = format!("Database error culling rows: {}", error);
             paths.push(err_msg.clone());
             (0, paths, Some(err_msg))
         }
@@ -1022,11 +1031,12 @@ mod delete_tests {
 
         let id_a = insert_db_image(&db, &a_png);
 
-        // Add a BEFORE DELETE trigger on images that forces an abort during delete_images_by_ids
+        // Add a BEFORE DELETE trigger on images that forces an abort during cull_images
         {
             let conn = db.pool_get_for_test().unwrap();
             conn.execute_batch(
-                "CREATE TRIGGER abort_delete BEFORE DELETE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;",
+                "CREATE TRIGGER abort_delete BEFORE DELETE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;
+                 CREATE TRIGGER abort_update BEFORE UPDATE ON images BEGIN SELECT RAISE(ABORT, 'forced test abort'); END;",
             )
             .unwrap();
         }
@@ -1057,6 +1067,54 @@ mod delete_tests {
         assert!(result.failed_paths[0].contains("forced test abort"));
 
         let _ = std::fs::remove_dir_all(&temp_dir_path);
+    }
+
+    #[test]
+    fn test_trash_cull_keeps_cached_thumbnail_but_permanent_removes_it() {
+        let root = std::env::temp_dir().join(format!(
+            "fml_ghost_thumb_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let db = crate::database::Database::new(&root.join("t.db"), crate::StorageProfile::Hdd)
+            .unwrap();
+        let thumbnail_index =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let failed = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
+        // Source files are already gone (deleted outside the app), so only the cache is at stake.
+        let trash_src = root.join("trash_me.png");
+        let perm_src = root.join("perm_me.png");
+        let trash_id = insert_db_image(&db, &trash_src);
+        let perm_id = insert_db_image(&db, &perm_src);
+        let trash_thumb = image_processing::get_thumbnail_cache_path(&trash_src, &cache_dir);
+        let perm_thumb = image_processing::get_thumbnail_cache_path(&perm_src, &cache_dir);
+        std::fs::write(&trash_thumb, b"jpeg").unwrap();
+        std::fs::write(&perm_thumb, b"jpeg").unwrap();
+
+        let run = |id: i64, mode: DeleteMode| {
+            delete_images_sync(
+                DeleteImagesRequest { ids: vec![id], mode },
+                &db,
+                &cache_dir,
+                &thumbnail_index,
+                &failed,
+            )
+            .unwrap()
+        };
+        let trash_res = run(trash_id, DeleteMode::Trash);
+        let perm_res = run(perm_id, DeleteMode::Permanent);
+
+        assert_eq!(trash_res.deleted_thumbnails, 0);
+        assert!(trash_thumb.exists(), "Trash cull must keep the thumbnail for the ghost ancestor");
+        assert_eq!(perm_res.deleted_thumbnails, 1);
+        assert!(!perm_thumb.exists(), "Permanent delete must remove the thumbnail");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

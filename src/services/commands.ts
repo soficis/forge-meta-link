@@ -24,7 +24,12 @@ import type {
     SortOption,
     StorageProfile,
     LineageCursor,
+    LineageTrace,
     TagProvenance,
+    PromptEntry,
+    SavePromptResult,
+    ImportPromptsResult,
+    PromptTagCount,
 } from "../types/metadata";
 
 // ── Directory Scanning ──────────────────────────────────────────────────
@@ -379,6 +384,18 @@ export async function forgeGetOptions(
     });
 }
 
+/** Per-send options that are not part of the recorded generation params. */
+export interface ForgeSendExtras {
+    /** Weight per LoRA token; a token with no entry uses the default loraWeight. */
+    loraWeights?: Record<string, number> | null;
+    /** Images generated per request (Forge n_iter). */
+    batchCount?: number | null;
+    /** Also let Forge keep its own copy in its outputs folder. */
+    saveForgeCopy?: boolean;
+    /** User confirmation to send API key over unencrypted remote HTTP. */
+    confirmUnencrypted?: boolean | null;
+}
+
 export async function forgeSendToImage(
     imageId: number,
     baseUrl: string,
@@ -389,7 +406,9 @@ export async function forgeSendToImage(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: Partial<ForgePayloadOverrides> | null
+    overrides: Partial<ForgePayloadOverrides> | null,
+    mutationOps: unknown | null = null,
+    extras: ForgeSendExtras = {}
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_send_to_image", {
         request: {
@@ -403,7 +422,12 @@ export async function forgeSendToImage(
                 adetailerFaceModel,
                 loraTokens,
                 loraWeight,
+                loraWeights: extras.loraWeights ?? null,
+                batchCount: extras.batchCount ?? null,
+                saveForgeCopy: extras.saveForgeCopy ?? false,
                 overrides,
+                mutationOps,
+                confirmUnencrypted: extras.confirmUnencrypted ?? null,
             },
         },
     });
@@ -419,7 +443,9 @@ export async function forgeSendToImages(
     adetailerFaceModel: string | null,
     loraTokens: string[] | null,
     loraWeight: number | null,
-    overrides: Partial<ForgePayloadOverrides> | null
+    overrides: Partial<ForgePayloadOverrides> | null,
+    mutationOps: unknown | null = null,
+    extras: ForgeSendExtras = {}
 ): Promise<ForgeBatchSendResult> {
     return invoke<ForgeBatchSendResult>("forge_send_to_images", {
         request: {
@@ -433,7 +459,12 @@ export async function forgeSendToImages(
                 adetailerFaceModel,
                 loraTokens,
                 loraWeight,
+                loraWeights: extras.loraWeights ?? null,
+                batchCount: extras.batchCount ?? null,
+                saveForgeCopy: extras.saveForgeCopy ?? false,
                 overrides,
+                mutationOps,
+                confirmUnencrypted: extras.confirmUnencrypted ?? null,
             },
         },
     });
@@ -443,11 +474,42 @@ export async function forgeRequeueImage(
     imageId: number,
     baseUrl: string,
     apiKey: string | null,
-    includeSeed = true
+    includeSeed = true,
+    confirmUnencrypted: boolean | null = null
 ): Promise<ForgeSendResult> {
     return invoke<ForgeSendResult>("forge_requeue_image", {
-        request: { imageId, baseUrl, apiKey, includeSeed },
+        request: { imageId, baseUrl, apiKey, includeSeed, confirmUnencrypted },
     });
+}
+
+export interface ForgeUpscaleOptions {
+    imageId: number;
+    baseUrl: string;
+    apiKey: string | null;
+    upscaler: string;
+    scale: number;
+    outputDir?: string | null;
+}
+
+export interface ForgeUpscaleResult {
+    ok: boolean;
+    message: string;
+    childId: number | null;
+    savedPath: string | null;
+    outputDir: string;
+}
+
+export async function forgeGetUpscalers(
+    baseUrl: string,
+    apiKey: string | null
+): Promise<string[]> {
+    return invoke<string[]>("forge_get_upscalers", { baseUrl, apiKey });
+}
+
+export async function forgeUpscaleImage(
+    options: ForgeUpscaleOptions
+): Promise<ForgeUpscaleResult> {
+    return invoke<ForgeUpscaleResult>("forge_upscale_image", { request: options });
 }
 
 // ── Timeline (file_mtime histogram) ─────────────────────────────────────
@@ -464,6 +526,10 @@ export async function getFileMtimesForQuery(query: string, limit = 50000): Promi
 
 export async function getLineageCursor(filepath: string): Promise<LineageCursor> {
     return invoke<LineageCursor>("get_lineage_cursor", { filepath });
+}
+
+export async function getLineageTrace(imageId: number): Promise<LineageTrace> {
+    return invoke<LineageTrace>("get_lineage_trace", { imageId });
 }
 
 export async function getSeedWalk(
@@ -525,4 +591,74 @@ export async function saveSidecarTags(
     notes: string | null
 ): Promise<void> {
     return invoke<void>("save_sidecar_tags", { filepath, tags, notes });
+}
+
+// ── Prompt library (N2) ─────────────────────────────────────────────────
+
+export interface SavePromptInput {
+    title?: string;
+    prompt: string;
+    negativePrompt?: string;
+    tags?: string;
+    notes?: string;
+    sourceImageId?: number;
+}
+
+export async function savePrompt(input: SavePromptInput): Promise<SavePromptResult> {
+    return invoke<SavePromptResult>("save_prompt", {
+        title: input.title ?? null,
+        prompt: input.prompt,
+        negativePrompt: input.negativePrompt ?? null,
+        tags: input.tags ?? null,
+        notes: input.notes ?? null,
+        sourceImageId: input.sourceImageId ?? null,
+    });
+}
+
+export async function listPrompts(
+    query?: string,
+    tag?: string,
+    limit = 200,
+    offset = 0
+): Promise<PromptEntry[]> {
+    return invoke<PromptEntry[]>("list_prompts", {
+        query: query?.trim() ? query : null,
+        tag: tag ?? null,
+        limit,
+        offset,
+    });
+}
+
+export async function listPromptTags(): Promise<PromptTagCount[]> {
+    return invoke<PromptTagCount[]>("list_prompt_tags");
+}
+
+export async function updatePrompt(
+    id: number,
+    fields: Omit<SavePromptInput, "sourceImageId">
+): Promise<PromptEntry> {
+    return invoke<PromptEntry>("update_prompt", {
+        id,
+        title: fields.title ?? null,
+        prompt: fields.prompt,
+        negativePrompt: fields.negativePrompt ?? null,
+        tags: fields.tags ?? null,
+        notes: fields.notes ?? null,
+    });
+}
+
+export async function deletePrompt(id: number): Promise<boolean> {
+    return invoke<boolean>("delete_prompt", { id });
+}
+
+export async function markPromptUsed(id: number): Promise<void> {
+    return invoke<void>("use_prompt", { id });
+}
+
+export async function exportPromptLibrary(outputPath: string): Promise<number> {
+    return invoke<number>("export_prompt_library", { outputPath });
+}
+
+export async function importPromptLibrary(inputPath: string): Promise<ImportPromptsResult> {
+    return invoke<ImportPromptsResult>("import_prompt_library", { inputPath });
 }

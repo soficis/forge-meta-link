@@ -7,14 +7,14 @@ use forge_meta_link_lib::{
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// FV-03 lineage e2e chain + compare + requeue loop
-/// Fixture: txt2img(seed 1234) -> img2img(seed 1235 same prompt) -> upscale(seed 1235/1236) chain
-/// 14d window = 1_209_600 sec ; existing DB window is 7d (604_800) which is strictly inside 14d
-/// so fixtures placed at +2d and +5d must still be linked, while +20d must be excluded.
-/// Hover mini-graph: get_lineage_cursor perf <150ms (ideal <100ms) with 3 ancestors 2 children limits
-/// PhotoViewer lineage tab: cursor fetch drives tab content
-/// CompareLab 4-pin compare + delta table: sampler/schedule/cfg/seed/LoRA/model/resolution highlights
-/// Forge requeue: payload identical for locked fields via override_settings + LoRA alwayson_scripts
+// FV-03 lineage e2e chain + compare + requeue loop
+// Fixture: txt2img(seed 1234) -> img2img(seed 1235 same prompt) -> upscale(seed 1235/1236) chain
+// 14d window = 1_209_600 sec ; existing DB window is 7d (604_800) which is strictly inside 14d
+// so fixtures placed at +2d and +5d must still be linked, while +20d must be excluded.
+// Hover mini-graph: get_lineage_cursor perf <150ms (ideal <100ms) with 3 ancestors 2 children limits
+// PhotoViewer lineage tab: cursor fetch drives tab content
+// CompareLab 4-pin compare + delta table: sampler/schedule/cfg/seed/LoRA/model/resolution highlights
+// Forge requeue: payload identical for locked fields via override_settings + LoRA prompt tags
 
 fn mem_db() -> Database {
     let nanos = std::time::SystemTime::now()
@@ -31,6 +31,7 @@ fn mem_db() -> Database {
     Database::new(&path, StorageProfile::Hdd).expect("mem db")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chain_params(
     seed: &str,
     prompt: &str,
@@ -41,14 +42,13 @@ fn chain_params(
     model_name: &str,
     model_hash: &str,
     generation_type: &str,
-    mtime: i64,
+    _mtime: i64,
     extra_lora_hash: Option<(&str, &str)>,
 ) -> GenerationParams {
     let mut extra = HashMap::new();
     if let Some((k, v)) = extra_lora_hash {
         extra.insert(k.to_string(), v.to_string());
     }
-    let now = mtime;
     let raw = format!(
         "{}\nNegative prompt: low quality\nSteps: {}, Sampler: {}, Schedule type: {}, CFG scale: {}, Seed: {}, Size: 1024x1024, Model hash: {}, Model: {}",
         prompt, steps, sampler, schedule, cfg, seed, model_hash, model_name
@@ -394,7 +394,6 @@ fn lineage_e2e_chain_compare_requeue_loop() {
     // Simulate delta logic (mirrors src/utils/metadata.ts computeDelta)
     #[derive(Debug, Clone)]
     struct MetaLite {
-        label: &'static str,
         seed: String,
         cfg: String,
         sampler: String,
@@ -425,9 +424,8 @@ fn lineage_e2e_chain_compare_requeue_loop() {
         out.sort();
         out
     }
-    let metas = vec![
+    let metas = [
         MetaLite {
-            label: "A txt2img 1234",
             seed: "1234".into(),
             cfg: "7.5".into(),
             sampler: "Euler a".into(),
@@ -438,7 +436,6 @@ fn lineage_e2e_chain_compare_requeue_loop() {
             h: 1024,
         },
         MetaLite {
-            label: "B img2img 1235",
             seed: "1235".into(),
             cfg: "7.5".into(),
             sampler: "Euler a".into(),
@@ -449,7 +446,6 @@ fn lineage_e2e_chain_compare_requeue_loop() {
             h: 1024,
         },
         MetaLite {
-            label: "C upscale 1235",
             seed: "1235".into(),
             cfg: "7.5".into(),
             sampler: "Euler a".into(),
@@ -460,7 +456,6 @@ fn lineage_e2e_chain_compare_requeue_loop() {
             h: 1024,
         },
         MetaLite {
-            label: "D delta 1237",
             seed: "1237".into(),
             cfg: "8.0".into(),
             sampler: "DPM++ 2M".into(),
@@ -472,7 +467,8 @@ fn lineage_e2e_chain_compare_requeue_loop() {
         },
     ];
     // Compute delta highlights like MetadataDeltaTable
-    let key_extractors: Vec<(&str, Box<dyn Fn(&MetaLite) -> String>)> = vec![
+    type KeyExtractor = (&'static str, Box<dyn Fn(&MetaLite) -> String>);
+    let key_extractors: Vec<KeyExtractor> = vec![
         ("seed", Box::new(|m| m.seed.clone())),
         ("cfg", Box::new(|m| m.cfg.clone())),
         ("sampler", Box::new(|m| m.sampler.clone())),
@@ -492,7 +488,7 @@ fn lineage_e2e_chain_compare_requeue_loop() {
     ];
     let mut changed_keys = Vec::new();
     for (key, getter) in &key_extractors {
-        let vals: Vec<String> = metas.iter().map(|m| getter(m)).collect();
+        let vals: Vec<String> = metas.iter().map(getter).collect();
         let uniq: std::collections::HashSet<&String> = vals.iter().collect();
         let is_changed = uniq.len() > 1;
         println!(
@@ -587,22 +583,21 @@ fn lineage_e2e_chain_compare_requeue_loop() {
         let expected_sched = params.schedule_type.as_deref().unwrap();
         let expected_cfg = params.cfg_scale.as_deref().unwrap().parse::<f64>().unwrap();
         let expected_seed = params.seed.as_deref().unwrap().parse::<i64>().unwrap();
-        // LoRA via alwayson_scripts
-        let alwayson = payload
-            .alwayson_scripts
-            .as_ref()
-            .expect("LoRA alwayson_scripts locked");
-        let lora = alwayson.get("LoRA").expect("LoRA key");
-        let args = lora
-            .get("args")
-            .and_then(|v| v.as_array())
-            .expect("LoRA args array");
+        // LoRA travels as `<lora:..>` prompt tags; a "LoRA" always-on script gets HTTP 422 from Forge.
         let prompt_loras = lora_names(&params.prompt);
+        assert!(
+            payload
+                .alwayson_scripts
+                .as_ref()
+                .and_then(|a| a.get("LoRA"))
+                .is_none(),
+            "{} must not send a LoRA always-on script",
+            label
+        );
         for l in &prompt_loras {
             assert!(
-                args.iter()
-                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(l.as_str())),
-                "{} lora {} must be in alwayson",
+                payload.prompt.contains(&format!("<lora:{}", l)),
+                "{} lora {} must stay in the prompt",
                 label,
                 l
             );
@@ -664,7 +659,7 @@ fn lineage_e2e_chain_compare_requeue_loop() {
     println!("[lineage_e2e] hover mini-graph: <150ms (target <100ms) avg={:.2} max={:.2} p95={:.2} | caps 3 ancestors 2 children OK", avg, max, p95);
     println!("[lineage_e2e] PhotoViewer lineage tab: cursor + thumbs + overrides + jump wiring OK");
     println!("[lineage_e2e] CompareLab: 4-pin 4/4 ready, delta highlights seed/cfg/sampler/schedule/lora changed (model/res unchanged) via delta-changed class");
-    println!("[lineage_e2e] Forge requeue: payload JSON exact locked fields diff 0 (sd_model_checkpoint/sd_sampler/sampler_name/sd_scheduler/cfg_scale/seed + LoRA alwayson_scripts)");
+    println!("[lineage_e2e] Forge requeue: payload JSON exact locked fields diff 0 (sd_model_checkpoint/sd_sampler/sampler_name/sd_scheduler/cfg_scale/seed + LoRA prompt tags)");
     println!("[lineage_e2e] slider: 60fps RAF flush verified");
     println!("[lineage_e2e] LOOP EVIDENCE: lineage infer idempotent, seed_walk 14d, hover LRU180 debounce80, delta-changed badges, payload identical rebuild — ALL PASS");
 }

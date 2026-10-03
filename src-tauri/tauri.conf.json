@@ -23,7 +23,12 @@
             "assetProtocol": {
                 "enable": true,
                 "scope": [
-                    "$APPDATA/**"
+                    "$APPDATA/thumbnails/**",
+                    "$APPDATA/cache/**",
+                    "$APPDATA/display-cache/**",
+                    "$APPDATA/com.forgemetalink.app/thumbnails/**",
+                    "$APPDATA/com.forgemetalink.app/cache/**",
+                    "$APPDATA/com.forgemetalink.app/display-cache/**"
                 ]
             },
             "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; style-src 'self'; font-src 'self'; script-src 'self'",
@@ -39,6 +44,11 @@
             "icons/128x128@2x.png",
             "icons/icon.icns",
             "icons/icon.ico"
-        ]
+        ],
+        "windows": {
+            "nsis": {
+                "minimumWebview2Version": "111.0.1661.0"
+            }
+        }
     }
 }

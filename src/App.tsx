@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, useMemo, useRef } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./queryClient";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Gallery } from "./components/Gallery";
 import { PhotoViewer } from "./components/PhotoViewer";
@@ -11,9 +12,11 @@ import { Sidebar } from "./components/Sidebar";
 import { TimelineHeatmap, type TimelineRange } from "./components/TimelineHeatmap";
 import { ToastHost } from "./components/ToastHost";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { PromptLibraryDialog } from "./components/PromptLibraryDialog";
 import { CompareLab } from "./components/CompareLab";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { resolveGalleryKeyTarget } from "./utils/galleryKeyTarget";
+import { isTypingTarget } from "./utils/typingTarget";
 import { useAppSettings } from "./hooks/useAppSettings";
 import { useForgeSettings } from "./hooks/useForgeSettings";
 import { useToast, type ShowToastOptions } from "./hooks/useToast";
@@ -53,15 +56,6 @@ import type {
     StorageProfile,
 } from "./types/metadata";
 import { needsBulkTrashConfirm } from "./utils/deleteHelpers";
-
-const queryClient = new QueryClient({
-    defaultOptions: {
-        queries: {
-            retry: 1,
-            refetchOnWindowFocus: false,
-        },
-    },
-});
 
 const DELETE_UNDO_WINDOW_MS = 6000;
 
@@ -197,6 +191,7 @@ function AppContent() {
     const [deleteHistory, setDeleteHistory] = useState<DeleteHistoryEntry[]>([]);
     const deleteHistoryIdRef = useRef(0);
     const [isHelpOpen, setIsHelpOpen] = useState(false);
+    const [isPromptLibraryOpen, setIsPromptLibraryOpen] = useState(false);
     const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null);
 
     const pushToast = useCallback(
@@ -301,17 +296,9 @@ function AppContent() {
         ]
     );
     const [images, setImages] = useState<GalleryImageRecord[]>([]);
-    const pageAccumulatorRef = useRef<{
-        signature: string;
-        pageCount: number;
-    }>({
-        signature: querySignature,
-        pageCount: 0,
-    });
 
     useEffect(() => {
         setImages([]);
-        pageAccumulatorRef.current = { signature: querySignature, pageCount: 0 };
     }, [querySignature]);
 
     const dedupeImages = useCallback((records: GalleryImageRecord[]) => {
@@ -330,40 +317,10 @@ function AppContent() {
     useEffect(() => {
         if (!data?.pages) {
             setImages([]);
-            pageAccumulatorRef.current = { signature: querySignature, pageCount: 0 };
             return;
         }
-
-        const tracker = pageAccumulatorRef.current;
-        const pageCount = data.pages.length;
-        const isQueryChanged = tracker.signature !== querySignature;
-        const hasPageReset = pageCount < tracker.pageCount;
-
-        if (isQueryChanged || hasPageReset) {
-            setImages(dedupeImages(data.pages.flatMap((page) => page.items)));
-            pageAccumulatorRef.current = {
-                signature: querySignature,
-                pageCount,
-            };
-            return;
-        }
-
-        if (pageCount === tracker.pageCount) {
-            return;
-        }
-
-        const appended = data.pages
-            .slice(tracker.pageCount)
-            .flatMap((page) => page.items);
-
-        setImages((prev) =>
-            appended.length > 0 ? dedupeImages(prev.concat(appended)) : prev
-        );
-        pageAccumulatorRef.current = {
-            signature: querySignature,
-            pageCount,
-        };
-    }, [data, dedupeImages, querySignature]);
+        setImages(dedupeImages(data.pages.flatMap((page) => page.items)));
+    }, [data, dedupeImages]);
 
     const timelineFilteredImages = useMemo(() => {
         if (!timelineRange) return images;
@@ -1526,6 +1483,28 @@ function AppContent() {
 
     const comparePins = useCompareLabStore((s) => s.pins);
 
+    const handlePinToCompare = useCallback(
+        (img: GalleryImageRecord) => {
+            const store = useCompareLabStore.getState();
+            if (store.pins.some((p) => p.id === img.id)) {
+                store.unpin(img.id);
+                pushToast("Unpinned from Compare Lab", { tone: "info", durationMs: 2200 });
+                return;
+            }
+            const firstFreeSlot = store.pins.length;
+            if (firstFreeSlot >= 4) {
+                pushToast("Compare Lab full (4 max).", { tone: "warning", durationMs: 2200 });
+                return;
+            }
+            const ok = store.pinToSlot(img, firstFreeSlot);
+            pushToast(
+                ok ? `Pinned to Compare Lab slot ${firstFreeSlot + 1}` : "Compare Lab pin failed",
+                { tone: ok ? "success" : "warning", durationMs: 2200 }
+            );
+        },
+        [pushToast]
+    );
+
     const handleNavigateViewer = useCallback(
         (index: number) => {
             const nextImage = viewerImageState.viewerImages[index];
@@ -1619,11 +1598,6 @@ function AppContent() {
         isDeletingImages || isMovingImages || isUpdatingSelectionMarks;
 
     useEffect(() => {
-        const isTypingTarget = (target: EventTarget | null): boolean => {
-            if (!(target instanceof HTMLElement)) return false;
-            const tag = target.tagName.toLowerCase();
-            return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
-        };
         const handleGlobalKey = (event: KeyboardEvent) => {
             if (isTypingTarget(event.target)) return;
             if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
@@ -1815,6 +1789,7 @@ function AppContent() {
                 columnCount={columnCount}
                 onColumnCountChange={setColumnCount}
                 onOpenSettings={() => setSettingsSection("library")}
+                onOpenPromptLibrary={() => setIsPromptLibraryOpen(true)}
             />
 
             <main className="main-content">
@@ -1897,6 +1872,7 @@ function AppContent() {
                         storageProfile={storageProfile}
                         onShowToast={pushToast}
                         emptyState={galleryEmptyState}
+                        onPin={handlePinToCompare}
                     />
                 )}
             </main>
@@ -1919,6 +1895,12 @@ function AppContent() {
                     onForgeSelectedLorasChange={forge.setForgeSelectedLoras}
                     forgeLoraWeight={forge.forgeLoraWeight}
                     onForgeLoraWeightChange={forge.setForgeLoraWeight}
+                    forgeLoraWeights={forge.forgeLoraWeights}
+                    onForgeLoraWeightsChange={forge.setForgeLoraWeights}
+                    forgeBatchCount={forge.forgeBatchCount}
+                    onForgeBatchCountChange={forge.setForgeBatchCount}
+                    forgeSaveCopy={forge.forgeSaveCopy}
+                    onForgeSaveCopyChange={forge.setForgeSaveCopy}
                     forgeIncludeSeed={forge.forgeIncludeSeed}
                     forgeAdetailerFaceEnabled={forge.forgeAdetailerFaceEnabled}
                     forgeAdetailerFaceModel={forge.forgeAdetailerFaceModel}
@@ -1996,6 +1978,9 @@ function AppContent() {
                 onDismissToast={dismissToast}
             />
             {isHelpOpen && <HelpOverlay onClose={() => setIsHelpOpen(false)} />}
+            {isPromptLibraryOpen && (
+                <PromptLibraryDialog onClose={() => setIsPromptLibraryOpen(false)} />
+            )}
         </div>
     );
 }

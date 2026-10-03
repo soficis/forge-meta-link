@@ -10,17 +10,19 @@ pub mod sidecar;
 mod commands;
 
 use commands::{
-    delete_images, directory_exists, export_images, export_images_as_files, filter_images_cursor,
-    forge_cancel_queue, forge_get_options, forge_requeue_image, forge_send_to_image,
-    forge_send_to_images, forge_test_connection, get_directories, get_display_image_path,
+    delete_images, delete_prompt, directory_exists, export_images, export_images_as_files,
+    export_prompt_library, filter_images_cursor, forge_cancel_queue, forge_get_options,
+    forge_get_upscalers, forge_requeue_image, forge_send_to_image, forge_send_to_images,
+    forge_test_connection, forge_upscale_image, get_directories, get_display_image_path,
     get_duplicate_groups, get_file_mtimes, get_file_mtimes_for_query, get_forge_api_key,
     get_image_clipboard_payload, get_image_detail, get_image_tags, get_images_cursor,
-    get_lineage_cursor, get_models, get_seed_walk, get_sidecar_data, get_storage_profile,
-    get_tag_provenance, get_thumbnail_path, get_thumbnail_paths, get_top_tags, get_total_count,
-    infer_lineage, list_tags, move_images_to_directory, open_file_location,
-    precache_all_thumbnails, save_sidecar_tags, scan_directory, search_images_cursor,
-    set_forge_api_key, set_image_favorite, set_image_locked, set_images_favorite,
-    set_images_locked, set_lineage_override, set_storage_profile,
+    get_lineage_cursor, get_lineage_trace, get_models, get_seed_walk, get_sidecar_data,
+    get_storage_profile, get_tag_provenance, get_thumbnail_path, get_thumbnail_paths, get_top_tags,
+    get_total_count, import_prompt_library, infer_lineage, list_prompt_tags, list_prompts,
+    list_tags, move_images_to_directory, open_file_location, precache_all_thumbnails, save_prompt,
+    save_sidecar_tags, scan_directory, search_images_cursor, set_forge_api_key, set_image_favorite,
+    set_image_locked, set_images_favorite, set_images_locked, set_lineage_override,
+    set_storage_profile, update_prompt, use_prompt,
 };
 use database::Database;
 use serde::{Deserialize, Serialize};
@@ -96,11 +98,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let app_data = app
-                .path()
-                .app_data_dir()
-                .expect("Failed to get app data directory");
+            let override_raw = std::env::var("FORGE_META_LINK_DATA_DIR").ok();
+            if cfg!(debug_assertions) && override_raw.is_some() && data_dir_override(override_raw.clone()).is_none() {
+                // The caller asked for isolation. Falling back to the real library would defeat it.
+                return Err("FORGE_META_LINK_DATA_DIR is set but invalid (needs an absolute path); refusing to open the default data dir".into());
+            }
+            let app_data = match data_dir_override(override_raw) {
+                Some(dir) => {
+                    log::warn!("Using OVERRIDDEN app data dir (debug build): {}", dir.display());
+                    dir
+                }
+                None => app
+                    .path()
+                    .app_data_dir()
+                    .expect("Failed to get app data directory"),
+            };
             std::fs::create_dir_all(&app_data).ok();
+            log::info!("App data dir: {}", app_data.display());
             let storage_profile_path = app_data.join(STORAGE_PROFILE_FILE);
             let storage_profile_value = load_storage_profile(&storage_profile_path);
             let storage_profile = Arc::new(RwLock::new(storage_profile_value));
@@ -155,6 +169,10 @@ pub fn run() {
                     }
                 }
             }
+            let _ = app.asset_protocol_scope().allow_directory(&cache_dir, true);
+            let display_cache_dir = app_data.join("display-cache");
+            std::fs::create_dir_all(&display_cache_dir).ok();
+            let _ = app.asset_protocol_scope().allow_directory(&display_cache_dir, true);
             app.manage(AppState {
                 db,
                 cache_dir,
@@ -201,9 +219,11 @@ pub fn run() {
             export_images_as_files,
             forge_test_connection,
             forge_get_options,
+            forge_get_upscalers,
             forge_send_to_image,
             forge_send_to_images,
             forge_requeue_image,
+            forge_upscale_image,
             forge_cancel_queue,
             get_forge_api_key,
             set_forge_api_key,
@@ -214,10 +234,19 @@ pub fn run() {
             get_file_mtimes,
             get_file_mtimes_for_query,
             get_lineage_cursor,
+            get_lineage_trace,
             get_seed_walk,
             get_tag_provenance,
             infer_lineage,
             set_lineage_override,
+            save_prompt,
+            list_prompts,
+            list_prompt_tags,
+            update_prompt,
+            delete_prompt,
+            use_prompt,
+            export_prompt_library,
+            import_prompt_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -265,6 +294,25 @@ pub(crate) fn persist_forge_api_key(path: &Path, api_key: &str) -> Result<(), St
     forge_keychain::persist_forge_api_key_secure(path, api_key)
 }
 
+/// Debug builds only: `FORGE_META_LINK_DATA_DIR` redirects the database, thumbnails and the
+/// Forge outputs to another folder (and the keyring entry to a separate name) so the app can be
+/// exercised without touching a real library. Webview storage (UI settings) is separate: also set
+/// `WEBVIEW2_USER_DATA_FOLDER` on Windows, as `launch-isolated.ps1` does. Tauri finds the
+/// default folder through a Windows API, so overriding `APPDATA` does NOT work. Release builds
+/// ignore the variable, and a relative or empty value is rejected rather than guessed at.
+fn data_dir_override(raw: Option<String>) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let value = raw?;
+    let path = PathBuf::from(value.trim());
+    if value.trim().is_empty() || !path.is_absolute() {
+        log::warn!("Ignoring FORGE_META_LINK_DATA_DIR: it must be a non-empty absolute path");
+        return None;
+    }
+    Some(path)
+}
+
 fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
     let mut index = HashSet::new();
 
@@ -302,7 +350,26 @@ fn build_thumbnail_index(cache_dir: &std::path::Path) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_forge_api_key, persist_forge_api_key};
+    #[test]
+    fn data_dir_override_accepts_only_absolute_paths() {
+        let abs = std::env::temp_dir().join("fml_override_test");
+        // Release builds ignore the variable entirely, so only debug builds honour it.
+        let expected = if cfg!(debug_assertions) {
+            Some(abs.clone())
+        } else {
+            None
+        };
+        assert_eq!(
+            data_dir_override(Some(abs.to_string_lossy().to_string())),
+            expected
+        );
+        assert_eq!(data_dir_override(None), None);
+        assert_eq!(data_dir_override(Some(String::new())), None);
+        assert_eq!(data_dir_override(Some("   ".to_string())), None);
+        assert_eq!(data_dir_override(Some("relative/dir".to_string())), None);
+    }
+
+    use super::{data_dir_override, load_forge_api_key, persist_forge_api_key};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};

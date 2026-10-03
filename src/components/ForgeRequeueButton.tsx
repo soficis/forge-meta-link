@@ -4,6 +4,10 @@ import type { ForgeSendResult, ForgeBatchSendResult, ForgePayloadOverrides } fro
 
 type QueueState = "idle" | "testing" | "queuing" | "done" | "error";
 
+/** Single-image sends may be queued while earlier ones are still running; the backend runs them
+ *  one at a time. This caps how many can be waiting so a held-down click cannot flood it. */
+export const MAX_PENDING_SENDS = 10;
+
 interface ForgeRequeueButtonProps {
     imageId?: number;
     imageIds?: number[];
@@ -15,7 +19,13 @@ interface ForgeRequeueButtonProps {
     adetailerModel?: string | null;
     loraTokens?: string[] | null;
     loraWeight?: number | null;
+    loraWeights?: Record<string, number> | null;
+    /** Images generated per send (Forge n_iter). */
+    batchCount?: number | null;
+    /** Also let Forge keep its own copy of generated images. */
+    saveForgeCopy?: boolean;
     overrides?: Partial<ForgePayloadOverrides> | null;
+    mutationOps?: unknown | null;
     onQueued?: (queueId: string, result: ForgeSendResult | ForgeBatchSendResult) => void;
     onError?: (message: string) => void;
     /** Site-specific pre-send validation (payload ranges, selection state). Return an error message to abort, null to proceed. */
@@ -44,7 +54,11 @@ export function ForgeRequeueButton({
     adetailerModel = null,
     loraTokens = null,
     loraWeight = null,
+    loraWeights = null,
+    batchCount = null,
+    saveForgeCopy = false,
     overrides = null,
+    mutationOps = null,
     onQueued,
     onError,
     validate,
@@ -55,14 +69,19 @@ export function ForgeRequeueButton({
     const [state, setState] = useState<QueueState>("idle");
     const [queueId, setQueueId] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [pending, setPending] = useState(0);
 
     const isBatch = Array.isArray(imageIds) && imageIds.length > 0;
+    const extras = useMemo(
+        () => ({ loraWeights, batchCount, saveForgeCopy }),
+        [loraWeights, batchCount, saveForgeCopy],
+    );
     const effectiveIds = useMemo(
         () => (isBatch ? (imageIds as number[]) : imageId != null ? [imageId] : []),
         [isBatch, imageIds, imageId],
     );
 
-    const handleRequeue = useCallback(async () => {
+    const runRequeue = useCallback(async () => {
         if (effectiveIds.length === 0) {
             const msg = "No image selected for requeue.";
             setError(msg);
@@ -120,7 +139,9 @@ export function ForgeRequeueButton({
                     adetailerModel,
                     loraTokens,
                     loraWeight,
-                    overrides
+                    overrides,
+                    mutationOps,
+                    extras
                 );
                 const fallback = `batch-${Date.now()}`;
                 const qid = extractQueueId(result.message, fallback);
@@ -143,7 +164,9 @@ export function ForgeRequeueButton({
                     adetailerModel,
                     loraTokens,
                     loraWeight,
-                    overrides
+                    overrides,
+                    mutationOps,
+                    extras
                 );
                 const fallback = `requeue-${Date.now()}`;
                 const qid = extractQueueId(result.message, fallback);
@@ -173,14 +196,31 @@ export function ForgeRequeueButton({
         adetailerModel,
         loraTokens,
         loraWeight,
+        extras,
         overrides,
+        mutationOps,
         isBatch,
         validate,
         onQueued,
         onError,
     ]);
 
-    const isBusy = state === "testing" || state === "queuing";
+    // Single sends are queued, not blocked: the button stays usable while earlier ones run.
+    // A batch of images still blocks, because the backend cancel flag is shared by those runs.
+    const handleRequeue = useCallback(async () => {
+        if (isBatch) {
+            await runRequeue();
+            return;
+        }
+        setPending((count) => count + 1);
+        try {
+            await runRequeue();
+        } finally {
+            setPending((count) => Math.max(0, count - 1));
+        }
+    }, [isBatch, runRequeue]);
+
+    const isBusy = isBatch ? state === "testing" || state === "queuing" : pending >= MAX_PENDING_SENDS;
     const buttonLabel =
         label ??
         (isBatch
@@ -206,6 +246,20 @@ export function ForgeRequeueButton({
             >
                 {buttonLabel}
             </button>
+            {!isBatch && pending > 0 ? (
+                <span
+                    className="forge-requeue-pending"
+                    data-testid="forge-pending-count"
+                    style={{ fontSize: 12, color: "var(--text-muted, #888)" }}
+                    aria-live="polite"
+                >
+                    {pending >= MAX_PENDING_SENDS
+                        ? `Queue full (${MAX_PENDING_SENDS})`
+                        : pending === 1
+                          ? "Sending…"
+                          : `Sending · ${pending - 1} queued`}
+                </span>
+            ) : null}
             {queueId ? (
                 <span
                     className="forge-requeue-queue-id"

@@ -4,6 +4,7 @@ import {
     usePersistedState,
     booleanStorage,
     stringArrayStorage,
+    stringRecordStorage,
 } from "./usePersistedState";
 
 const LEGACY_FORGE_API_KEY_STORAGE_KEY = "forgeApiKey";
@@ -27,6 +28,15 @@ export interface ForgeSettings {
     setForgeSelectedLoras: (value: string[]) => void;
     forgeLoraWeight: string;
     setForgeLoraWeight: (value: string) => void;
+    /** Per-LoRA weight overrides keyed by LoRA token. A LoRA without an entry uses forgeLoraWeight. */
+    forgeLoraWeights: Record<string, string>;
+    setForgeLoraWeights: (value: Record<string, string>) => void;
+    /** Images generated per Send to Forge (Forge n_iter), as typed text. */
+    forgeBatchCount: string;
+    setForgeBatchCount: (value: string) => void;
+    /** Also let Forge keep its own copy of generated images in its outputs folder. */
+    forgeSaveCopy: boolean;
+    setForgeSaveCopy: (value: boolean) => void;
     forgeIncludeSeed: boolean;
     setForgeIncludeSeed: (value: boolean) => void;
     forgeAdetailerFaceEnabled: boolean;
@@ -74,6 +84,18 @@ export function useForgeSettings(): ForgeSettings {
     const [forgeLoraWeight, setForgeLoraWeight] = usePersistedState(
         "forgeLoraWeight",
         "1.0"
+    );
+    const [forgeLoraWeights, setForgeLoraWeights] = usePersistedState<
+        Record<string, string>
+    >("forgeLoraWeights", {}, stringRecordStorage);
+    const [forgeBatchCount, setForgeBatchCount] = usePersistedState(
+        "forgeBatchCount",
+        "1"
+    );
+    const [forgeSaveCopy, setForgeSaveCopy] = usePersistedState(
+        "forgeSaveCopy",
+        false,
+        booleanStorage
     );
     const [forgeIncludeSeed, setForgeIncludeSeed] = usePersistedState(
         "forgeIncludeSeed",
@@ -166,6 +188,12 @@ export function useForgeSettings(): ForgeSettings {
         setForgeSelectedLoras,
         forgeLoraWeight,
         setForgeLoraWeight,
+        forgeLoraWeights,
+        setForgeLoraWeights,
+        forgeBatchCount,
+        setForgeBatchCount,
+        forgeSaveCopy,
+        setForgeSaveCopy,
         forgeIncludeSeed,
         setForgeIncludeSeed,
         forgeAdetailerFaceEnabled,

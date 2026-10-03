@@ -42,7 +42,19 @@ pub fn write_sidecar(image_path: &Path, data: &SidecarData) -> Result<PathBuf, S
     Ok(sidecar_path)
 }
 
+pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+
 fn read_sidecar_file(path: &Path) -> Option<SidecarData> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_SIDECAR_BYTES {
+        log::warn!(
+            "Sidecar file {} exceeds max size ({} bytes > {} bytes cap), skipping",
+            path.display(),
+            meta.len(),
+            MAX_SIDECAR_BYTES
+        );
+        return None;
+    }
     let content = std::fs::read_to_string(path).ok()?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 

@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef } from "react";
+import { useId, useRef } from "react";
+import { Modal } from "./Modal";
 
 export interface ConfirmDialogProps {
     count: number;
@@ -18,12 +19,6 @@ export function ConfirmDialog({
     const titleId = useId();
     const descriptionId = useId();
     const cancelButtonRef = useRef<HTMLButtonElement>(null);
-    const dialogRef = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        // Initial focus must be on the Cancel button
-        cancelButtonRef.current?.focus();
-    }, []);
 
     const isSingle = count === 1;
     const isTrash = mode === "trash";
@@ -57,63 +52,45 @@ export function ConfirmDialog({
 
     const description = isTrash
         ? "They will be moved to the Recycle Bin."
-        : "They will not go to the Recycle Bin.";
+        : "Prompt text is removed; seed, CFG, steps, sampler, scheduler and model are kept so lineage can still be traced.";
 
     return (
-        <div
-            className="settings-backdrop"
-            onMouseDown={(event) => {
-                if (event.target === event.currentTarget) {
-                    onCancel();
-                }
-            }}
+        <Modal
+            role="alertdialog"
+            labelledBy={titleId}
+            aria-describedby={descriptionId}
+            className="confirm-dialog"
+            onClose={onCancel}
+            initialFocusRef={cancelButtonRef}
         >
-            <div
-                ref={dialogRef}
-                className="confirm-dialog"
-                role="alertdialog"
-                aria-modal="true"
-                aria-labelledby={titleId}
-                aria-describedby={descriptionId}
-                tabIndex={-1}
-                onKeyDown={(event) => {
-                    // Prevent background shortcuts (f, 1-4, Delete, etc.) from firing behind modal
-                    event.stopPropagation();
-                    if (event.key === "Escape") {
-                        event.preventDefault();
-                        onCancel();
-                    }
-                }}
-            >
-                <header className="confirm-dialog-header">
-                    <h2 id={titleId}>{title}</h2>
-                </header>
+            <header className="confirm-dialog-header">
+                <h2 id={titleId}>{title}</h2>
+            </header>
 
-                <div className="confirm-dialog-body" id={descriptionId}>
-                    {filesSummary ? (
-                        <p className="confirm-dialog-files">{filesSummary}</p>
-                    ) : null}
-                    <p>{description}</p>
-                </div>
-
-                <footer className="confirm-dialog-actions">
-                    <button
-                        ref={cancelButtonRef}
-                        type="button"
-                        className="sidebar-button"
-                        onClick={onCancel}
-                    >
-                        Cancel
-                    </button>
-                    <button
-                        type="button"
-                        className="sidebar-button danger"
-                        onClick={onConfirm}
-                    >
-                        {destructiveLabel}
-                    </button>
-                </footer>
+            <div className="confirm-dialog-body" id={descriptionId}>
+                {filesSummary ? (
+                    <p className="confirm-dialog-files">{filesSummary}</p>
+                ) : null}
+                <p>{description}</p>
             </div>
-        </div>
+
+            <footer className="confirm-dialog-actions">
+                <button
+                    ref={cancelButtonRef}
+                    type="button"
+                    className="sidebar-button"
+                    onClick={onCancel}
+                >
+                    Cancel
+                </button>
+                <button
+                    type="button"
+                    className="sidebar-button danger"
+                    onClick={onConfirm}
+                >
+                    {destructiveLabel}
+                </button>
+            </footer>
+        </Modal>
     );
 }

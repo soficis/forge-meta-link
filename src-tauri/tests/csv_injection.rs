@@ -170,7 +170,7 @@ fn csv_injection_build_export_escapes_all_fields() {
     let csv2 = build_csv_export(&[with_comma]).expect("csv2 failed");
     // csv writer should quote fields containing comma/quote/newline
     assert!(
-        csv2.contains("\"a,b\"") || csv2.contains("'a,b") == false,
+        csv2.contains("\"a,b\"") || !csv2.contains("'a,b"),
         "comma field not quoted: {}",
         csv2
     );
