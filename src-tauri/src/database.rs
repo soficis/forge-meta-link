@@ -1905,7 +1905,7 @@ mod tests {
         for (fp, new_mtime) in &pending {
             delta_records.push(BulkRecord {
                 filepath: fp.clone(),
-                filename: fp.split('/').last().unwrap_or(fp).to_string(),
+                filename: fp.split('/').next_back().unwrap_or(fp).to_string(),
                 directory: "bench".to_string(),
                 params: GenerationParams {
                     prompt: "bench updated".to_string(),
@@ -1927,7 +1927,7 @@ mod tests {
             "1k delta bulk_upsert (500/tx): inserted={} elapsed={:.2?} tx_count={}",
             delta_inserted,
             delta_bulk_elapsed,
-            (delta + 499) / 500
+            delta.div_ceil(500)
         );
         assert_eq!(delta_inserted, delta);
         assert!(

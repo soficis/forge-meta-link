@@ -3,74 +3,6 @@ use std::path::Path;
 const SERVICE: &str = "com.forgemetalink.app";
 const ACCOUNT: &str = "forge-api-key";
 
-#[cfg(test)]
-mod mock_store {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, OnceLock};
-
-    static FAIL_GET: AtomicBool = AtomicBool::new(false);
-    static FAIL_SET: AtomicBool = AtomicBool::new(false);
-
-    fn store() -> &'static Mutex<HashMap<String, String>> {
-        static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-        STORE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn key() -> String {
-        format!("{}:{}", super::SERVICE, super::ACCOUNT)
-    }
-
-    pub fn set_fail_get(fail: bool) {
-        FAIL_GET.store(fail, Ordering::SeqCst);
-    }
-
-    pub fn set_fail_set(fail: bool) {
-        FAIL_SET.store(fail, Ordering::SeqCst);
-    }
-
-    pub fn get() -> Result<Option<String>, String> {
-        if FAIL_GET.load(Ordering::SeqCst) {
-            return Err("mock keyring get failure".to_string());
-        }
-        let map = store()
-            .lock()
-            .map_err(|_| "mock lock poisoned".to_string())?;
-        Ok(map.get(&key()).cloned())
-    }
-
-    pub fn set(value: &str) -> Result<(), String> {
-        if FAIL_SET.load(Ordering::SeqCst) {
-            return Err("mock keyring set failure".to_string());
-        }
-        let mut map = store()
-            .lock()
-            .map_err(|_| "mock lock poisoned".to_string())?;
-        if value.is_empty() {
-            map.remove(&key());
-        } else {
-            map.insert(key(), value.to_string());
-        }
-        Ok(())
-    }
-
-    pub fn delete() -> Result<(), String> {
-        let mut map = store()
-            .lock()
-            .map_err(|_| "mock lock poisoned".to_string())?;
-        map.remove(&key());
-        Ok(())
-    }
-
-    pub fn clear() {
-        FAIL_GET.store(false, Ordering::SeqCst);
-        FAIL_SET.store(false, Ordering::SeqCst);
-        if let Ok(mut map) = store().lock() {
-            map.clear();
-        }
-    }
-}
-
 #[cfg(not(test))]
 fn keyring_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| format!("keyring entry error: {}", e))
@@ -253,6 +185,74 @@ pub fn persist_forge_api_key_secure(path: &Path, api_key: &str) -> Result<(), St
                 e
             );
             write_plaintext_fallback(path, trimmed)
+        }
+    }
+}
+
+#[cfg(test)]
+mod mock_store {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static FAIL_GET: AtomicBool = AtomicBool::new(false);
+    static FAIL_SET: AtomicBool = AtomicBool::new(false);
+
+    fn store() -> &'static Mutex<HashMap<String, String>> {
+        static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn key() -> String {
+        format!("{}:{}", super::SERVICE, super::ACCOUNT)
+    }
+
+    pub fn set_fail_get(fail: bool) {
+        FAIL_GET.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_fail_set(fail: bool) {
+        FAIL_SET.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn get() -> Result<Option<String>, String> {
+        if FAIL_GET.load(Ordering::SeqCst) {
+            return Err("mock keyring get failure".to_string());
+        }
+        let map = store()
+            .lock()
+            .map_err(|_| "mock lock poisoned".to_string())?;
+        Ok(map.get(&key()).cloned())
+    }
+
+    pub fn set(value: &str) -> Result<(), String> {
+        if FAIL_SET.load(Ordering::SeqCst) {
+            return Err("mock keyring set failure".to_string());
+        }
+        let mut map = store()
+            .lock()
+            .map_err(|_| "mock lock poisoned".to_string())?;
+        if value.is_empty() {
+            map.remove(&key());
+        } else {
+            map.insert(key(), value.to_string());
+        }
+        Ok(())
+    }
+
+    pub fn delete() -> Result<(), String> {
+        let mut map = store()
+            .lock()
+            .map_err(|_| "mock lock poisoned".to_string())?;
+        map.remove(&key());
+        Ok(())
+    }
+
+    pub fn clear() {
+        FAIL_GET.store(false, Ordering::SeqCst);
+        FAIL_SET.store(false, Ordering::SeqCst);
+        if let Ok(mut map) = store().lock() {
+            map.clear();
         }
     }
 }
