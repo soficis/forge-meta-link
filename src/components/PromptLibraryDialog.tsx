@@ -11,6 +11,7 @@ import {
     updatePrompt,
 } from "../services/commands";
 import type { PromptEntry, PromptTagCount } from "../types/metadata";
+import { Modal } from "./Modal";
 import "./PromptLibrary.css";
 
 export interface PromptLibraryDialogProps {
@@ -41,7 +42,19 @@ export function PromptLibraryDialog({ onClose, onApply }: PromptLibraryDialogPro
     const [activeTag, setActiveTag] = useState<string | null>(null);
     const [draft, setDraft] = useState<Draft | null>(null);
     const [status, setStatus] = useState<{ text: string; error: boolean }>({ text: "", error: false });
+    const [deletingId, setDeletingId] = useState<number | null>(null);
+    const [deletedEntries, setDeletedEntries] = useState<PromptEntry[]>([]);
+    const undoTimerRef = useRef<number | null>(null);
     const requestSeq = useRef(0);
+    const searchInputRef = useRef<HTMLInputElement>(null);
+
+    useEffect(() => {
+        return () => {
+            if (undoTimerRef.current) {
+                window.clearTimeout(undoTimerRef.current);
+            }
+        };
+    }, []);
 
     const refresh = useCallback(async () => {
         const seq = ++requestSeq.current;
@@ -86,11 +99,56 @@ export function PromptLibraryDialog({ onClose, onApply }: PromptLibraryDialogPro
         onClose();
     };
 
-    const handleDelete = async (entry: PromptEntry) => {
-        if (!window.confirm(`Delete "${entry.title}" from the prompt library?`)) return;
+    const handleConfirmDelete = async (entry: PromptEntry) => {
+        setDeletingId(null);
         try {
             await deletePrompt(entry.id);
-            report("Deleted.");
+            setDeletedEntries((prev) => {
+                const next = [...prev, entry];
+                return next.length > 5 ? next.slice(next.length - 5) : next;
+            });
+            // One shared timer for the whole stack: each delete restarts the 6s window,
+            // and when it fires it clears ALL pending entries, not just the oldest.
+            if (undoTimerRef.current) {
+                window.clearTimeout(undoTimerRef.current);
+            }
+            undoTimerRef.current = window.setTimeout(() => {
+                setDeletedEntries([]);
+                undoTimerRef.current = null;
+            }, 6000);
+            void refresh();
+        } catch (error) {
+            report(errorText(error), true);
+        }
+    };
+
+    const handleUndo = async () => {
+        if (deletedEntries.length === 0) return;
+        const toRestore = deletedEntries[deletedEntries.length - 1];
+        const remaining = deletedEntries.slice(0, deletedEntries.length - 1);
+        setDeletedEntries(remaining);
+        if (undoTimerRef.current) {
+            window.clearTimeout(undoTimerRef.current);
+            undoTimerRef.current = null;
+        }
+        if (remaining.length > 0) {
+            undoTimerRef.current = window.setTimeout(() => {
+                setDeletedEntries([]);
+                undoTimerRef.current = null;
+            }, 6000);
+        }
+        try {
+            // NOTE: savePrompt creates a new row with a new id, resetting use_count to 0
+            // and dropping any other columns not accepted by save_prompt (e.g. created_at/updated_at).
+            // This is a known backend schema limitation.
+            await savePrompt({
+                title: toRestore.title,
+                prompt: toRestore.prompt,
+                negativePrompt: toRestore.negative_prompt,
+                tags: toRestore.tags,
+                notes: toRestore.notes,
+            });
+            report("");
             void refresh();
         } catch (error) {
             report(errorText(error), true);
@@ -153,107 +211,107 @@ export function PromptLibraryDialog({ onClose, onApply }: PromptLibraryDialogPro
     };
 
     return (
-        <div
-            className="settings-backdrop"
-            onMouseDown={(event) => {
-                if (event.target === event.currentTarget) onClose();
+        <Modal
+            label="Prompt library"
+            className="prompt-library"
+            onClose={onClose}
+            initialFocusRef={searchInputRef}
+            closeOnEscape={false}
+            onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    if (draft) setDraft(null);
+                    else onClose();
+                }
             }}
         >
-            <div
-                className="prompt-library"
-                role="dialog"
-                aria-modal="true"
-                aria-label="Prompt library"
-                tabIndex={-1}
-                onKeyDown={(event) => {
-                    event.stopPropagation(); // keep gallery shortcuts from firing behind the modal
-                    if (event.key === "Escape") {
-                        event.preventDefault();
-                        if (draft) setDraft(null);
-                        else onClose();
-                    }
-                }}
-            >
-                <header className="prompt-library-header">
-                    <h2>Prompt library</h2>
-                    <button type="button" className="sidebar-button" onClick={() => setDraft({ ...EMPTY_DRAFT })}>
-                        New
-                    </button>
-                    <button type="button" className="sidebar-button" onClick={() => void handleImport()}>
-                        Import
-                    </button>
-                    <button type="button" className="sidebar-button" onClick={() => void handleExport()}>
-                        Export
-                    </button>
-                    <button type="button" className="sidebar-button" onClick={onClose} aria-label="Close prompt library">
-                        Close
-                    </button>
-                </header>
+            <header className="prompt-library-header">
+                <h2>Prompt library</h2>
+                <button type="button" className="sidebar-button" onClick={() => setDraft({ ...EMPTY_DRAFT })}>
+                    New
+                </button>
+                <button type="button" className="sidebar-button" onClick={() => void handleImport()}>
+                    Import
+                </button>
+                <button type="button" className="sidebar-button" onClick={() => void handleExport()}>
+                    Export
+                </button>
+                <button type="button" className="sidebar-button" onClick={onClose} aria-label="Close prompt library">
+                    Close
+                </button>
+            </header>
 
-                {draft ? (
-                    <div className="prompt-library-list">
-                        <div className="prompt-library-form">
-                            <input
-                                className="viewer-input"
-                                placeholder="Title (optional)"
-                                value={draft.title}
-                                onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-                            />
-                            <textarea
-                                className="viewer-textarea"
-                                rows={5}
-                                placeholder="Prompt"
-                                value={draft.prompt}
-                                onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
-                            />
-                            <textarea
-                                className="viewer-textarea"
-                                rows={3}
-                                placeholder="Negative prompt"
-                                value={draft.negative_prompt}
-                                onChange={(e) => setDraft({ ...draft, negative_prompt: e.target.value })}
-                            />
-                            <input
-                                className="viewer-input"
-                                placeholder="Tags, comma separated"
-                                value={draft.tags}
-                                onChange={(e) => setDraft({ ...draft, tags: e.target.value })}
-                            />
-                            <textarea
-                                className="viewer-textarea"
-                                rows={2}
-                                placeholder="Notes"
-                                value={draft.notes}
-                                onChange={(e) => setDraft({ ...draft, notes: e.target.value })}
-                            />
-                            <div className="prompt-library-item-actions">
-                                <button
-                                    type="button"
-                                    className="sidebar-button"
-                                    disabled={!draft.prompt.trim()}
-                                    onClick={() => void handleSaveDraft()}
-                                >
-                                    {draft.id == null ? "Save" : "Update"}
-                                </button>
-                                <button type="button" className="sidebar-button" onClick={() => setDraft(null)}>
-                                    Cancel
-                                </button>
-                            </div>
+            {!onApply && (
+                <div className="prompt-library-apply-hint">
+                    Open an image&apos;s Forge tab to apply a prompt to a request. Copy works anywhere.
+                </div>
+            )}
+
+            {draft ? (
+                <div className="prompt-library-list">
+                    <div className="prompt-library-form">
+                        <input
+                            className="viewer-input"
+                            placeholder="Title (optional)"
+                            value={draft.title}
+                            onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                        />
+                        <textarea
+                            className="viewer-textarea"
+                            rows={5}
+                            placeholder="Prompt"
+                            value={draft.prompt}
+                            onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
+                        />
+                        <textarea
+                            className="viewer-textarea"
+                            rows={3}
+                            placeholder="Negative prompt"
+                            value={draft.negative_prompt}
+                            onChange={(e) => setDraft({ ...draft, negative_prompt: e.target.value })}
+                        />
+                        <input
+                            className="viewer-input"
+                            placeholder="Tags, comma separated"
+                            value={draft.tags}
+                            onChange={(e) => setDraft({ ...draft, tags: e.target.value })}
+                        />
+                        <textarea
+                            className="viewer-textarea"
+                            rows={2}
+                            placeholder="Notes"
+                            value={draft.notes}
+                            onChange={(e) => setDraft({ ...draft, notes: e.target.value })}
+                        />
+                        <div className="prompt-library-item-actions">
+                            <button
+                                type="button"
+                                className="sidebar-button"
+                                disabled={!draft.prompt.trim()}
+                                onClick={() => void handleSaveDraft()}
+                            >
+                                {draft.id == null ? "Save" : "Update"}
+                            </button>
+                            <button type="button" className="sidebar-button" onClick={() => setDraft(null)}>
+                                Cancel
+                            </button>
                         </div>
                     </div>
-                ) : (
-                    <>
-                        <div className="prompt-library-toolbar">
-                            <input
-                                className="viewer-input"
-                                type="search"
-                                placeholder="Search prompts, titles, tags, notes"
-                                aria-label="Search prompt library"
-                                value={query}
-                                onChange={(e) => setQuery(e.target.value)}
-                                autoFocus
-                            />
-                        </div>
+                </div>
+            ) : (
+                <>
+                    <div className="prompt-library-toolbar">
+                        <input
+                            ref={searchInputRef}
+                            className="viewer-input"
+                            type="search"
+                            placeholder="Search prompts, titles, tags, notes"
+                            aria-label="Search prompt library"
+                            value={query}
+                            onChange={(e) => setQuery(e.target.value)}
+                            autoFocus
+                        />
+                    </div>
                         {tags.length > 0 && (
                             <div className="prompt-library-tags">
                                 {tags.map((t) => (
@@ -321,13 +379,34 @@ export function PromptLibraryDialog({ onClose, onApply }: PromptLibraryDialogPro
                                             >
                                                 Edit
                                             </button>
-                                            <button
-                                                type="button"
-                                                className="sidebar-button danger"
-                                                onClick={() => void handleDelete(entry)}
-                                            >
-                                                Delete
-                                            </button>
+                                            {deletingId === entry.id ? (
+                                                <div className="prompt-library-delete-confirm">
+                                                    <span className="prompt-library-delete-confirm-label">Delete?</span>
+                                                    <button
+                                                        type="button"
+                                                        className="sidebar-button danger"
+                                                        onClick={() => void handleConfirmDelete(entry)}
+                                                    >
+                                                        Yes, delete
+                                                    </button>
+                                                    <button
+                                                        ref={(el) => el?.focus()}
+                                                        type="button"
+                                                        className="sidebar-button"
+                                                        onClick={() => setDeletingId(null)}
+                                                    >
+                                                        Keep
+                                                    </button>
+                                                </div>
+                                            ) : (
+                                                <button
+                                                    type="button"
+                                                    className="sidebar-button danger"
+                                                    onClick={() => setDeletingId(entry.id)}
+                                                >
+                                                    Delete
+                                                </button>
+                                            )}
                                         </div>
                                     </div>
                                 ))
@@ -336,9 +415,22 @@ export function PromptLibraryDialog({ onClose, onApply }: PromptLibraryDialogPro
                     </>
                 )}
                 <div className="prompt-library-status" role="status" data-error={status.error}>
-                    {status.text}
+                    {deletedEntries.length > 0 ? (
+                        <span>
+                            Deleted &quot;{deletedEntries[deletedEntries.length - 1].title}&quot;.{" "}
+                            <button
+                                type="button"
+                                className="prompt-library-undo-btn"
+                                onClick={() => void handleUndo()}
+                            >
+                                Undo
+                            </button>
+                            {deletedEntries.length > 1 && ` (+${deletedEntries.length - 1} more)`}
+                        </span>
+                    ) : (
+                        status.text
+                    )}
                 </div>
-            </div>
-        </div>
+        </Modal>
     );
 }

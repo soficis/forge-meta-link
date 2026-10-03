@@ -882,7 +882,9 @@ const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%"];
 const FAMILY_PATTERNS_FLUX: &[&str] = &["%flux%"];
 const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] =
     &["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"];
-const FAMILY_PATTERNS_SD15: &[&str] = &["%sd1.5%", "%sd15%", "%stable diffusion 1.5%"];
+// "_" is a single-character LIKE wildcard, so "%krea_2%" covers "krea 2", "krea-2" and "krea_2".
+const FAMILY_PATTERNS_KREA2_TURBO: &[&str] = &["%krea2%", "%krea_2%"];
+const FAMILY_PATTERNS_SD15:&[&str] = &["%sd1.5%", "%sd15%", "%stable diffusion 1.5%"];
 const FAMILY_PATTERNS_SD21: &[&str] = &["%sd2.1%", "%sd21%", "%stable diffusion 2.1%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
 const FAMILY_PATTERNS_VACE: &[&str] = &["%vace%"];
@@ -900,6 +902,7 @@ fn normalize_model_family(value: &str) -> Option<&'static str> {
         "sdxl" => Some("sdxl"),
         "flux" => Some("flux"),
         "zimage" | "zimageturbo" => Some("zimage_turbo"),
+        "krea2" | "krea2turbo" => Some("krea2_turbo"),
         "sd15" | "stablediffusion15" | "sdv15" => Some("sd15"),
         "sd21" | "stablediffusion21" | "sdv21" => Some("sd21"),
         "chroma" => Some("chroma"),
@@ -933,6 +936,7 @@ fn family_patterns(family: &str) -> &'static [&'static str] {
         "sdxl" => FAMILY_PATTERNS_SDXL,
         "flux" => FAMILY_PATTERNS_FLUX,
         "zimage_turbo" => FAMILY_PATTERNS_ZIMAGE_TURBO,
+        "krea2_turbo" => FAMILY_PATTERNS_KREA2_TURBO,
         "sd15" => FAMILY_PATTERNS_SD15,
         "sd21" => FAMILY_PATTERNS_SD21,
         "chroma" => FAMILY_PATTERNS_CHROMA,
@@ -991,6 +995,50 @@ fn append_model_family_filter(
 /// - `word*` -> preserved as explicit prefix wildcard
 /// - Multiple terms are ANDed together
 pub(crate) fn sanitize_fts_query(query: &str) -> String {
+    let parts = fts_query_parts(query);
+    let has_positive = parts.iter().any(|p| !p.starts_with("NOT "));
+    if !has_positive {
+        return String::new();
+    }
+    parts.join(" ")
+}
+
+/// How the gallery should run a user search against the FTS index.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GalleryFtsPlan {
+    /// Nothing searchable in the query.
+    Empty,
+    /// Normal MATCH expression (may include scoped `NOT` terms).
+    Match(String),
+    /// Only `-term` words: FTS5 cannot express a bare NOT, so the caller keeps every
+    /// image whose id is NOT in `SELECT rowid ... MATCH <expr>` (expr is the negated
+    /// terms joined with OR).
+    ExcludeOnly(String),
+}
+
+pub(crate) fn plan_gallery_fts_query(query: &str) -> GalleryFtsPlan {
+    let parts = fts_query_parts(query);
+    if parts.is_empty() {
+        return GalleryFtsPlan::Empty;
+    }
+    if parts.iter().any(|p| !p.starts_with("NOT ")) {
+        return GalleryFtsPlan::Match(parts.join(" "));
+    }
+    let expr = parts
+        .iter()
+        .filter_map(|p| p.strip_prefix("NOT "))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    GalleryFtsPlan::ExcludeOnly(expr)
+}
+
+/// True when the query contains a `-term`. Used to skip the trigram fallback, which
+/// searches the raw text and would treat the `-` as a literal character.
+pub(crate) fn query_has_negation(query: &str) -> bool {
+    fts_query_parts(query).iter().any(|p| p.starts_with("NOT "))
+}
+
+fn fts_query_parts(query: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut remaining = query.trim();
 
@@ -1025,12 +1073,7 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
         }
     }
 
-    let has_positive = parts.iter().any(|p| !p.starts_with("NOT "));
-    if !has_positive {
-        return String::new();
-    }
-
-    parts.join(" ")
+    parts
 }
 
 pub(crate) fn process_unquoted_words(text: &str, parts: &mut Vec<String>) {
@@ -1047,16 +1090,16 @@ pub(crate) fn process_unquoted_words(text: &str, parts: &mut Vec<String>) {
             continue;
         }
 
-        let term = if has_wildcard {
-            cleaned.to_lowercase()
-        } else {
-            format!("{}*", cleaned.to_lowercase())
-        };
-
         if is_negated {
-            parts.push(format!("NOT {}", term));
+            // Exclusions are whole-word (the porter tokenizer already folds "girls" into
+            // "girl"; "girlfriend" is kept) unless the user wrote an explicit `*`, and are
+            // scoped to the positive prompt so a negative prompt like "girl, blurry" does
+            // not hide an image.
+            parts.push(format!("NOT prompt : {}", cleaned.to_lowercase()));
+        } else if has_wildcard {
+            parts.push(cleaned.to_lowercase());
         } else {
-            parts.push(term);
+            parts.push(format!("{}*", cleaned.to_lowercase()));
         }
     }
 }
@@ -1068,6 +1111,16 @@ pub(crate) fn contains_search_token(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn krea2_turbo_family_normalizes_and_has_patterns() {
+        for raw in ["krea2_turbo", "Krea 2 Turbo", "krea-2", "krea2"] {
+            assert_eq!(normalize_model_family(raw), Some("krea2_turbo"), "{raw}");
+        }
+        assert_eq!(family_patterns("krea2_turbo"), FAMILY_PATTERNS_KREA2_TURBO);
+        // Plain FLUX.1 Krea [dev] is not Krea 2.
+        assert_eq!(normalize_model_family("flux1-krea-dev"), None);
+    }
 
     fn insert_with_prompt(db: &Database, filepath: &str, prompt: &str, tags: &[&str]) {
         let params = GenerationParams {
@@ -1083,6 +1136,200 @@ mod tests {
         let normalized_tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
         db.replace_image_tags(image_id, &normalized_tags)
             .expect("failed to insert tags");
+    }
+
+    fn negation_fixture() -> Database {
+        let db = Database::new(Path::new(":memory:"), StorageProfile::Hdd).expect("db");
+        let mk = |path: &str, prompt: &str, neg: &str| {
+            let params = GenerationParams {
+                prompt: prompt.to_string(),
+                negative_prompt: neg.to_string(),
+                raw_metadata: format!("{prompt}\nNegative prompt: {neg}\nSteps: 20"),
+                ..Default::default()
+            };
+            db.upsert_image(path, path, "c:\\images", &params, Some(1))
+                .unwrap();
+        };
+        mk("a_girl.png", "portrait of a girl", "blurry");
+        mk("b_girls.png", "portrait of girls", "blurry");
+        mk("c_boy.png", "portrait of a boy", "blurry");
+        mk("d_neg_girl.png", "portrait of a boy", "girl, blurry");
+        mk("e_girlfriend.png", "portrait of a girlfriend", "blurry");
+        db
+    }
+
+    fn search_paths(db: &Database, q: &str) -> Vec<String> {
+        let page = db
+            .search_cursor(SearchCursorParams {
+                query: q,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn filter_paths(db: &Database, q: &str, exclude_tags: &[String]) -> Vec<String> {
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: Some(q),
+                include_tags: &[],
+                exclude_tags,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn negated_term_excludes_prompt_matches_but_not_negative_prompt_or_longer_words() {
+        let db = negation_fixture();
+        // "girls" is folded to "girl" by the porter tokenizer, so both go. The image that
+        // only has "girl" in its NEGATIVE prompt stays, and so does "girlfriend".
+        assert_eq!(
+            search_paths(&db, "portrait -girl"),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        // an explicit wildcard widens the exclusion to prefixes
+        assert_eq!(
+            search_paths(&db, "portrait -girl*"),
+            vec!["c_boy.png", "d_neg_girl.png"]
+        );
+    }
+
+    #[test]
+    fn negation_only_query_returns_everything_except_matches() {
+        let db = negation_fixture();
+        assert_eq!(
+            search_paths(&db, "-girl"),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        // several exclusions combine
+        assert_eq!(
+            search_paths(&db, "-girl -boy"),
+            vec!["e_girlfriend.png"]
+        );
+        // excluding something nothing has returns the whole library
+        assert_eq!(search_paths(&db, "-unicorn").len(), 5);
+        // a query of only punctuation is still empty
+        assert!(search_paths(&db, "- ?").is_empty());
+    }
+
+    #[test]
+    fn negation_only_query_works_through_filter_path_with_tag_exclusion() {
+        let db = negation_fixture();
+        assert_eq!(
+            filter_paths(&db, "-girl", &[]),
+            vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]
+        );
+        db.replace_image_tags(
+            db.search_cursor(SearchCursorParams {
+                query: "boy",
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 1,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap()
+            .items[0]
+                .id,
+            &["keepout".to_string()],
+        )
+        .unwrap();
+        let after = filter_paths(&db, "-girl", &["keepout".to_string()]);
+        assert_eq!(after.len(), 2, "{after:?}");
+    }
+
+    #[test]
+    fn tag_filters_match_the_prompt_not_the_negative_prompt() {
+        let db = negation_fixture();
+        // no tag rows at all: only the FTS fallback decides. "girl" is in the prompt of
+        // a/b, and only in the NEGATIVE prompt of d.
+        let excluded = filter_paths_tags(&db, &[], &["girl".to_string()]);
+        assert_eq!(excluded, vec!["c_boy.png", "d_neg_girl.png", "e_girlfriend.png"]);
+        let included = filter_paths_tags(&db, &["girl".to_string()], &[]);
+        assert_eq!(included, vec!["a_girl.png", "b_girls.png"]);
+
+        // "ortrai" is a substring, not a word prefix, so the porter index finds nothing and
+        // the trigram fallback runs: its tag clauses must be scoped the same way.
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: Some("ortrai"),
+                include_tags: &[],
+                exclude_tags: &["girl".to_string()],
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut tri: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        tri.sort();
+        // trigram matching is substring-based, so "girlfriend" is excluded here too
+        assert_eq!(tri, vec!["c_boy.png", "d_neg_girl.png"]);
+    }
+
+    fn filter_paths_tags(db: &Database, include: &[String], exclude: &[String]) -> Vec<String> {
+        let page = db
+            .filter_images_cursor(FilterCursorParams {
+                query: None,
+                include_tags: include,
+                exclude_tags: exclude,
+                options: CursorQueryOptions {
+                    cursor: None,
+                    limit: 50,
+                    sort_by: None,
+                    generation_types: None,
+                    model_filter: None,
+                    model_family_filters: None,
+                },
+            })
+            .unwrap();
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn plan_distinguishes_match_exclude_only_and_empty() {
+        assert_eq!(
+            plan_gallery_fts_query("cat -dog"),
+            GalleryFtsPlan::Match("cat* NOT prompt : dog".to_string())
+        );
+        assert_eq!(
+            plan_gallery_fts_query("-dog -cat"),
+            GalleryFtsPlan::ExcludeOnly("prompt : dog OR prompt : cat".to_string())
+        );
+        assert_eq!(plan_gallery_fts_query(" ??? "), GalleryFtsPlan::Empty);
+        // the legacy sanitizer still yields nothing for exclude-only (other callers)
+        assert!(sanitize_fts_query("-dog").is_empty());
+        assert!(query_has_negation("cat -dog"));
+        assert!(!query_has_negation("cat dog"));
     }
 
     #[test]

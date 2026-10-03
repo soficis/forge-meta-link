@@ -3,9 +3,30 @@ import { render, screen, fireEvent, waitFor, act, within } from "@testing-librar
 import { installTauriMock, type Handlers, type TauriMock } from "../../test/tauriMock";
 import { queryClient } from "../../queryClient";
 import type { DeleteImagesResult, GalleryImageRecord, PromptEntry } from "../../types/metadata";
+import { useCompareLabStore } from "../../store/compareLabStore";
+
+type EventCallback = (event: { event: string; payload: unknown }) => void;
+const eventListeners = new Map<string, Set<EventCallback>>();
+
+function emitTauriEvent(eventName: string, payload: unknown = {}) {
+    const handlers = eventListeners.get(eventName);
+    if (handlers) {
+        for (const cb of Array.from(handlers)) {
+            cb({ event: eventName, payload });
+        }
+    }
+}
 
 vi.mock("@tauri-apps/api/event", () => ({
-    listen: vi.fn(() => Promise.resolve(() => {})),
+    listen: vi.fn((eventName: string, handler: EventCallback) => {
+        if (!eventListeners.has(eventName)) {
+            eventListeners.set(eventName, new Set());
+        }
+        eventListeners.get(eventName)!.add(handler);
+        return Promise.resolve(() => {
+            eventListeners.get(eventName)?.delete(handler);
+        });
+    }),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tanstack/react-virtual", () => ({
@@ -86,6 +107,7 @@ function backend(extra: Handlers = {}): Handlers {
         },
         list_prompts: () => [prompt(1, "Saved portrait")],
         list_prompt_tags: () => [],
+        get_sidecar_data: () => ({ tags: [], notes: "" }),
         ...extra,
     };
 }
@@ -102,6 +124,8 @@ const sleep = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, m
 beforeEach(() => {
     localStorage.clear();
     queryClient.clear(); // the client is app-wide; stale cache from the previous test would leak in
+    useCompareLabStore.getState().clear();
+    eventListeners.clear();
     library = [image(1, "a"), image(2, "b"), image(3, "c")];
 });
 
@@ -132,6 +156,11 @@ describe("App wiring: prompt library", () => {
         await within(dialog).findByText("Saved portrait");
         expect(within(dialog).queryByText("Apply")).toBeNull();
         expect(within(dialog).getByText("Copy")).toBeTruthy();
+        expect(
+            within(dialog).getByText(
+                "Open an image's Forge tab to apply a prompt to a request. Copy works anywhere."
+            )
+        ).toBeTruthy();
     });
 });
 
@@ -234,3 +263,159 @@ describe("App wiring: delete, undo, finalize", () => {
         expect(mock.argsOf("delete_images")[0]).toEqual({ request: { ids: [1, 2, 3], mode: "permanent" } });
     });
 });
+
+describe("App wiring: thumbnail Pin button and Compare Lab", () => {
+    it("clicking Pin on an image adds it to Compare Lab; pinning 4 times fills it; fifth pin is refused with full message", async () => {
+        library = [
+            image(1, "a"),
+            image(2, "b"),
+            image(3, "c"),
+            image(4, "d"),
+            image(5, "e"),
+        ];
+        mock = installTauriMock(
+            backend({
+                get_image_detail: ({ id }) => ({
+                    ...library.find((img) => img.id === id)!,
+                    prompt: "test prompt",
+                    negative_prompt: "",
+                    steps: "20",
+                    sampler: "Euler a",
+                    cfg_scale: "7",
+                    model_hash: "abc",
+                    raw_metadata: "",
+                }),
+                get_lineage_cursor: () => ({ ancestors: [], children: [] }),
+            })
+        );
+        await mountApp();
+
+        expect(screen.queryByTestId("compare-lab")).toBeNull();
+
+        // Pin image 1
+        const pinButtons = await screen.findAllByRole("button", { name: "Pin to Compare Lab" });
+        expect(pinButtons.length).toBe(5);
+
+        fireEvent.click(pinButtons[0]);
+        // CompareLab appears
+        expect(await screen.findByTestId("compare-lab")).toBeTruthy();
+        expect(await screen.findByTestId("compare-pin-1")).toBeTruthy();
+        expect(screen.getByText("Pinned to Compare Lab slot 1")).toBeTruthy();
+
+        // Pin images 2, 3, 4
+        fireEvent.click(pinButtons[1]);
+        expect(await screen.findByTestId("compare-pin-2")).toBeTruthy();
+
+        fireEvent.click(pinButtons[2]);
+        expect(await screen.findByTestId("compare-pin-3")).toBeTruthy();
+
+        fireEvent.click(pinButtons[3]);
+        expect(await screen.findByTestId("compare-pin-4")).toBeTruthy();
+
+        // All 4 slots are full
+        expect(useCompareLabStore.getState().pins.length).toBe(4);
+
+        // Pinned thumbnails have enabled button with name "Unpin from Compare Lab" and aria-pressed="true"
+        const unpinButtons = await screen.findAllByRole("button", { name: "Unpin from Compare Lab" });
+        expect(unpinButtons.length).toBe(4);
+        for (const btn of unpinButtons) {
+            expect(btn.hasAttribute("disabled")).toBe(false);
+            expect(btn.getAttribute("aria-pressed")).toBe("true");
+        }
+
+        // Fifth pin button is disabled with tooltip "Compare Lab full (4 max)" and name "Pin to Compare Lab"
+        const fifthPinBtn = screen.getByRole("button", { name: "Pin to Compare Lab" });
+        expect(fifthPinBtn.hasAttribute("disabled")).toBe(true);
+        expect(fifthPinBtn.getAttribute("title")).toBe("Compare Lab full (4 max)");
+
+        // Clicking fifth pin button is refused with full warning toast
+        fireEvent.click(fifthPinBtn);
+        expect(useCompareLabStore.getState().pins.length).toBe(4);
+        expect(screen.queryByTestId("compare-pin-5")).toBeNull();
+        expect(await screen.findByText("Compare Lab full (4 max).")).toBeTruthy();
+    });
+
+    it("clicking Pin on an already-pinned image unpins it, preserves remaining order, and shows toast", async () => {
+        library = [
+            image(1, "a"),
+            image(2, "b"),
+            image(3, "c"),
+            image(4, "d"),
+            image(5, "e"),
+        ];
+        mock = installTauriMock(
+            backend({
+                get_image_detail: ({ id }) => ({
+                    ...library.find((img) => img.id === id)!,
+                    prompt: "test prompt",
+                    negative_prompt: "",
+                    steps: "20",
+                    sampler: "Euler a",
+                    cfg_scale: "7",
+                    model_hash: "abc",
+                    raw_metadata: "",
+                }),
+                get_lineage_cursor: () => ({ ancestors: [], children: [] }),
+            })
+        );
+        await mountApp();
+
+        // Pin 3 distinct images: 1, 2, 3
+        const pinButtons = await screen.findAllByRole("button", { name: "Pin to Compare Lab" });
+        fireEvent.click(pinButtons[0]);
+        await screen.findByTestId("compare-pin-1");
+        fireEvent.click(pinButtons[1]);
+        await screen.findByTestId("compare-pin-2");
+        fireEvent.click(pinButtons[2]);
+        await screen.findByTestId("compare-pin-3");
+
+        expect(useCompareLabStore.getState().pins.map((p) => p.id)).toEqual([1, 2, 3]);
+
+        // Pinned thumbnails now have accessible name "Unpin from Compare Lab"
+        const unpinButtons = await screen.findAllByRole("button", { name: "Unpin from Compare Lab" });
+        expect(unpinButtons.length).toBe(3);
+
+        // Click unpin on image 2
+        fireEvent.click(unpinButtons[1]);
+
+        expect(await screen.findByText("Unpinned from Compare Lab")).toBeTruthy();
+        expect(useCompareLabStore.getState().pins.map((p) => p.id)).toEqual([1, 3]);
+        expect(screen.queryByTestId("compare-pin-2")).toBeNull();
+        expect(screen.getByTestId("compare-pin-1")).toBeTruthy();
+        expect(screen.getByTestId("compare-pin-3")).toBeTruthy();
+    });
+});
+
+describe("App wiring: first scan into empty library", () => {
+    it("grid refreshes and displays newly scanned images when scan-complete fires", async () => {
+        library = []; // start with empty library
+        mock = installTauriMock(backend());
+        const { default: App } = await import("../../App");
+        render(<App />);
+
+        // Grid starts empty
+        expect(await screen.findByText(/No images available|No images/i)).toBeTruthy();
+
+        // Backend now has 3 images
+        library = [image(10, "scanned-1"), image(20, "scanned-2"), image(30, "scanned-3")];
+
+        // Fire scan-complete event
+        await act(async () => {
+            emitTauriEvent("scan-complete", {
+                duration_ms: 100,
+                scanned_files: 3,
+                new_images: 3,
+                updated_images: 0,
+                failed_files: 0,
+                errors: [],
+            });
+        });
+
+        // Grid should show the scanned images
+        expect(await screen.findByText("scanned-1.png")).toBeTruthy();
+        expect(screen.getByText("scanned-2.png")).toBeTruthy();
+        expect(screen.getByText("scanned-3.png")).toBeTruthy();
+    });
+});
+
+

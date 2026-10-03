@@ -36,5 +36,8 @@
 .prompt-library-empty { color: var(--text-secondary); font-size: 13px; padding: 24px 0; text-align: center; }
 .prompt-library-status { padding: 0 20px 12px; font-size: 12px; color: var(--text-secondary); min-height: 16px; }
 .prompt-library-status[data-error="true"] { color: var(--danger, #e5484d); }
-.prompt-library-form { display: flex; flex-direction: column; gap: 6px; }
 .prompt-library-form textarea, .prompt-library-form input { width: 100%; }
+.prompt-library-apply-hint { padding: 8px 20px 0; font-size: 12px; color: var(--text-secondary); }
+.prompt-library-delete-confirm { display: inline-flex; align-items: center; gap: 6px; }
+.prompt-library-delete-confirm-label { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-right: 2px; }
+.prompt-library-undo-btn { background: none; border: none; color: var(--text-accent); text-decoration: underline; cursor: pointer; font-size: inherit; margin-left: 4px; padding: 0; }

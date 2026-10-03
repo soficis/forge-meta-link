@@ -104,7 +104,7 @@ impl Database {
     /// Cursor-based search: tries porter first, falls back to trigram.
     pub fn search_cursor(&self, params: SearchCursorParams<'_>) -> SqlResult<CursorPage> {
         let porter = self.search_cursor_porter(params)?;
-        if !porter.items.is_empty() {
+        if !porter.items.is_empty() || query_has_negation(params.query) {
             return Ok(porter);
         }
         self.search_cursor_trigram(params)
@@ -122,13 +122,24 @@ impl Database {
         } = params.options;
         let conn = self.pool.get().map_err(pool_error)?;
 
-        let sanitized = sanitize_fts_query(query);
-        if sanitized.is_empty() {
-            return Ok(CursorPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        }
+        let (fts_join, fts_where, sanitized) = match plan_gallery_fts_query(query) {
+            GalleryFtsPlan::Empty => {
+                return Ok(CursorPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            GalleryFtsPlan::Match(expr) => (
+                " JOIN images_fts ON images.id = images_fts.rowid",
+                " WHERE images_fts MATCH ?",
+                expr,
+            ),
+            GalleryFtsPlan::ExcludeOnly(expr) => (
+                "",
+                " WHERE images.id NOT IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)",
+                expr,
+            ),
+        };
 
         let sort = SortConfig::from_str(sort_by.unwrap_or("newest"));
         let cursor_value = cursor.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
@@ -145,21 +156,20 @@ impl Database {
         let normalized_model_family_filters = normalize_model_family_filters(model_family_filters);
         let mut params_vec = vec![Value::Text(sanitized)];
         let mut sql = if sort.field == "id" {
-            String::from(
+            format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime
-                 FROM images_live AS images
-                 JOIN images_fts ON images.id = images_fts.rowid
-                 WHERE images_fts MATCH ?",
+                 FROM images_live AS images{}{}",
+                fts_join, fts_where
             )
         } else {
             format!(
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
-                 FROM images_live AS images
-                 JOIN images_fts ON images.id = images_fts.rowid
-                 WHERE images_fts MATCH ?",
-                sort.sort_expr()
+                 FROM images_live AS images{}{}",
+                sort.sort_expr(),
+                fts_join,
+                fts_where
             )
         };
         append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
@@ -357,7 +367,7 @@ impl Database {
         let Some(query) = params.query else {
             return Ok(porter);
         };
-        if query.trim().is_empty() {
+        if query.trim().is_empty() || query_has_negation(query) {
             return Ok(porter);
         }
 
@@ -398,7 +408,8 @@ impl Database {
 
         let mut params_vec = Vec::<Value>::new();
 
-        let fts_join = if query.is_some() {
+        let fts_plan = query.map(plan_gallery_fts_query);
+        let fts_join = if matches!(fts_plan, Some(GalleryFtsPlan::Match(_))) {
             " JOIN images_fts ON images.id = images_fts.rowid"
         } else {
             ""
@@ -421,18 +432,24 @@ impl Database {
             )
         };
 
-        if let Some(q) = query {
-            let sanitized = sanitize_fts_query(q);
-            if sanitized.is_empty() {
+        match fts_plan {
+            Some(GalleryFtsPlan::Empty) => {
                 return Ok(CursorPage {
                     items: Vec::new(),
                     next_cursor: None,
                 });
             }
-            sql.push_str(" WHERE images_fts MATCH ?");
-            params_vec.push(Value::Text(sanitized));
-        } else {
-            sql.push_str(" WHERE 1=1");
+            Some(GalleryFtsPlan::Match(expr)) => {
+                sql.push_str(" WHERE images_fts MATCH ?");
+                params_vec.push(Value::Text(expr));
+            }
+            Some(GalleryFtsPlan::ExcludeOnly(expr)) => {
+                sql.push_str(
+                    " WHERE images.id NOT IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)",
+                );
+                params_vec.push(Value::Text(expr));
+            }
+            None => sql.push_str(" WHERE 1=1"),
         }
 
         append_generation_type_filter(&mut sql, &mut params_vec, &normalized_generation_types);
@@ -448,7 +465,9 @@ impl Database {
             let clean = tag.trim().to_ascii_lowercase();
             let clean_space = clean.replace('_', " ");
             let clean_under = clean.replace(' ', "_");
-            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
+            // Scoped to the positive prompt: a tag mentioned only in the negative prompt
+            // ("girl, blurry") must neither match an include nor hide an image on exclude.
+            let fts_phrase = format!("prompt : \"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
                 " AND (
                     EXISTS (
@@ -469,7 +488,9 @@ impl Database {
             let clean = tag.trim().to_ascii_lowercase();
             let clean_space = clean.replace('_', " ");
             let clean_under = clean.replace(' ', "_");
-            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
+            // Scoped to the positive prompt: a tag mentioned only in the negative prompt
+            // ("girl, blurry") must neither match an include nor hide an image on exclude.
+            let fts_phrase = format!("prompt : \"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
                 " AND NOT (
                     EXISTS (
@@ -636,7 +657,9 @@ impl Database {
             let clean = tag.trim().to_ascii_lowercase();
             let clean_space = clean.replace('_', " ");
             let clean_under = clean.replace(' ', "_");
-            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
+            // Scoped to the positive prompt: a tag mentioned only in the negative prompt
+            // ("girl, blurry") must neither match an include nor hide an image on exclude.
+            let fts_phrase = format!("prompt : \"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
                 " AND (
                     EXISTS (
@@ -657,7 +680,9 @@ impl Database {
             let clean = tag.trim().to_ascii_lowercase();
             let clean_space = clean.replace('_', " ");
             let clean_under = clean.replace(' ', "_");
-            let fts_phrase = format!("\"{}\"", clean_space.replace('"', "\"\""));
+            // Scoped to the positive prompt: a tag mentioned only in the negative prompt
+            // ("girl, blurry") must neither match an include nor hide an image on exclude.
+            let fts_phrase = format!("prompt : \"{}\"", clean_space.replace('"', "\"\""));
             sql.push_str(
                 " AND NOT (
                     EXISTS (

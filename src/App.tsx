@@ -295,17 +295,9 @@ function AppContent() {
         ]
     );
     const [images, setImages] = useState<GalleryImageRecord[]>([]);
-    const pageAccumulatorRef = useRef<{
-        signature: string;
-        pageCount: number;
-    }>({
-        signature: querySignature,
-        pageCount: 0,
-    });
 
     useEffect(() => {
         setImages([]);
-        pageAccumulatorRef.current = { signature: querySignature, pageCount: 0 };
     }, [querySignature]);
 
     const dedupeImages = useCallback((records: GalleryImageRecord[]) => {
@@ -324,40 +316,10 @@ function AppContent() {
     useEffect(() => {
         if (!data?.pages) {
             setImages([]);
-            pageAccumulatorRef.current = { signature: querySignature, pageCount: 0 };
             return;
         }
-
-        const tracker = pageAccumulatorRef.current;
-        const pageCount = data.pages.length;
-        const isQueryChanged = tracker.signature !== querySignature;
-        const hasPageReset = pageCount < tracker.pageCount;
-
-        if (isQueryChanged || hasPageReset) {
-            setImages(dedupeImages(data.pages.flatMap((page) => page.items)));
-            pageAccumulatorRef.current = {
-                signature: querySignature,
-                pageCount,
-            };
-            return;
-        }
-
-        if (pageCount === tracker.pageCount) {
-            return;
-        }
-
-        const appended = data.pages
-            .slice(tracker.pageCount)
-            .flatMap((page) => page.items);
-
-        setImages((prev) =>
-            appended.length > 0 ? dedupeImages(prev.concat(appended)) : prev
-        );
-        pageAccumulatorRef.current = {
-            signature: querySignature,
-            pageCount,
-        };
-    }, [data, dedupeImages, querySignature]);
+        setImages(dedupeImages(data.pages.flatMap((page) => page.items)));
+    }, [data, dedupeImages]);
 
     const timelineFilteredImages = useMemo(() => {
         if (!timelineRange) return images;
@@ -1520,6 +1482,28 @@ function AppContent() {
 
     const comparePins = useCompareLabStore((s) => s.pins);
 
+    const handlePinToCompare = useCallback(
+        (img: GalleryImageRecord) => {
+            const store = useCompareLabStore.getState();
+            if (store.pins.some((p) => p.id === img.id)) {
+                store.unpin(img.id);
+                pushToast("Unpinned from Compare Lab", { tone: "info", durationMs: 2200 });
+                return;
+            }
+            const firstFreeSlot = store.pins.length;
+            if (firstFreeSlot >= 4) {
+                pushToast("Compare Lab full (4 max).", { tone: "warning", durationMs: 2200 });
+                return;
+            }
+            const ok = store.pinToSlot(img, firstFreeSlot);
+            pushToast(
+                ok ? `Pinned to Compare Lab slot ${firstFreeSlot + 1}` : "Compare Lab pin failed",
+                { tone: ok ? "success" : "warning", durationMs: 2200 }
+            );
+        },
+        [pushToast]
+    );
+
     const handleNavigateViewer = useCallback(
         (index: number) => {
             const nextImage = viewerImageState.viewerImages[index];
@@ -1892,6 +1876,7 @@ function AppContent() {
                         storageProfile={storageProfile}
                         onShowToast={pushToast}
                         emptyState={galleryEmptyState}
+                        onPin={handlePinToCompare}
                     />
                 )}
             </main>

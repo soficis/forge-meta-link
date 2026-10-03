@@ -39,10 +39,11 @@ import type {
     LineageEdge,
     LineageTrace,
 } from "../types/metadata";
-import { usePersistedState } from "../hooks/usePersistedState";
+import { usePersistedState, booleanStorage } from "../hooks/usePersistedState";
 import type { ShowToastOptions } from "../hooks/useToast";
 import { useCompareLabStore } from "../store/compareLabStore";
 import { ForgeRequeueButton } from "./ForgeRequeueButton";
+import { GhostIcon, BookmarkIcon } from "./icons";
 
 interface PhotoViewerProps {
     images: GalleryImageRecord[];
@@ -103,7 +104,7 @@ const SINGLE_IMAGE_EXPORT_OPTIONS: { value: ImageExportFormat; label: string }[]
     { value: "webp", label: "WebP" },
     { value: "jxl", label: "JPEG XL" },
 ];
-type ResolutionPresetFamily = "pony_sdxl" | "flux" | "zimage_turbo";
+type ResolutionPresetFamily = "pony_sdxl" | "flux" | "zimage_turbo" | "krea2_turbo";
 
 const RESOLUTION_PRESETS: Record<
     ResolutionPresetFamily,
@@ -131,6 +132,17 @@ const RESOLUTION_PRESETS: Record<
         { label: "1152 x 896", width: "1152", height: "896" },
         { label: "768 x 1344", width: "768", height: "1344" },
         { label: "1344 x 768", width: "1344", height: "768" },
+    ],
+    // Krea 2 / Krea 2 Turbo native 1K sizes (~1 MP), per Krea's published aspect ratios.
+    krea2_turbo: [
+        { label: "1024 x 1024 (1:1)", width: "1024", height: "1024" },
+        { label: "1184 x 896 (4:3)", width: "1184", height: "896" },
+        { label: "1248 x 832 (3:2)", width: "1248", height: "832" },
+        { label: "1376 x 768 (16:9)", width: "1376", height: "768" },
+        { label: "1568 x 672 (2.35:1)", width: "1568", height: "672" },
+        { label: "928 x 1152 (4:5)", width: "928", height: "1152" },
+        { label: "832 x 1248 (2:3)", width: "832", height: "1248" },
+        { label: "768 x 1376 (9:16)", width: "768", height: "1376" },
     ],
 };
 const ADETAILER_FACE_MODELS = ["face_yolov8n.pt", "face_yolov8s.pt"];
@@ -257,6 +269,11 @@ function detectResolutionFamilyFromModelName(modelName: string | null | undefine
     const lowered = (modelName ?? "").toLowerCase();
     if (lowered.includes("flux")) {
         return "flux";
+    }
+    // Before the generic "turbo" match below so "krea2-turbo" is not read as Z-Image Turbo.
+    // Checked after "flux" so FLUX.1 Krea [dev] keeps Flux presets.
+    if (/krea[\s_-]*2/.test(lowered)) {
+        return "krea2_turbo";
     }
     if (lowered.includes("z-image") || lowered.includes("zimage") || lowered.includes("turbo")) {
         return "zimage_turbo";
@@ -399,6 +416,15 @@ export function PhotoViewer({
     const [linkParentInput, setLinkParentInput] = useState("");
     const [linkRelationInput, setLinkRelationInput] = useState("seed_walk");
     const [isLineageMutating, setIsLineageMutating] = useState(false);
+    const [expandedGhostIds, setExpandedGhostIds] = useState<Set<number>>(() => new Set());
+    const toggleGhostExpanded = useCallback((id: number) => {
+        setExpandedGhostIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }, []);
     const lineageRequestRef = useRef(0);
     const [isPromptLibraryOpen, setIsPromptLibraryOpen] = useState(false);
     const [promptLibraryNote, setPromptLibraryNote] = useState<string | null>(null);
@@ -412,6 +438,26 @@ export function PhotoViewer({
         useState<ResolutionPresetFamily>("pony_sdxl");
     const [isLoraDropdownOpen, setIsLoraDropdownOpen] = useState(false);
     const [loraSearch, setLoraSearch] = useState("");
+    const [promptSectionOpen, setPromptSectionOpen] = usePersistedState(
+        "forgeSectionPromptOpen",
+        true,
+        booleanStorage
+    );
+    const [samplingSectionOpen, setSamplingSectionOpen] = usePersistedState(
+        "forgeSectionSamplingOpen",
+        true,
+        booleanStorage
+    );
+    const [sizeSectionOpen, setSizeSectionOpen] = usePersistedState(
+        "forgeSectionSizeOpen",
+        false,
+        booleanStorage
+    );
+    const [modelLoraSectionOpen, setModelLoraSectionOpen] = usePersistedState(
+        "forgeSectionModelLoraOpen",
+        false,
+        booleanStorage
+    );
 
     const panOriginRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(
         null
@@ -680,6 +726,29 @@ export function PhotoViewer({
         }
     }, [forgeBaseUrl]);
     const hasValidForgeUrl = forgeUrlValidationError == null;
+
+    const { forgeProblems, forgeHints } = useMemo(() => {
+        if (!forgeOptionsWarning) {
+            return { forgeProblems: [] as string[], forgeHints: [] as string[] };
+        }
+        const parts = forgeOptionsWarning.split(" | ");
+        const problems: string[] = [];
+        const hints: string[] = [];
+        for (const part of parts) {
+            if (part.startsWith("LoRA directory not configured")) {
+                hints.push(part);
+            } else {
+                problems.push(part);
+            }
+        }
+        return { forgeProblems: problems, forgeHints: hints };
+    }, [forgeOptionsWarning]);
+
+    const showLoraHint = useMemo(() => {
+        const promptHasLora = forgeOverrides.prompt.includes("<lora:");
+        const loraSelected = forgeSelectedLoras.length > 0;
+        return (promptHasLora || loraSelected) && forgeHints.length > 0;
+    }, [forgeOverrides.prompt, forgeSelectedLoras.length, forgeHints.length]);
 
     const adetailerModelDropdownOptions = useMemo(() => {
         const current = adetailerFaceModelForCurrentRequest.trim();
@@ -2378,7 +2447,7 @@ export function PhotoViewer({
                             )}
 
                             {infoPanelTab === "forge" && (
-                                <>
+                                <div className="viewer-forge-panel">
                                     <section className="photo-viewer-section">
                                         <h4>Forge Payload</h4>
                                         {detailFailed && (
@@ -2401,9 +2470,10 @@ export function PhotoViewer({
                                         {isLoadingForgeOptions && (
                                             <div className="photo-viewer-note">Loading Forge options...</div>
                                         )}
-                                        {forgeOptionsWarning && (
+                                        {forgeProblems.length > 0 && (
                                             <div
-                                                className="photo-viewer-note"
+                                                className="photo-viewer-note input-error"
+                                                role="alert"
                                                 style={{
                                                     display: "flex",
                                                     justifyContent: "space-between",
@@ -2411,16 +2481,20 @@ export function PhotoViewer({
                                                     gap: "8px",
                                                 }}
                                             >
-                                                <span>{forgeOptionsWarning}</span>
+                                                <span>{forgeProblems.join(" | ")}</span>
                                                 <button
                                                     type="button"
-                                                    className="viewer-link-button"
+                                                    className="viewer-link-button viewer-retry-button"
                                                     onClick={() => void refreshForgeOptions()}
                                                     disabled={isLoadingForgeOptions}
-                                                    style={{ flexShrink: 0, padding: "2px 6px", fontSize: "11px" }}
                                                 >
                                                     {isLoadingForgeOptions ? "Checking…" : "↻ Retry connection"}
                                                 </button>
+                                            </div>
+                                        )}
+                                        {showLoraHint && (
+                                            <div className="photo-viewer-note viewer-lora-hint">
+                                                <span>{forgeHints.join(" | ")}</span>
                                             </div>
                                         )}
                                         <div className="viewer-form-label">Preset Manager</div>
@@ -2478,480 +2552,533 @@ export function PhotoViewer({
                                                 Delete
                                             </button>
                                         </div>
-                                        <div className="viewer-forge-folders">
-                                            <div className="viewer-key-value-row">
-                                                <span>Models folder</span>
-                                                <strong className="viewer-path" title={forgeModelsPath || undefined}>
-                                                    {forgeModelsPath || "Not set"}
-                                                    {forgeModelsPath && forgeModelsScanSubfolders ? " (+ subfolders)" : ""}
-                                                </strong>
+
+                                        {/* 1. Prompt section */}
+                                        <details
+                                            open={promptSectionOpen}
+                                            onToggle={(e) => setPromptSectionOpen(e.currentTarget.open)}
+                                            data-testid="forge-section-prompt"
+                                            className="viewer-collapsible-section"
+                                        >
+                                            <summary className="viewer-section-summary">
+                                                <span className="viewer-summary-title">Prompt</span>
+                                            </summary>
+                                            <div className="viewer-section-content">
+                                                <div className="viewer-prompt-actions-row">
+                                                    <button
+                                                        type="button"
+                                                        className="sidebar-button"
+                                                        onClick={() => void handleSavePromptToLibrary()}
+                                                        title="Save the prompt below to the prompt library"
+                                                        aria-label="Save to library"
+                                                    >
+                                                        <BookmarkIcon size={14} />
+                                                        <span>Save to library</span>
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="sidebar-button"
+                                                        onClick={() => {
+                                                            setPromptLibraryNote(null);
+                                                            setIsPromptLibraryOpen(true);
+                                                        }}
+                                                        title="Browse the prompt library and apply a prompt"
+                                                        aria-label="Library"
+                                                    >
+                                                        <BookmarkIcon size={14} />
+                                                        <span>Library</span>
+                                                    </button>
+                                                </div>
+                                                {promptLibraryNote && (
+                                                    <div className="viewer-form-label" role="status">
+                                                        {promptLibraryNote}
+                                                    </div>
+                                                )}
+                                                <textarea
+                                                    className="viewer-textarea"
+                                                    value={forgeOverrides.prompt}
+                                                    onChange={(event) =>
+                                                        updateForgeOverride("prompt", event.target.value)
+                                                    }
+                                                    placeholder="Prompt"
+                                                    rows={4}
+                                                />
+                                                <div className="viewer-form-label">Negative Prompt</div>
+                                                <textarea
+                                                    className="viewer-textarea"
+                                                    value={forgeOverrides.negative_prompt}
+                                                    onChange={(event) =>
+                                                        updateForgeOverride(
+                                                            "negative_prompt",
+                                                            event.target.value
+                                                        )
+                                                    }
+                                                    placeholder="Negative prompt"
+                                                    rows={3}
+                                                />
                                             </div>
-                                            <div className="viewer-key-value-row">
-                                                <span>LoRA folder</span>
-                                                <strong className="viewer-path" title={forgeLoraPath || undefined}>
-                                                    {forgeLoraPath || "Not set"}
-                                                    {forgeLoraPath && forgeLoraScanSubfolders ? " (+ subfolders)" : ""}
-                                                </strong>
-                                            </div>
-                                            <button
-                                                type="button"
-                                                className="viewer-control-button"
-                                                onClick={onOpenForgeSettings}
-                                            >
-                                                Change in Settings…
-                                            </button>
-                                        </div>
-                                        <div className="viewer-form-label">
-                                            LoRA Multi-Select
-                                        </div>
-                                        <div className="viewer-multiselect" ref={loraDropdownRef}>
-                                            <button
-                                                type="button"
-                                                className="viewer-control-button viewer-multiselect-trigger"
-                                                onClick={() =>
-                                                    setIsLoraDropdownOpen((previous) => !previous)
-                                                }
-                                            >
-                                                {forgeSelectedLoras.length > 0
-                                                    ? `${forgeSelectedLoras.length} selected`
-                                                    : "Select LoRAs"}
-                                            </button>
-                                            {isLoraDropdownOpen && (
-                                                <div className="viewer-multiselect-menu">
+                                        </details>
+
+                                        {/* 2. Sampling section */}
+                                        <details
+                                            open={samplingSectionOpen}
+                                            onToggle={(e) => setSamplingSectionOpen(e.currentTarget.open)}
+                                            data-testid="forge-section-sampling"
+                                            className="viewer-collapsible-section"
+                                        >
+                                            <summary className="viewer-section-summary">
+                                                <span className="viewer-summary-title">Sampling</span>
+                                            </summary>
+                                            <div className="viewer-section-content">
+                                                <div className="viewer-form-grid">
                                                     <input
-                                                        className="viewer-input"
-                                                        placeholder="Filter LoRAs..."
-                                                        value={loraSearch}
+                                                        className={`viewer-input ${
+                                                            stepsValidationError ? "input-invalid" : ""
+                                                        }`}
+                                                        value={forgeOverrides.steps}
                                                         onChange={(event) =>
-                                                            setLoraSearch(event.target.value)
+                                                            updateForgeOverride("steps", event.target.value)
                                                         }
+                                                        placeholder="Steps"
+                                                        aria-invalid={stepsValidationError != null}
                                                     />
-                                                    <div className="viewer-multiselect-list">
-                                                        {filteredLoraOptions.map((lora) => (
-                                                            <label
-                                                                key={lora}
-                                                                className="viewer-multiselect-option"
-                                                            >
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={forgeSelectedLoras.includes(
-                                                                        lora
-                                                                    )}
-                                                                    onChange={() =>
-                                                                        toggleLoraSelection(lora)
-                                                                    }
-                                                                />
-                                                                <span>{lora}</span>
-                                                            </label>
+                                                    <select
+                                                        className="viewer-input"
+                                                        value={forgeOverrides.sampler_name}
+                                                        onChange={(event) =>
+                                                            updateForgeOverride(
+                                                                "sampler_name",
+                                                                event.target.value
+                                                            )
+                                                        }
+                                                    >
+                                                        <option value="">Sampler (auto/default)</option>
+                                                        {samplerDropdownOptions.map((sampler) => (
+                                                            <option key={sampler} value={sampler}>
+                                                                {sampler}
+                                                            </option>
                                                         ))}
-                                                        {filteredLoraOptions.length === 0 && (
-                                                            <div className="photo-viewer-note">
-                                                                No LoRAs match filter
-                                                            </div>
+                                                    </select>
+                                                    <select
+                                                        className="viewer-input"
+                                                        value={forgeOverrides.scheduler}
+                                                        onChange={(event) =>
+                                                            updateForgeOverride("scheduler", event.target.value)
+                                                        }
+                                                    >
+                                                        <option value="">Scheduler (auto/default)</option>
+                                                        {schedulerDropdownOptions.map((scheduler) => (
+                                                            <option key={scheduler} value={scheduler}>
+                                                                {scheduler}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                    <input
+                                                        className={`viewer-input ${
+                                                            cfgScaleValidationError ? "input-invalid" : ""
+                                                        }`}
+                                                        value={forgeOverrides.cfg_scale}
+                                                        onChange={(event) =>
+                                                            updateForgeOverride("cfg_scale", event.target.value)
+                                                        }
+                                                        placeholder="CFG Scale"
+                                                        aria-invalid={cfgScaleValidationError != null}
+                                                    />
+                                                    <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+                                                        <input
+                                                            className="viewer-input"
+                                                            style={{ flex: 1 }}
+                                                            value={forgeOverrides.seed}
+                                                            onChange={(event) =>
+                                                                updateForgeOverride("seed", event.target.value)
+                                                            }
+                                                            placeholder="Seed (-1 for random)"
+                                                            disabled={!sendSeedForCurrentRequest}
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            className="viewer-ghost-button"
+                                                            title="Generate random seed"
+                                                            disabled={!sendSeedForCurrentRequest}
+                                                            onClick={() =>
+                                                                updateForgeOverride(
+                                                                    "seed",
+                                                                    String(Math.floor(Math.random() * 4294967295))
+                                                                )
+                                                            }
+                                                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                                                        >
+                                                            🎲
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div className="viewer-seed-toggle-row">
+                                                    <label className="viewer-toggle-row" style={{ margin: 0 }}>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={sendSeedForCurrentRequest}
+                                                            onChange={(event) =>
+                                                                setSendSeedForCurrentRequest(event.target.checked)
+                                                            }
+                                                        />
+                                                        Send seed with request
+                                                    </label>
+                                                    <div style={{ display: "flex", gap: "4px" }}>
+                                                        <button
+                                                            type="button"
+                                                            className="viewer-ghost-button viewer-seed-action-button"
+                                                            title="Send with random seed (-1)"
+                                                            onClick={() => {
+                                                                setSendSeedForCurrentRequest(true);
+                                                                updateForgeOverride("seed", "-1");
+                                                            }}
+                                                        >
+                                                            🎲 Random (-1)
+                                                        </button>
+                                                        {currentSeed && (
+                                                            <button
+                                                                type="button"
+                                                                className="viewer-ghost-button viewer-seed-action-button"
+                                                                title={`Restore original seed (${currentSeed})`}
+                                                                onClick={() => {
+                                                                    setSendSeedForCurrentRequest(true);
+                                                                    updateForgeOverride("seed", currentSeed);
+                                                                }}
+                                                            >
+                                                                Original
+                                                            </button>
                                                         )}
                                                     </div>
                                                 </div>
-                                            )}
-                                        </div>
-                                        {forgeSelectedLoras.length > 0 && (
-                                            <div className="viewer-tag-chip-list">
-                                                {forgeSelectedLoras.map((lora) => (
-                                                    <button
-                                                        key={lora}
-                                                        className="viewer-tag-chip"
-                                                        onClick={() => removeSelectedLora(lora)}
-                                                        title="Remove LoRA"
-                                                        type="button"
-                                                    >
-                                                        {lora}
-                                                    </button>
-                                                ))}
-                                            </div>
-                                        )}
-                                        <div className="viewer-form-label">LoRA Weight</div>
-                                        <div className="viewer-form-grid">
-                                            <input
-                                                className="viewer-input"
-                                                type="range"
-                                                min={0}
-                                                max={2}
-                                                step={0.05}
-                                                value={loraWeightSliderValue}
-                                                onChange={(event) =>
-                                                    onForgeLoraWeightChange(
-                                                        Number(event.target.value).toFixed(2)
-                                                    )
-                                                }
-                                            />
-                                            <input
-                                                className={`viewer-input ${
-                                                    loraWeightValidationError ? "input-invalid" : ""
-                                                }`}
-                                                value={forgeLoraWeight}
-                                                onChange={(event) =>
-                                                    onForgeLoraWeightChange(event.target.value)
-                                                }
-                                                placeholder="1.00"
-                                                aria-invalid={loraWeightValidationError != null}
-                                            />
-                                        </div>
-                                        {loraWeightValidationError && (
-                                            <div className="input-error" role="alert">
-                                                {loraWeightValidationError}
-                                            </div>
-                                        )}
-                                        <div
-                                            className="viewer-form-label"
-                                            style={{ display: "flex", alignItems: "center", gap: "6px" }}
-                                        >
-                                            <span style={{ flex: 1 }}>Prompt</span>
-                                            <button
-                                                type="button"
-                                                className="sidebar-button"
-                                                onClick={() => void handleSavePromptToLibrary()}
-                                                title="Save the prompt below to the prompt library"
-                                            >
-                                                Save to library
-                                            </button>
-                                            <button
-                                                type="button"
-                                                className="sidebar-button"
-                                                onClick={() => {
-                                                    setPromptLibraryNote(null);
-                                                    setIsPromptLibraryOpen(true);
-                                                }}
-                                                title="Browse the prompt library and apply a prompt"
-                                            >
-                                                Library
-                                            </button>
-                                        </div>
-                                        {promptLibraryNote && (
-                                            <div className="viewer-form-label" role="status">
-                                                {promptLibraryNote}
-                                            </div>
-                                        )}
-                                        <textarea
-                                            className="viewer-textarea"
-                                            value={forgeOverrides.prompt}
-                                            onChange={(event) =>
-                                                updateForgeOverride("prompt", event.target.value)
-                                            }
-                                            placeholder="Prompt"
-                                            rows={4}
-                                        />
-                                        <div className="viewer-form-label">Negative Prompt</div>
-                                        <textarea
-                                            className="viewer-textarea"
-                                            value={forgeOverrides.negative_prompt}
-                                            onChange={(event) =>
-                                                updateForgeOverride(
-                                                    "negative_prompt",
-                                                    event.target.value
-                                                )
-                                            }
-                                            placeholder="Negative prompt"
-                                            rows={3}
-                                        />
-                                        <div
-                                            style={{
-                                                display: "flex",
-                                                alignItems: "center",
-                                                justifyContent: "space-between",
-                                                gap: "8px",
-                                                margin: "6px 0",
-                                            }}
-                                        >
-                                            <label className="viewer-toggle-row" style={{ margin: 0 }}>
-                                                <input
-                                                    type="checkbox"
-                                                    checked={sendSeedForCurrentRequest}
-                                                    onChange={(event) =>
-                                                        setSendSeedForCurrentRequest(event.target.checked)
-                                                    }
-                                                />
-                                                Send seed with request
-                                            </label>
-                                            <div style={{ display: "flex", gap: "4px" }}>
-                                                <button
-                                                    type="button"
-                                                    className="viewer-ghost-button"
-                                                    title="Send with random seed (-1)"
-                                                    onClick={() => {
-                                                        setSendSeedForCurrentRequest(true);
-                                                        updateForgeOverride("seed", "-1");
-                                                    }}
-                                                    style={{ padding: "2px 6px", fontSize: "11px" }}
-                                                >
-                                                    🎲 Random (-1)
-                                                </button>
-                                                {currentSeed && (
-                                                    <button
-                                                        type="button"
-                                                        className="viewer-ghost-button"
-                                                        title={`Restore original seed (${currentSeed})`}
-                                                        onClick={() => {
-                                                            setSendSeedForCurrentRequest(true);
-                                                            updateForgeOverride("seed", currentSeed);
-                                                        }}
-                                                        style={{ padding: "2px 6px", fontSize: "11px" }}
-                                                    >
-                                                        Original
-                                                    </button>
+                                                {(stepsValidationError || cfgScaleValidationError) && (
+                                                    <div className="input-error" role="alert">
+                                                        {stepsValidationError ?? cfgScaleValidationError}
+                                                    </div>
                                                 )}
                                             </div>
-                                        </div>
-                                        <label className="viewer-toggle-row">
-                                            <input
-                                                type="checkbox"
-                                                checked={useAdetailerForCurrentRequest}
-                                                onChange={(event) =>
-                                                    setUseAdetailerForCurrentRequest(
-                                                        event.target.checked
-                                                    )
-                                                }
-                                            />
-                                            Enable ADetailer face fix
-                                        </label>
-                                        <select
-                                            className="viewer-input"
-                                            value={adetailerFaceModelForCurrentRequest}
-                                            onChange={(event) =>
-                                                setAdetailerFaceModelForCurrentRequest(
-                                                    event.target.value
-                                                )
-                                            }
-                                            disabled={!useAdetailerForCurrentRequest}
+                                        </details>
+
+                                        {/* 3. Size section */}
+                                        <details
+                                            open={sizeSectionOpen}
+                                            onToggle={(e) => setSizeSectionOpen(e.currentTarget.open)}
+                                            data-testid="forge-section-size"
+                                            className="viewer-collapsible-section"
                                         >
-                                            {adetailerModelDropdownOptions.map((model) => (
-                                                <option key={model} value={model}>
-                                                    {model}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <div className="viewer-form-label">Resolution Preset Family</div>
-                                        <select
-                                            className="viewer-input"
-                                            value={selectedResolutionFamily}
-                                            onChange={(event) =>
-                                                setSelectedResolutionFamily(
-                                                    event.target.value as ResolutionPresetFamily
-                                                )
-                                            }
-                                        >
-                                            <option value="pony_sdxl">PonyXL / SDXL</option>
-                                            <option value="flux">Flux</option>
-                                            <option value="zimage_turbo">Z-Image Turbo</option>
-                                        </select>
-                                        <div className="sidebar-help">
-                                            Detected family: {detectedModelFamily} | functionality:{" "}
-                                            {detectedFunctionality}
-                                        </div>
-                                        <div className="viewer-form-label">Resolution Presets</div>
-                                        <select
-                                            className="viewer-input"
-                                            value={selectedResolutionPreset}
-                                            onChange={(event) =>
-                                                handleResolutionPresetChange(event.target.value)
-                                            }
-                                        >
-                                            <option value="custom">Custom</option>
-                                            {RESOLUTION_PRESETS[selectedResolutionFamily].map((option) => (
-                                                <option
-                                                    key={`${option.width}x${option.height}`}
-                                                    value={`${option.width}x${option.height}`}
-                                                >
-                                                    {option.label}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <div className="viewer-form-grid">
-                                            <input
-                                                className={`viewer-input ${
-                                                    stepsValidationError ? "input-invalid" : ""
-                                                }`}
-                                                value={forgeOverrides.steps}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("steps", event.target.value)
-                                                }
-                                                placeholder="Steps"
-                                                aria-invalid={stepsValidationError != null}
-                                            />
-                                            <select
-                                                className="viewer-input"
-                                                value={forgeOverrides.sampler_name}
-                                                onChange={(event) =>
-                                                    updateForgeOverride(
-                                                        "sampler_name",
-                                                        event.target.value
-                                                    )
-                                                }
-                                            >
-                                                <option value="">Sampler (auto/default)</option>
-                                                {samplerDropdownOptions.map((sampler) => (
-                                                    <option key={sampler} value={sampler}>
-                                                        {sampler}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                            <select
-                                                className="viewer-input"
-                                                value={forgeOverrides.scheduler}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("scheduler", event.target.value)
-                                                }
-                                            >
-                                                <option value="">Scheduler (auto/default)</option>
-                                                {schedulerDropdownOptions.map((scheduler) => (
-                                                    <option key={scheduler} value={scheduler}>
-                                                        {scheduler}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                            <input
-                                                className={`viewer-input ${
-                                                    cfgScaleValidationError ? "input-invalid" : ""
-                                                }`}
-                                                value={forgeOverrides.cfg_scale}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("cfg_scale", event.target.value)
-                                                }
-                                                placeholder="CFG Scale"
-                                                aria-invalid={cfgScaleValidationError != null}
-                                            />
-                                            <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
-                                                <input
+                                            <summary className="viewer-section-summary">
+                                                <span className="viewer-summary-title">Size</span>
+                                            </summary>
+                                            <div className="viewer-section-content">
+                                                <div className="viewer-form-label">Resolution Preset Family</div>
+                                                <select
                                                     className="viewer-input"
-                                                    style={{ flex: 1 }}
-                                                    value={forgeOverrides.seed}
+                                                    value={selectedResolutionFamily}
                                                     onChange={(event) =>
-                                                        updateForgeOverride("seed", event.target.value)
-                                                    }
-                                                    placeholder="Seed (-1 for random)"
-                                                    disabled={!sendSeedForCurrentRequest}
-                                                />
-                                                <button
-                                                    type="button"
-                                                    className="viewer-ghost-button"
-                                                    title="Generate random seed"
-                                                    disabled={!sendSeedForCurrentRequest}
-                                                    onClick={() =>
-                                                        updateForgeOverride(
-                                                            "seed",
-                                                            String(Math.floor(Math.random() * 4294967295))
+                                                        setSelectedResolutionFamily(
+                                                            event.target.value as ResolutionPresetFamily
                                                         )
                                                     }
-                                                    style={{ padding: "6px 8px", fontSize: "12px" }}
                                                 >
-                                                    🎲
-                                                </button>
-                                            </div>
-                                            <input
-                                                className="viewer-input"
-                                                value={forgeOverrides.width}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("width", event.target.value)
-                                                }
-                                                placeholder="Width"
-                                            />
-                                            <input
-                                                className="viewer-input"
-                                                value={forgeOverrides.height}
-                                                onChange={(event) =>
-                                                    updateForgeOverride("height", event.target.value)
-                                                }
-                                                placeholder="Height"
-                                            />
-                                        </div>
-                                        {(stepsValidationError || cfgScaleValidationError) && (
-                                            <div className="input-error" role="alert">
-                                                {stepsValidationError ?? cfgScaleValidationError}
-                                            </div>
-                                        )}
-                                        <select
-                                            className="viewer-input"
-                                            value={
-                                                familyCompatibleModelOptions.includes(
-                                                    forgeOverrides.model_name
-                                                )
-                                                    ? forgeOverrides.model_name
-                                                    : ""
-                                            }
-                                            onChange={(event) =>
-                                                updateForgeOverride("model_name", event.target.value)
-                                            }
-                                        >
-                                            <option value="">Model checkpoint (none/default)</option>
-                                            {familyCompatibleModelOptions.map((model) => (
-                                                <option key={model} value={model}>
-                                                    {model}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        {forgeOverrides.model_name &&
-                                            !familyCompatibleModelOptions.includes(
-                                                forgeOverrides.model_name
-                                            ) && (
-                                                <div className="photo-viewer-note">
-                                                    Current image model is not in detected checkpoint scan.
+                                                    <option value="pony_sdxl">PonyXL / SDXL</option>
+                                                    <option value="flux">Flux</option>
+                                                    <option value="zimage_turbo">Z-Image Turbo</option>
+                                                    <option value="krea2_turbo">Krea 2 Turbo</option>
+                                                </select>
+                                                <div className="sidebar-help">
+                                                    Detected family: {detectedModelFamily} | functionality:{" "}
+                                                    {detectedFunctionality}
                                                 </div>
-                                            )}
-                                        <div style={{ marginTop: 6 }}>
-                                            <ForgeRequeueButton
-                                                imageId={currentImage?.id}
-                                                baseUrl={forgeBaseUrl}
-                                                apiKey={forgeApiKey}
-                                                outputDir={
-                                                    forgeOutputDir.trim() ? forgeOutputDir : null
-                                                }
-                                                includeSeed={sendSeedForCurrentRequest}
-                                                adetailerEnabled={useAdetailerForCurrentRequest}
-                                                adetailerModel={
-                                                    adetailerFaceModelForCurrentRequest.trim()
-                                                        ? adetailerFaceModelForCurrentRequest
-                                                        : null
-                                                }
-                                                loraTokens={
-                                                    forgeSelectedLoras.length > 0
-                                                        ? forgeSelectedLoras
-                                                        : null
-                                                }
-                                                loraWeight={
-                                                    forgeLoraWeight.trim()
-                                                        ? Number(forgeLoraWeight)
-                                                        : null
-                                                }
-                                                overrides={forgeOverrides}
-                                                disabled={
-                                                    !hasValidForgeUrl ||
-                                                    hasForgeValidationErrors ||
-                                                    isDetailLoading ||
-                                                    !currentDetail
-                                                }
-                                                validate={() => {
-                                                    if (!hasValidForgeUrl) {
-                                                        return (
-                                                            forgeUrlValidationError ??
-                                                            "Forge URL is invalid."
-                                                        );
+                                                <div className="viewer-form-label">Resolution Presets</div>
+                                                <select
+                                                    className="viewer-input"
+                                                    value={selectedResolutionPreset}
+                                                    onChange={(event) =>
+                                                        handleResolutionPresetChange(event.target.value)
                                                     }
-                                                    if (hasForgeValidationErrors) {
-                                                        return "Fix invalid Forge payload fields before sending.";
+                                                >
+                                                    <option value="custom">Custom</option>
+                                                    {RESOLUTION_PRESETS[selectedResolutionFamily].map((option) => (
+                                                        <option
+                                                            key={`${option.width}x${option.height}`}
+                                                            value={`${option.width}x${option.height}`}
+                                                        >
+                                                            {option.label}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                                <div className="viewer-form-label">Dimensions</div>
+                                                <div className="viewer-form-grid">
+                                                    <input
+                                                        className="viewer-input"
+                                                        value={forgeOverrides.width}
+                                                        onChange={(event) =>
+                                                            updateForgeOverride("width", event.target.value)
+                                                        }
+                                                        placeholder="Width"
+                                                    />
+                                                    <input
+                                                        className="viewer-input"
+                                                        value={forgeOverrides.height}
+                                                        onChange={(event) =>
+                                                            updateForgeOverride("height", event.target.value)
+                                                        }
+                                                        placeholder="Height"
+                                                    />
+                                                </div>
+                                            </div>
+                                        </details>
+
+                                        {/* 4. Model & LoRA section */}
+                                        <details
+                                            open={modelLoraSectionOpen}
+                                            onToggle={(e) => setModelLoraSectionOpen(e.currentTarget.open)}
+                                            data-testid="forge-section-model-lora"
+                                            className="viewer-collapsible-section"
+                                        >
+                                            <summary className="viewer-section-summary">
+                                                <span className="viewer-summary-title">Model &amp; LoRA</span>
+                                            </summary>
+                                            <div className="viewer-section-content">
+                                                <div className="viewer-form-label">Model Checkpoint</div>
+                                                <select
+                                                    className="viewer-input"
+                                                    value={
+                                                        familyCompatibleModelOptions.includes(
+                                                            forgeOverrides.model_name
+                                                        )
+                                                            ? forgeOverrides.model_name
+                                                            : ""
                                                     }
-                                                    return null;
-                                                }}
-                                                onQueued={(_queueId, result) => {
-                                                    showViewerToast(result.message, "success");
-                                                    void refreshForgeOptions();
-                                                }}
-                                                onError={(message) =>
-                                                    showViewerToast(message, "error")
-                                                }
-                                                label="Send to Forge"
-                                                className="viewer-action-button primary"
-                                            />
-                                        </div>
+                                                    onChange={(event) =>
+                                                        updateForgeOverride("model_name", event.target.value)
+                                                    }
+                                                >
+                                                    <option value="">Model checkpoint (none/default)</option>
+                                                    {familyCompatibleModelOptions.map((model) => (
+                                                        <option key={model} value={model}>
+                                                            {model}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                                {forgeOverrides.model_name &&
+                                                    !familyCompatibleModelOptions.includes(
+                                                        forgeOverrides.model_name
+                                                    ) && (
+                                                        <div className="photo-viewer-note">
+                                                            Current image model is not in detected checkpoint scan.
+                                                        </div>
+                                                    )}
+                                                <div className="viewer-forge-folders">
+                                                    <div className="viewer-key-value-row">
+                                                        <span>Models folder</span>
+                                                        <strong className="viewer-path" title={forgeModelsPath || undefined}>
+                                                            {forgeModelsPath || "Not set"}
+                                                            {forgeModelsPath && forgeModelsScanSubfolders ? " (+ subfolders)" : ""}
+                                                        </strong>
+                                                    </div>
+                                                    <div className="viewer-key-value-row">
+                                                        <span>LoRA folder</span>
+                                                        <strong className="viewer-path" title={forgeLoraPath || undefined}>
+                                                            {forgeLoraPath || "Not set"}
+                                                            {forgeLoraPath && forgeLoraScanSubfolders ? " (+ subfolders)" : ""}
+                                                        </strong>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        className="viewer-control-button"
+                                                        onClick={onOpenForgeSettings}
+                                                    >
+                                                        Change in Settings…
+                                                    </button>
+                                                </div>
+                                                <div className="viewer-form-label">
+                                                    LoRA Multi-Select
+                                                </div>
+                                                <div className="viewer-multiselect" ref={loraDropdownRef}>
+                                                    <button
+                                                        type="button"
+                                                        className="viewer-control-button viewer-multiselect-trigger"
+                                                        onClick={() =>
+                                                            setIsLoraDropdownOpen((previous) => !previous)
+                                                        }
+                                                    >
+                                                        {forgeSelectedLoras.length > 0
+                                                            ? `${forgeSelectedLoras.length} selected`
+                                                            : "Select LoRAs"}
+                                                    </button>
+                                                    {isLoraDropdownOpen && (
+                                                        <div className="viewer-multiselect-menu">
+                                                            <input
+                                                                className="viewer-input"
+                                                                placeholder="Filter LoRAs..."
+                                                                value={loraSearch}
+                                                                onChange={(event) =>
+                                                                    setLoraSearch(event.target.value)
+                                                                }
+                                                            />
+                                                            <div className="viewer-multiselect-list">
+                                                                {filteredLoraOptions.map((lora) => (
+                                                                    <label
+                                                                        key={lora}
+                                                                        className="viewer-multiselect-option"
+                                                                    >
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={forgeSelectedLoras.includes(
+                                                                                lora
+                                                                            )}
+                                                                            onChange={() =>
+                                                                                toggleLoraSelection(lora)
+                                                                            }
+                                                                        />
+                                                                        <span>{lora}</span>
+                                                                    </label>
+                                                                ))}
+                                                                {filteredLoraOptions.length === 0 && (
+                                                                    <div className="photo-viewer-note">
+                                                                        No LoRAs match filter
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                {forgeSelectedLoras.length > 0 && (
+                                                    <div className="viewer-tag-chip-list">
+                                                        {forgeSelectedLoras.map((lora) => (
+                                                            <button
+                                                                key={lora}
+                                                                className="viewer-tag-chip"
+                                                                onClick={() => removeSelectedLora(lora)}
+                                                                title="Remove LoRA"
+                                                                type="button"
+                                                            >
+                                                                {lora}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                                <div className="viewer-form-label">LoRA Weight</div>
+                                                <div className="viewer-form-grid">
+                                                    <input
+                                                        className="viewer-input"
+                                                        type="range"
+                                                        min={0}
+                                                        max={2}
+                                                        step={0.05}
+                                                        value={loraWeightSliderValue}
+                                                        onChange={(event) =>
+                                                            onForgeLoraWeightChange(
+                                                                Number(event.target.value).toFixed(2)
+                                                            )
+                                                        }
+                                                    />
+                                                    <input
+                                                        className={`viewer-input ${
+                                                            loraWeightValidationError ? "input-invalid" : ""
+                                                        }`}
+                                                        value={forgeLoraWeight}
+                                                        onChange={(event) =>
+                                                            onForgeLoraWeightChange(event.target.value)
+                                                        }
+                                                        placeholder="1.00"
+                                                        aria-invalid={loraWeightValidationError != null}
+                                                    />
+                                                </div>
+                                                {loraWeightValidationError && (
+                                                    <div className="input-error" role="alert">
+                                                        {loraWeightValidationError}
+                                                    </div>
+                                                )}
+                                                <label className="viewer-toggle-row">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={useAdetailerForCurrentRequest}
+                                                        onChange={(event) =>
+                                                            setUseAdetailerForCurrentRequest(
+                                                                event.target.checked
+                                                            )
+                                                        }
+                                                    />
+                                                    Enable ADetailer face fix
+                                                </label>
+                                                <select
+                                                    className="viewer-input"
+                                                    value={adetailerFaceModelForCurrentRequest}
+                                                    onChange={(event) =>
+                                                        setAdetailerFaceModelForCurrentRequest(
+                                                            event.target.value
+                                                        )
+                                                    }
+                                                    disabled={!useAdetailerForCurrentRequest}
+                                                >
+                                                    {adetailerModelDropdownOptions.map((model) => (
+                                                        <option key={model} value={model}>
+                                                            {model}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                        </details>
                                     </section>
-                                </>
+
+                                    {/* Sticky footer with Send to Forge */}
+                                    <div className="viewer-forge-sticky-footer">
+                                        <ForgeRequeueButton
+                                            imageId={currentImage?.id}
+                                            baseUrl={forgeBaseUrl}
+                                            apiKey={forgeApiKey}
+                                            outputDir={
+                                                forgeOutputDir.trim() ? forgeOutputDir : null
+                                            }
+                                            includeSeed={sendSeedForCurrentRequest}
+                                            adetailerEnabled={useAdetailerForCurrentRequest}
+                                            adetailerModel={
+                                                adetailerFaceModelForCurrentRequest.trim()
+                                                    ? adetailerFaceModelForCurrentRequest
+                                                    : null
+                                            }
+                                            loraTokens={
+                                                forgeSelectedLoras.length > 0
+                                                    ? forgeSelectedLoras
+                                                    : null
+                                            }
+                                            loraWeight={
+                                                forgeLoraWeight.trim()
+                                                    ? Number(forgeLoraWeight)
+                                                    : null
+                                            }
+                                            overrides={forgeOverrides}
+                                            disabled={
+                                                !hasValidForgeUrl ||
+                                                hasForgeValidationErrors ||
+                                                isDetailLoading ||
+                                                !currentDetail
+                                            }
+                                            validate={() => {
+                                                if (!hasValidForgeUrl) {
+                                                    return (
+                                                        forgeUrlValidationError ??
+                                                        "Forge URL is invalid."
+                                                    );
+                                                }
+                                                if (hasForgeValidationErrors) {
+                                                    return "Fix invalid Forge payload fields before sending.";
+                                                }
+                                                return null;
+                                            }}
+                                            onQueued={(_queueId, result) => {
+                                                showViewerToast(result.message, "success");
+                                                void refreshForgeOptions();
+                                            }}
+                                            onError={(message) =>
+                                                showViewerToast(message, "error")
+                                            }
+                                            label="Send to Forge"
+                                            className="viewer-action-button primary"
+                                        />
+                                    </div>
+                                </div>
                             )}
 
                             {infoPanelTab === "lineage" && (
@@ -3009,44 +3136,80 @@ export function PhotoViewer({
                                                             {lineageTrace.nodes.slice(1).map((node) => {
                                                                 const opsLabel = formatOpsLabel(node.ops_json);
                                                                 if (node.is_ghost) {
+                                                                    const isExpanded = expandedGhostIds.has(node.id);
+                                                                    const hasSeed = node.seed != null && node.seed !== "";
+                                                                    const hasCfg = node.cfg_scale != null && node.cfg_scale !== "";
+                                                                    const hasSteps = node.steps != null && node.steps !== "";
                                                                     return (
                                                                         <div
                                                                             key={`trace-ghost-${node.id}`}
-                                                                            className="viewer-lineage-row ghost-ancestor-row"
+                                                                            className={`viewer-lineage-row ghost-ancestor-row lineage-ghost-row ${isExpanded ? "expanded" : ""}`}
                                                                             data-testid={`lineage-trace-ghost-${node.id}`}
-                                                                            style={{
-                                                                                padding: "8px 10px",
-                                                                                background: "rgba(245, 158, 11, 0.05)",
-                                                                                borderRadius: "4px",
-                                                                                border: "1px dashed rgba(245, 158, 11, 0.4)",
-                                                                                display: "flex",
-                                                                                flexDirection: "column",
-                                                                                gap: "2px",
-                                                                            }}
                                                                         >
-                                                                            {node.thumbnail_path && (
-                                                                                <img
-                                                                                    src={toAssetSrc(node.thumbnail_path)}
-                                                                                    alt="Culled ancestor thumbnail"
-                                                                                    data-testid={`lineage-trace-ghost-thumb-${node.id}`}
-                                                                                    loading="lazy"
-                                                                                    decoding="async"
-                                                                                    style={{
-                                                                                        width: "64px",
-                                                                                        height: "64px",
-                                                                                        objectFit: "cover",
-                                                                                        borderRadius: "4px",
-                                                                                        opacity: 0.75,
-                                                                                    }}
-                                                                                />
-                                                                            )}
-                                                                            <span style={{ fontSize: "11px", fontWeight: 600, color: "#fbbf24" }}>
-                                                                                👻 {formatGhostRecipeText(node)}
-                                                                            </span>
-                                                                            {opsLabel && (
-                                                                                <span style={{ fontSize: "10px", color: "var(--color-text-muted, #888)" }}>
-                                                                                    Mutations: {opsLabel}
+                                                                            <button
+                                                                                type="button"
+                                                                                className="lineage-ghost-toggle-btn"
+                                                                                data-testid={`lineage-trace-ghost-toggle-${node.id}`}
+                                                                                aria-expanded={isExpanded}
+                                                                                aria-controls={`ghost-details-${node.id}`}
+                                                                                onClick={() => toggleGhostExpanded(node.id)}
+                                                                                onKeyDown={(e) => {
+                                                                                    if (e.key === "Enter" || e.key === " ") {
+                                                                                        e.preventDefault();
+                                                                                        toggleGhostExpanded(node.id);
+                                                                                    }
+                                                                                }}
+                                                                            >
+                                                                                {node.thumbnail_path && (
+                                                                                    <img
+                                                                                        src={toAssetSrc(node.thumbnail_path)}
+                                                                                        alt="Culled ancestor thumbnail"
+                                                                                        data-testid={`lineage-trace-ghost-thumb-${node.id}`}
+                                                                                        loading="lazy"
+                                                                                        decoding="async"
+                                                                                        className="lineage-ghost-thumb"
+                                                                                    />
+                                                                                )}
+                                                                                <span className="viewer-ghost-recipe-title">
+                                                                                    <GhostIcon size={14} /> {formatGhostRecipeText(node)}
                                                                                 </span>
+                                                                                {opsLabel && (
+                                                                                    <span className="viewer-ghost-recipe-mutations">
+                                                                                        Mutations: {opsLabel}
+                                                                                    </span>
+                                                                                )}
+                                                                            </button>
+                                                                            {isExpanded && (
+                                                                                <div
+                                                                                    id={`ghost-details-${node.id}`}
+                                                                                    className="viewer-ghost-expanded-details lineage-ghost-details"
+                                                                                    data-testid={`lineage-trace-ghost-details-${node.id}`}
+                                                                                >
+                                                                                    {opsLabel && (
+                                                                                        <div data-testid="ghost-detail-ops">
+                                                                                            <strong>Ops:</strong> {opsLabel}
+                                                                                        </div>
+                                                                                    )}
+                                                                                    {(node.sampler || node.scheduler || node.model_name) && (
+                                                                                        <div data-testid="ghost-detail-model">
+                                                                                            <strong>Model &amp; Sampler:</strong> {[node.model_name, node.sampler, node.scheduler].filter(Boolean).join(" · ")}
+                                                                                        </div>
+                                                                                    )}
+                                                                                    {(hasSeed || hasCfg || hasSteps) && (
+                                                                                        <div data-testid="ghost-detail-sampling">
+                                                                                            <strong>Sampling:</strong> {[
+                                                                                                hasSeed ? `Seed: ${node.seed}` : null,
+                                                                                                hasCfg ? `CFG: ${node.cfg_scale}` : null,
+                                                                                                hasSteps ? `Steps: ${node.steps}` : null,
+                                                                                            ].filter(Boolean).join(" · ")}
+                                                                                        </div>
+                                                                                    )}
+                                                                                    {node.prompt && (
+                                                                                        <div className="viewer-ghost-prompt" data-testid="ghost-detail-prompt">
+                                                                                            <strong>Prompt:</strong> {node.prompt}
+                                                                                        </div>
+                                                                                    )}
+                                                                                </div>
                                                                             )}
                                                                         </div>
                                                                     );

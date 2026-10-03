@@ -33,11 +33,12 @@ const details = (over: Partial<ImageRecord> = {}): ImageRecord => ({
 let mock: TauriMock;
 let sendResult: (call: number) => unknown;
 
-function setup(winnerDetails: ImageRecord | null, handlers: { fail?: (call: number) => boolean } = {}) {
+function setup(winnerDetails: ImageRecord | null, handlers: { fail?: (call: number) => boolean; onCall?: (call: number) => void } = {}) {
     mock = installTauriMock({
         forge_send_to_image: () => {
             const call = mock.count("forge_send_to_image");
             if (handlers.fail?.(call)) throw new Error("Forge unreachable");
+            handlers.onCall?.(call);
             return sendResult(call);
         },
     });
@@ -108,9 +109,13 @@ describe("MutationPopover sweep", () => {
     it("refuses a CFG delta when the winner has no CFG recorded, and sends nothing", async () => {
         const { onError, onQueued } = setup(details({ cfg_scale: null }));
         tick("checkbox-cfg-plus-1");
-        fireEvent.click(screen.getByTestId("sweep-send-btn"));
-        await waitFor(() => expect(onError).toHaveBeenCalled());
-        expect(onError.mock.calls[0][0]).toMatch(/no CFG/);
+
+        expect(screen.getByText(/no CFG scale recorded/)).toBeTruthy();
+        const sendBtn = screen.getByTestId("sweep-send-btn") as HTMLButtonElement;
+        expect(sendBtn.disabled).toBe(true);
+
+        fireEvent.click(sendBtn);
+        expect(onError).not.toHaveBeenCalled();
         expect(mock.count("forge_send_to_image")).toBe(0);
         expect(onQueued).not.toHaveBeenCalled();
     });
@@ -151,5 +156,128 @@ describe("MutationPopover sweep", () => {
         setup(details({ seed: "-1" }));
         const seed1 = screen.getByTestId("checkbox-seed-1") as HTMLInputElement;
         expect(seed1.disabled).toBe(true);
+    });
+
+    it("clicking Stop after the first variant sends exactly one request and reports 'Stopped after 1 of N'", async () => {
+        let resolveFirst: () => void = () => {};
+        const firstCallPromise = new Promise<void>((r) => {
+            resolveFirst = r;
+        });
+
+        const onQueued = vi.fn();
+        const onError = vi.fn();
+        const onClose = vi.fn();
+
+        mock = installTauriMock({
+            forge_send_to_image: async () => {
+                const call = mock.count("forge_send_to_image");
+                if (call === 1) {
+                    await firstCallPromise;
+                }
+                return sendResult(call);
+            },
+        });
+
+        render(
+            <MutationPopover
+                winner={winner}
+                winnerDetails={details()}
+                baseUrl="http://127.0.0.1:7860"
+                apiKey={null}
+                onClose={onClose}
+                onQueued={onQueued}
+                onError={onError}
+            />
+        );
+
+        tick("checkbox-seed-1");
+        tick("checkbox-seed-2");
+        fireEvent.click(screen.getByTestId("sweep-send-btn"));
+
+        const stopBtn = await screen.findByTestId("sweep-stop-btn");
+        fireEvent.click(stopBtn);
+        resolveFirst();
+
+        await waitFor(() => expect(screen.getByText(/Stopped after 1 of 2/)).toBeTruthy());
+        expect(mock.count("forge_send_to_image")).toBe(1);
+        expect(onQueued).toHaveBeenCalledWith([expect.objectContaining({ ok: true })]);
+        expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("Esc during a send behaves the same", async () => {
+        let resolveFirst: () => void = () => {};
+        const firstCallPromise = new Promise<void>((r) => {
+            resolveFirst = r;
+        });
+
+        const onQueued = vi.fn();
+        const onError = vi.fn();
+        const onClose = vi.fn();
+
+        mock = installTauriMock({
+            forge_send_to_image: async () => {
+                const call = mock.count("forge_send_to_image");
+                if (call === 1) {
+                    await firstCallPromise;
+                }
+                return sendResult(call);
+            },
+        });
+
+        render(
+            <MutationPopover
+                winner={winner}
+                winnerDetails={details()}
+                baseUrl="http://127.0.0.1:7860"
+                apiKey={null}
+                onClose={onClose}
+                onQueued={onQueued}
+                onError={onError}
+            />
+        );
+
+        tick("checkbox-seed-1");
+        tick("checkbox-seed-2");
+        fireEvent.click(screen.getByTestId("sweep-send-btn"));
+
+        await screen.findByTestId("sweep-stop-btn");
+        const dialog = screen.getByRole("dialog");
+        fireEvent.keyDown(dialog, { key: "Escape" });
+        resolveFirst();
+
+        await waitFor(() => expect(screen.getByText(/Stopped after 1 of 2/)).toBeTruthy());
+        expect(mock.count("forge_send_to_image")).toBe(1);
+        expect(onQueued).toHaveBeenCalledWith([expect.objectContaining({ ok: true })]);
+        expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("Esc when idle closes immediately", () => {
+        const { onClose } = setup(details());
+        fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("for seed+1,+2 and CFG +1 the table shows rows 101/6.5 and 102/6.5", () => {
+        setup(details()); // base seed 100, CFG 5.5
+        tick("checkbox-seed-1");
+        tick("checkbox-seed-2");
+        tick("checkbox-cfg-plus-1");
+
+        const row1 = screen.getByTestId("sweep-preview-row-1");
+        const row2 = screen.getByTestId("sweep-preview-row-2");
+
+        expect(row1.textContent).toContain("101");
+        expect(row1.textContent).toContain("6.5");
+        expect(row2.textContent).toContain("102");
+        expect(row2.textContent).toContain("6.5");
+    });
+
+    it("a winner with no CFG and a CFG delta shows the error row and disables Send", () => {
+        setup(details({ cfg_scale: null }));
+        tick("checkbox-cfg-plus-1");
+
+        expect(screen.getByText(/no CFG scale recorded/)).toBeTruthy();
+        const sendBtn = screen.getByTestId("sweep-send-btn") as HTMLButtonElement;
+        expect(sendBtn.disabled).toBe(true);
     });
 });

@@ -80,7 +80,7 @@ export function HelpOverlay({ onClose }: HelpOverlayProps) {
               <tr key={s.keys} style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
                 <td style={{ padding: "6px 8px", fontFamily: "monospace", whiteSpace: "nowrap", fontWeight: 600 }}>{s.keys}</td>
                 <td style={{ padding: "6px 8px", opacity: 0.85 }}>{s.desc}</td>
-                <td style={{ padding: "6px 8px", opacity: 0.5, fontSize: 11 }}>{s.group}</td>
+                <td style={{ padding: "6px 8px", opacity: 0.5, fontSize: 12 }}>{s.group}</td>
               </tr>
             ))}
           </tbody>

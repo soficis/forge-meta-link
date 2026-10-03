@@ -20,6 +20,8 @@ import {
     formatBytes,
 } from "../utils/imageClipboard";
 import type { ShowToastOptions } from "../hooks/useToast";
+import { PinIcon } from "./icons";
+import { useCompareLabStore } from "../store/compareLabStore";
 
 interface GalleryProps {
     images: GalleryImageRecord[];
@@ -44,6 +46,7 @@ interface GalleryProps {
         message: string;
         action?: { label: string; onClick: () => void };
     };
+    onPin?: (image: GalleryImageRecord) => void;
 }
 
 const LINEAGE_LRU_LIMIT = 180;
@@ -134,7 +137,11 @@ export function Gallery({
     storageProfile,
     onShowToast,
     emptyState,
+    onPin,
 }: GalleryProps) {
+    const comparePins = useCompareLabStore((s) => s.pins);
+    const isCompareFull = comparePins.length >= 4;
+    const pinnedIds = useMemo(() => new Set(comparePins.map((p) => p.id)), [comparePins]);
     const parentRef = useRef<HTMLDivElement>(null);
     const thumbnailCacheRef = useRef<Map<string, string>>(new Map());
     const thumbnailInFlightRef = useRef<Set<string>>(new Set());
@@ -918,6 +925,9 @@ export function Gallery({
                                             }
                                             onHoverEnter={handleItemHoverEnter}
                                             onHoverLeave={handleItemHoverLeave}
+                                            onPin={onPin ? () => onPin(image) : undefined}
+                                            isCompareFull={isCompareFull}
+                                            isPinned={pinnedIds.has(image.id)}
                                         />
                                     );
                                 })
@@ -982,6 +992,9 @@ interface GalleryItemProps {
     onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
     onHoverEnter: (image: GalleryImageRecord, anchorEl: HTMLElement) => void;
     onHoverLeave: () => void;
+    onPin?: () => void;
+    isCompareFull?: boolean;
+    isPinned?: boolean;
 }
 
 const GalleryItem = memo(function GalleryItem({
@@ -999,6 +1012,9 @@ const GalleryItem = memo(function GalleryItem({
     onContextMenu,
     onHoverEnter,
     onHoverLeave,
+    onPin,
+    isCompareFull,
+    isPinned,
 }: GalleryItemProps) {
     const [thumbLoaded, setThumbLoaded] = useState(false);
     const [fullLoaded, setFullLoaded] = useState(false);
@@ -1068,6 +1084,38 @@ const GalleryItem = memo(function GalleryItem({
                     aria-label={`Select ${image.filename}`}
                 />
             </label>
+            {onPin && (
+                <div
+                    className="gallery-item-pin-wrap"
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        if (!isPinned && isCompareFull) {
+                            onPin();
+                        }
+                    }}
+                >
+                    <button
+                        type="button"
+                        className={`gallery-item-pin-btn ${isPinned ? "is-pinned" : ""}`}
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onPin();
+                        }}
+                        disabled={!isPinned && isCompareFull}
+                        aria-pressed={isPinned ? "true" : "false"}
+                        aria-label={isPinned ? "Unpin from Compare Lab" : "Pin to Compare Lab"}
+                        title={
+                            isPinned
+                                ? "Unpin from Compare Lab"
+                                : isCompareFull
+                                ? "Compare Lab full (4 max)"
+                                : "Pin to Compare Lab (keys 1-4)"
+                        }
+                    >
+                        <PinIcon size={12} />
+                    </button>
+                </div>
+            )}
             {(image.is_favorite || image.is_locked) && (
                 <div className="gallery-item-badges" aria-hidden="true">
                     {image.is_favorite && (

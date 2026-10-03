@@ -3,6 +3,7 @@ import type { DeleteHistoryEntry, TagCount, TagProvenance } from "../types/metad
 import { getTagProvenance } from "../services/commands";
 import type { ScanProgress, ScanComplete } from "../services/commands";
 import { usePersistedState } from "../hooks/usePersistedState";
+import { BookmarkIcon, GearIcon } from "./icons";
 
 interface SidebarProps {
     isCollapsed: boolean;
@@ -455,7 +456,7 @@ export function Sidebar({
                     title="Prompt library"
                     aria-label="Prompt library"
                 >
-                    <span aria-hidden="true">✎</span>
+                    <BookmarkIcon />
                     {!isCollapsed && <span>Prompt library</span>}
                 </button>
                 <button
@@ -465,7 +466,7 @@ export function Sidebar({
                     title="Settings"
                     aria-label="Settings"
                 >
-                    <span aria-hidden="true">⚙</span>
+                    <GearIcon />
                     {!isCollapsed && <span>Settings</span>}
                 </button>
             </div>

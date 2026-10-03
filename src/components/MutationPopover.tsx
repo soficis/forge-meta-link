@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import type { GalleryImageRecord, ImageRecord, ForgeSendResult } from "../types/metadata";
 import {
     applyOps,
@@ -13,6 +13,9 @@ import {
 } from "../utils/mutations";
 import { forgeSendToImage } from "../services/commands";
 import type { GenerationParams } from "../utils/forgePayload";
+import { Modal } from "./Modal";
+import { BoltIcon, WarningIcon } from "./icons";
+import "./MutationPopover.css";
 
 export interface MutationPopoverProps {
     winner: GalleryImageRecord;
@@ -45,9 +48,13 @@ export function MutationPopover({
     const [selectedScheduler, setSelectedScheduler] = useState<string>("");
 
     const [isSending, setIsSending] = useState(false);
-    const [sendProgress, setSendProgress] = useState<string | null>(null);
+    const [sendProgressIndex, setSendProgressIndex] = useState(0);
     const [showConfirm, setShowConfirm] = useState(false);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
+    const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+    const stopRequested = useRef(false);
+    const shouldCloseAfterStop = useRef(false);
 
     const isRandomSeed = useMemo(() => {
         const s = winnerDetails?.seed ?? winner.seed;
@@ -81,6 +88,59 @@ export function MutationPopover({
     const sweepCount = combinations.length;
     const needsConfirm = isConfirmRequired(sweepCount);
 
+    const baseParams = useMemo<GenerationParams>(() => {
+        const isDetailsProvided = winnerDetails !== undefined;
+        return {
+            prompt: winnerDetails?.prompt ?? "",
+            negative_prompt: winnerDetails?.negative_prompt ?? "",
+            steps: isDetailsProvided ? (winnerDetails?.steps ?? null) : "20",
+            sampler: isDetailsProvided ? (winnerDetails?.sampler ?? null) : null,
+            schedule_type: null,
+            cfg_scale: isDetailsProvided ? (winnerDetails?.cfg_scale ?? null) : "7.0",
+            seed: winnerDetails?.seed ?? winner.seed ?? null,
+            width: winnerDetails?.width ?? winner.width ?? null,
+            height: winnerDetails?.height ?? winner.height ?? null,
+            model_hash: winnerDetails?.model_hash ?? null,
+            model_name: winnerDetails?.model_name ?? winner.model_name ?? null,
+            generation_type: null,
+            extra_params: {},
+            raw_metadata: winnerDetails?.raw_metadata ?? "",
+        };
+    }, [winner, winnerDetails]);
+
+    const previewRows = useMemo(() => {
+        return combinations.map((ops, idx) => {
+            try {
+                const mutated = applyOps(baseParams, ops);
+                const overrides = changedOverrides(baseParams, mutated);
+                return {
+                    index: idx + 1,
+                    seed: overrides.seed ?? "—",
+                    cfg: overrides.cfg_scale ?? "—",
+                    steps: overrides.steps ?? "—",
+                    sampler: overrides.sampler_name ?? "—",
+                    scheduler: overrides.scheduler ?? "—",
+                    error: null,
+                };
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                return {
+                    index: idx + 1,
+                    seed: "—",
+                    cfg: "—",
+                    steps: "—",
+                    sampler: "—",
+                    scheduler: "—",
+                    error: msg,
+                };
+            }
+        });
+    }, [combinations, baseParams]);
+
+    const previewError = useMemo(() => {
+        return previewRows.find((r) => r.error !== null)?.error ?? null;
+    }, [previewRows]);
+
     const toggleSeedStep = (step: number) => {
         setSelectedSeedSteps((prev) =>
             prev.includes(step) ? prev.filter((s) => s !== step) : [...prev, step].sort((a, b) => a - b)
@@ -99,46 +159,28 @@ export function MutationPopover({
         );
     };
 
-    const handleSendClick = () => {
-        if (sweepCount === 0) return;
-        if (needsConfirm) {
-            setShowConfirm(true);
-        } else {
-            executeSweep();
-        }
-    };
-
     const executeSweep = useCallback(async () => {
         setShowConfirm(false);
         setIsSending(true);
         setErrorMessage(null);
-
-        // Base params hold only what the winner's record actually carries. Nothing is defaulted:
-        // an operator that needs a missing value fails loudly instead of sweeping from a guess.
-        // The scheduler is not on the UI record; the backend reads it from the stored image
-        // unless a swap overrides it.
-        const baseParams: GenerationParams = {
-            prompt: winnerDetails?.prompt ?? "",
-            negative_prompt: winnerDetails?.negative_prompt ?? "",
-            steps: winnerDetails?.steps ?? null,
-            sampler: winnerDetails?.sampler ?? null,
-            schedule_type: null,
-            cfg_scale: winnerDetails?.cfg_scale ?? null,
-            seed: winnerDetails?.seed ?? winner.seed ?? null,
-            width: winnerDetails?.width ?? winner.width ?? null,
-            height: winnerDetails?.height ?? winner.height ?? null,
-            model_hash: winnerDetails?.model_hash ?? null,
-            model_name: winnerDetails?.model_name ?? winner.model_name ?? null,
-            generation_type: null,
-            extra_params: {},
-            raw_metadata: winnerDetails?.raw_metadata ?? "",
-        };
+        setStatusMessage(null);
+        stopRequested.current = false;
+        shouldCloseAfterStop.current = false;
+        setSendProgressIndex(0);
 
         const results: ForgeSendResult[] = [];
+        let isUserStop = false;
+
         try {
             for (let i = 0; i < combinations.length; i++) {
+                if (stopRequested.current) {
+                    isUserStop = true;
+                    break;
+                }
+
                 const ops = combinations[i];
-                setSendProgress(`Generating variant ${i + 1}/${combinations.length}...`);
+                setSendProgressIndex(i + 1);
+
                 const mutated = applyOps(baseParams, ops);
                 const overrides = changedOverrides(baseParams, mutated);
 
@@ -157,8 +199,21 @@ export function MutationPopover({
                 );
                 results.push(res);
             }
-            onQueued?.(results);
-            onClose();
+
+            if (isUserStop || stopRequested.current) {
+                const k = results.length;
+                const msg = `Stopped after ${k} of ${combinations.length} (those ${k} are already in your library)`;
+                setStatusMessage(msg);
+                if (results.length > 0) {
+                    onQueued?.(results);
+                }
+                if (shouldCloseAfterStop.current) {
+                    onClose();
+                }
+            } else {
+                onQueued?.(results);
+                onClose();
+            }
         } catch (err: unknown) {
             const reason = err instanceof Error ? err.message : String(err);
             const msg =
@@ -169,257 +224,344 @@ export function MutationPopover({
             onError?.(msg);
         } finally {
             setIsSending(false);
-            setSendProgress(null);
+            setSendProgressIndex(0);
         }
-    }, [combinations, winner, winnerDetails, baseUrl, apiKey, outputDir, includeSeed, onQueued, onError, onClose]);
+    }, [combinations, baseParams, winner, baseUrl, apiKey, outputDir, includeSeed, onQueued, onError, onClose]);
+
+    const handleSendClick = () => {
+        if (sweepCount === 0) return;
+        if (previewError) {
+            return;
+        }
+        if (needsConfirm) {
+            setShowConfirm(true);
+        } else {
+            void executeSweep();
+        }
+    };
+
+    const handleStop = () => {
+        stopRequested.current = true;
+    };
+
+    const handleClose = () => {
+        if (isSending) {
+            stopRequested.current = true;
+            shouldCloseAfterStop.current = true;
+        } else {
+            onClose();
+        }
+    };
 
     return (
-        <div className="settings-backdrop" data-testid="mutation-popover-backdrop">
-            <div
-                className="confirm-dialog-content mutation-popover-modal"
-                data-testid="mutation-popover"
-                role="dialog"
-                aria-modal="true"
-                aria-label="Mutation Sweep"
-                style={{ maxWidth: "540px", width: "95%" }}
-            >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-                    <h3 style={{ margin: 0, fontSize: "16px", color: "var(--color-text-main, #e0e0e0)" }}>
-                        👑 Mutate Winner: <span style={{ color: "var(--color-accent, #6366f1)" }}>{winner.filename}</span>
-                    </h3>
-                    <button
-                        type="button"
-                        onClick={onClose}
-                        disabled={isSending}
-                        style={{ background: "none", border: "none", color: "var(--color-text-muted, #888)", cursor: "pointer", fontSize: "18px" }}
-                        aria-label="Close"
-                    >
-                        ✕
-                    </button>
+        <Modal
+            label="Mutation Sweep"
+            className="confirm-dialog-content mutation-popover-modal"
+            backdropTestId="mutation-popover-backdrop"
+            panelTestId="mutation-popover"
+            onClose={handleClose}
+            closeOnEscape={false}
+            closeOnBackdrop={!isSending}
+            onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleClose();
+                }
+            }}
+        >
+            <div className="mutation-header">
+                <h3 className="mutation-title">
+                    <BoltIcon /> Mutate Winner: <span className="mutation-title-winner">{winner.filename}</span>
+                </h3>
+                <button
+                    type="button"
+                    onClick={handleClose}
+                    className="mutation-close-btn"
+                    aria-label="Close"
+                >
+                    ✕
+                </button>
+            </div>
+
+            {errorMessage && (
+                <div className="mutation-error-banner" data-testid="sweep-error-message">
+                    {errorMessage}
                 </div>
+            )}
 
-                {errorMessage && (
-                    <div style={{ padding: "8px 12px", background: "rgba(239, 68, 68, 0.15)", border: "1px solid #ef4444", borderRadius: "4px", color: "#fca5a5", fontSize: "12px", marginBottom: "12px" }}>
-                        {errorMessage}
-                    </div>
-                )}
-
-                {/* Operator 1: Seed Step */}
-                <div style={{ marginBottom: "14px", padding: "10px", background: "rgba(255, 255, 255, 0.03)", borderRadius: "6px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                        <span style={{ fontSize: "13px", fontWeight: 600 }}>Seed Step (+1..+4)</span>
-                        {isRandomSeed && (
-                            <span style={{ fontSize: "11px", color: "#f59e0b" }}>Random seed (-1) — disabled</span>
-                        )}
-                    </div>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                        {[1, 2, 3, 4].map((step) => (
-                            <label
-                                key={`seed-${step}`}
-                                style={{
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: "4px",
-                                    fontSize: "12px",
-                                    cursor: isRandomSeed ? "not-allowed" : "pointer",
-                                    opacity: isRandomSeed ? 0.4 : 1,
-                                }}
-                            >
-                                <input
-                                    type="checkbox"
-                                    checked={selectedSeedSteps.includes(step)}
-                                    onChange={() => toggleSeedStep(step)}
-                                    disabled={isRandomSeed || isSending}
-                                    data-testid={`checkbox-seed-${step}`}
-                                />
-                                +{step}
-                            </label>
-                        ))}
-                    </div>
-                </div>
-
-                {/* Operator 2: CFG Delta */}
-                <div style={{ marginBottom: "14px", padding: "10px", background: "rgba(255, 255, 255, 0.03)", borderRadius: "6px" }}>
-                    <span style={{ display: "block", fontSize: "13px", fontWeight: 600, marginBottom: "6px" }}>
-                        CFG Delta
-                    </span>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                        {[-1.0, 1.0].map((delta) => (
-                            <label
-                                key={`cfg-${delta}`}
-                                style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", cursor: "pointer" }}
-                            >
-                                <input
-                                    type="checkbox"
-                                    checked={selectedCfgDeltas.includes(delta)}
-                                    onChange={() => toggleCfgDelta(delta)}
-                                    disabled={isSending}
-                                    data-testid={`checkbox-cfg-${delta > 0 ? "plus" : "minus"}-${Math.abs(delta)}`}
-                                />
-                                {delta > 0 ? `+${delta}` : delta}
-                            </label>
-                        ))}
-                    </div>
-                </div>
-
-                {/* Operator 3: Steps Delta */}
-                <div style={{ marginBottom: "14px", padding: "10px", background: "rgba(255, 255, 255, 0.03)", borderRadius: "6px" }}>
-                    <span style={{ display: "block", fontSize: "13px", fontWeight: 600, marginBottom: "6px" }}>
-                        Steps Delta
-                    </span>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                        {[-5, 5].map((delta) => (
-                            <label
-                                key={`steps-${delta}`}
-                                style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", cursor: "pointer" }}
-                            >
-                                <input
-                                    type="checkbox"
-                                    checked={selectedStepsDeltas.includes(delta)}
-                                    onChange={() => toggleStepsDelta(delta)}
-                                    disabled={isSending}
-                                    data-testid={`checkbox-steps-${delta > 0 ? "plus" : "minus"}-${Math.abs(delta)}`}
-                                />
-                                {delta > 0 ? `+${delta}` : delta}
-                            </label>
-                        ))}
-                    </div>
-                </div>
-
-                {/* Operator 4: Sampler / Scheduler Swap */}
-                <div style={{ marginBottom: "14px", padding: "10px", background: "rgba(255, 255, 255, 0.03)", borderRadius: "6px" }}>
-                    <span style={{ display: "block", fontSize: "13px", fontWeight: 600, marginBottom: "6px" }}>
-                        Sampler / Scheduler Swap
-                    </span>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                        <div>
-                            <label style={{ fontSize: "11px", color: "var(--color-text-muted, #aaa)", display: "block", marginBottom: "2px" }}>
-                                Sampler
-                            </label>
-                            <select
-                                value={selectedSampler}
-                                onChange={(e) => setSelectedSampler(e.target.value)}
-                                disabled={isSending}
-                                style={{ width: "100%", padding: "4px 8px", background: "var(--color-bg-secondary, #222)", color: "#fff", border: "1px solid #444", borderRadius: "4px", fontSize: "12px" }}
-                                data-testid="select-sampler-swap"
-                            >
-                                <option value="">(No swap)</option>
-                                {COMMON_SAMPLERS.map((s) => (
-                                    <option key={s} value={s}>
-                                        {s}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-                        <div>
-                            <label style={{ fontSize: "11px", color: "var(--color-text-muted, #aaa)", display: "block", marginBottom: "2px" }}>
-                                Scheduler
-                            </label>
-                            <select
-                                value={selectedScheduler}
-                                onChange={(e) => setSelectedScheduler(e.target.value)}
-                                disabled={isSending}
-                                style={{ width: "100%", padding: "4px 8px", background: "var(--color-bg-secondary, #222)", color: "#fff", border: "1px solid #444", borderRadius: "4px", fontSize: "12px" }}
-                                data-testid="select-scheduler-swap"
-                            >
-                                <option value="">(No swap)</option>
-                                {ACCEPTED_SCHEDULERS.map((s) => (
-                                    <option key={s} value={s}>
-                                        {s}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Preview count & Combinatorics info */}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: "rgba(99, 102, 241, 0.08)", border: "1px solid rgba(99, 102, 241, 0.2)", borderRadius: "6px", marginBottom: "16px" }}>
-                    <div>
-                        <span style={{ fontSize: "12px", fontWeight: 600 }}>Sweep Combinations: </span>
-                        <span style={{ fontSize: "13px", fontWeight: "bold", color: "var(--color-accent, #6366f1)" }} data-testid="sweep-count-badge">
-                            {sweepCount} variant{sweepCount === 1 ? "" : "s"}
-                        </span>
-                        {rawCount > SWEEP_HARD_CAP && (
-                            <span style={{ fontSize: "11px", color: "#f59e0b", marginLeft: "6px" }}>
-                                (capped at {SWEEP_HARD_CAP})
-                            </span>
-                        )}
-                    </div>
-                    {needsConfirm && (
-                        <span style={{ fontSize: "11px", color: "#f59e0b" }}>⚠️ Confirmation required (&gt;8)</span>
+            {/* Operator 1: Seed Step */}
+            <div className="mutation-section">
+                <div className="mutation-section-header">
+                    <span className="mutation-section-title">Seed Step (+1..+4)</span>
+                    {isRandomSeed && (
+                        <span className="mutation-section-warning">Random seed (-1) — disabled</span>
                     )}
                 </div>
+                <div className="mutation-options-row">
+                    {[1, 2, 3, 4].map((step) => (
+                        <label
+                            key={`seed-${step}`}
+                            className={`mutation-option-label ${isRandomSeed ? "disabled" : ""}`}
+                        >
+                            <input
+                                type="checkbox"
+                                checked={selectedSeedSteps.includes(step)}
+                                onChange={() => toggleSeedStep(step)}
+                                disabled={isRandomSeed || isSending}
+                                data-testid={`checkbox-seed-${step}`}
+                            />
+                            <span>+{step}</span>
+                        </label>
+                    ))}
+                </div>
+            </div>
 
-                {/* Confirm Dialog Overlay if size > 8 */}
-                {showConfirm && (
-                    <div
-                        style={{ padding: "12px", background: "rgba(245, 158, 11, 0.1)", border: "1px solid #f59e0b", borderRadius: "6px", marginBottom: "16px" }}
-                        data-testid="sweep-confirm-dialog"
-                    >
-                        <h4 style={{ margin: "0 0 6px 0", fontSize: "13px", color: "#fbbf24" }}>
-                            Confirm Mutation Sweep
-                        </h4>
-                        <p style={{ margin: "0 0 10px 0", fontSize: "12px" }}>
-                            Generate {sweepCount} variants? This will send {sweepCount} requests to Forge Neo in sequence.
-                        </p>
-                        <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
-                            <button
-                                type="button"
-                                onClick={() => setShowConfirm(false)}
-                                style={{ padding: "4px 10px", fontSize: "12px", background: "#333", color: "#fff", border: "none", borderRadius: "4px", cursor: "pointer" }}
-                                data-testid="sweep-confirm-cancel-btn"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                type="button"
-                                onClick={executeSweep}
-                                style={{ padding: "4px 10px", fontSize: "12px", background: "#f59e0b", color: "#000", fontWeight: 600, border: "none", borderRadius: "4px", cursor: "pointer" }}
-                                data-testid="sweep-confirm-proceed-btn"
-                            >
-                                Confirm &amp; Send
-                            </button>
-                        </div>
+            {/* Operator 2: CFG Delta */}
+            <div className="mutation-section">
+                <div className="mutation-section-header">
+                    <span className="mutation-section-title">CFG Delta (±0.5, ±1.0)</span>
+                </div>
+                <div className="mutation-options-row">
+                    {[
+                        { label: "-1.0", value: -1.0, id: "minus-1" },
+                        { label: "-0.5", value: -0.5, id: "minus-0-5" },
+                        { label: "+0.5", value: 0.5, id: "plus-0-5" },
+                        { label: "+1.0", value: 1.0, id: "plus-1" },
+                    ].map(({ label, value, id }) => (
+                        <label key={`cfg-${id}`} className="mutation-option-label">
+                            <input
+                                type="checkbox"
+                                checked={selectedCfgDeltas.includes(value)}
+                                onChange={() => toggleCfgDelta(value)}
+                                disabled={isSending}
+                                data-testid={`checkbox-cfg-${id}`}
+                            />
+                            <span>{label}</span>
+                        </label>
+                    ))}
+                </div>
+            </div>
+
+            {/* Operator 3: Steps Delta */}
+            <div className="mutation-section">
+                <div className="mutation-section-header">
+                    <span className="mutation-section-title">Steps Delta (±5, ±10)</span>
+                </div>
+                <div className="mutation-options-row">
+                    {[
+                        { label: "-10", value: -10, id: "minus-10" },
+                        { label: "-5", value: -5, id: "minus-5" },
+                        { label: "+5", value: 5, id: "plus-5" },
+                        { label: "+10", value: 10, id: "plus-10" },
+                    ].map(({ label, value, id }) => (
+                        <label key={`steps-${id}`} className="mutation-option-label">
+                            <input
+                                type="checkbox"
+                                checked={selectedStepsDeltas.includes(value)}
+                                onChange={() => toggleStepsDelta(value)}
+                                disabled={isSending}
+                                data-testid={`checkbox-steps-${id}`}
+                            />
+                            <span>{label}</span>
+                        </label>
+                    ))}
+                </div>
+            </div>
+
+            {/* Operator 4: Sampler / Scheduler Swap */}
+            <div className="mutation-section">
+                <div className="mutation-section-header">
+                    <span className="mutation-section-title">Sampler &amp; Scheduler Swap (1-pair)</span>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                    <div>
+                        <select
+                            value={selectedSampler}
+                            onChange={(e) => setSelectedSampler(e.target.value)}
+                            disabled={isSending}
+                            className="mutation-select"
+                            data-testid="select-sampler-swap"
+                        >
+                            <option value="">Keep current sampler</option>
+                            {COMMON_SAMPLERS.map((s) => (
+                                <option key={s} value={s}>
+                                    {s}
+                                </option>
+                            ))}
+                        </select>
                     </div>
-                )}
+                    <div>
+                        <select
+                            value={selectedScheduler}
+                            onChange={(e) => setSelectedScheduler(e.target.value)}
+                            disabled={isSending}
+                            className="mutation-select"
+                            data-testid="select-scheduler-swap"
+                        >
+                            <option value="">Keep current scheduler</option>
+                            {ACCEPTED_SCHEDULERS.map((sched) => (
+                                <option key={sched} value={sched}>
+                                    {sched}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+                </div>
+            </div>
 
-                {/* Footer Actions */}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontSize: "12px", color: "var(--color-text-muted, #888)" }}>
-                        {sendProgress ?? ""}
+            {/* Sweep Summary */}
+            <div className="mutation-summary-row">
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span
+                        className="settings-badge"
+                        style={{
+                            backgroundColor: sweepCount > 0 ? "var(--bg-selected)" : "var(--bg-tertiary)",
+                            color: sweepCount > 0 ? "var(--text-accent)" : "var(--text-secondary)",
+                            padding: "3px 8px",
+                            borderRadius: "var(--radius-sm)",
+                            fontSize: "12px",
+                            fontWeight: 600,
+                        }}
+                        data-testid="sweep-count-badge"
+                    >
+                        {sweepCount} variant{sweepCount === 1 ? "" : "s"}
                     </span>
-                    <div style={{ display: "flex", gap: "8px" }}>
+                    {rawCount > SWEEP_HARD_CAP && (
+                        <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                            (capped at {SWEEP_HARD_CAP})
+                        </span>
+                    )}
+                </div>
+                {needsConfirm && (
+                    <span className="mutation-section-warning" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                        <WarningIcon /> Confirmation required (&gt;8)
+                    </span>
+                )}
+            </div>
+
+            {/* Preview Table */}
+            {combinations.length > 0 && (
+                <div className="mutation-preview-table-container">
+                    <table className="mutation-preview-table" data-testid="sweep-preview-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Seed</th>
+                                <th>CFG</th>
+                                <th>Steps</th>
+                                <th>Sampler</th>
+                                <th>Scheduler</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {previewRows.map((row) => (
+                                <tr key={row.index} data-testid={`sweep-preview-row-${row.index}`}>
+                                    <td>{row.index}</td>
+                                    {row.error ? (
+                                        <td colSpan={5} className="mutation-preview-error">
+                                            {row.error}
+                                        </td>
+                                    ) : (
+                                        <>
+                                            <td>{row.seed}</td>
+                                            <td>{row.cfg}</td>
+                                            <td>{row.steps}</td>
+                                            <td>{row.sampler}</td>
+                                            <td>{row.scheduler}</td>
+                                        </>
+                                    )}
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+
+            {/* Confirm Dialog Overlay if size > 8 */}
+            {showConfirm && (
+                <div className="mutation-confirm-box" data-testid="sweep-confirm-dialog">
+                    <div className="mutation-confirm-header">
+                        <WarningIcon />
+                        <h4 style={{ margin: 0 }}>Generate {sweepCount} variants?</h4>
+                    </div>
+                    <p className="mutation-confirm-desc">
+                        You are about to queue {sweepCount} variants. Forge may take significant time to process all requests.
+                    </p>
+                    <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
                         <button
                             type="button"
-                            onClick={onClose}
-                            disabled={isSending}
-                            style={{ padding: "6px 14px", background: "transparent", color: "var(--color-text-main, #e0e0e0)", border: "1px solid #444", borderRadius: "4px", cursor: "pointer", fontSize: "12px" }}
+                            className="sidebar-button"
+                            onClick={() => setShowConfirm(false)}
+                            data-testid="sweep-confirm-cancel-btn"
                         >
                             Cancel
                         </button>
                         <button
                             type="button"
-                            onClick={handleSendClick}
-                            disabled={sweepCount === 0 || isSending}
-                            style={{
-                                padding: "6px 16px",
-                                background: sweepCount === 0 || isSending ? "#444" : "var(--color-accent, #6366f1)",
-                                color: "#fff",
-                                fontWeight: 600,
-                                border: "none",
-                                borderRadius: "4px",
-                                cursor: sweepCount === 0 || isSending ? "not-allowed" : "pointer",
-                                fontSize: "12px",
-                            }}
-                            data-testid="sweep-send-btn"
+                            className="sidebar-button primary"
+                            onClick={() => void executeSweep()}
+                            data-testid="sweep-confirm-proceed-btn"
                         >
-                            {isSending ? "Sending..." : `Send Sweep (${sweepCount})`}
+                            Proceed with {sweepCount}
                         </button>
                     </div>
                 </div>
+            )}
+
+            {/* Footer Actions */}
+            <div className="mutation-footer">
+                <div className="mutation-progress-wrap">
+                    {isSending && (
+                        <>
+                            <progress
+                                value={sendProgressIndex}
+                                max={combinations.length}
+                                aria-valuenow={sendProgressIndex}
+                                aria-valuemax={combinations.length}
+                                className="mutation-progress-bar"
+                                data-testid="sweep-progress-bar"
+                            />
+                            <span>{`Generating variant ${sendProgressIndex}/${combinations.length}...`}</span>
+                        </>
+                    )}
+                    {!isSending && statusMessage && (
+                        <span data-testid="sweep-status-message">{statusMessage}</span>
+                    )}
+                </div>
+                <div className="mutation-actions">
+                    {isSending ? (
+                        <button
+                            type="button"
+                            onClick={handleStop}
+                            className="sidebar-button danger"
+                            data-testid="sweep-stop-btn"
+                        >
+                            Stop
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={onClose}
+                            className="sidebar-button"
+                            data-testid="sweep-cancel-btn"
+                        >
+                            Cancel
+                        </button>
+                    )}
+                    <button
+                        type="button"
+                        onClick={handleSendClick}
+                        disabled={sweepCount === 0 || isSending || previewError !== null}
+                        className="sidebar-button primary"
+                        data-testid="sweep-send-btn"
+                        title={previewError ?? undefined}
+                    >
+                        {isSending ? "Sending..." : `Send Sweep (${sweepCount})`}
+                    </button>
+                </div>
             </div>
-        </div>
+        </Modal>
     );
 }
 

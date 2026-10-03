@@ -23,6 +23,7 @@ import { useForgeSettings } from "../hooks/useForgeSettings";
 import type { GalleryImageRecord, ImageRecord } from "../types/metadata";
 import { getImageDetail, getLineageCursor, getSeedWalk } from "../services/commands";
 import type { LineageCursor } from "../types/metadata";
+import { BoltIcon, CrownIcon, TrophyIcon } from "./icons";
 import "./CompareLab.css";
 
 function toAssetSrc(filepath: string): string {
@@ -80,7 +81,7 @@ function SortablePinCard({ image, isWinner, onPickWinner, onRemove }: SortablePi
                     onClick={() => onPickWinner(image.id)}
                     data-testid={`pin-winner-${image.id}`}
                 >
-                    {isWinner ? "🏆 Winner" : "👑 Win"}
+                    {isWinner ? <><TrophyIcon /> Winner</> : <><CrownIcon /> Win</>}
                 </button>
                 <button
                     type="button"
@@ -483,7 +484,7 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
                             data-testid="mutate-winner-btn"
                             title={`Mutate winner: ${winner.filename}`}
                         >
-                            ⚡ Mutate Winner
+                            <BoltIcon /> Mutate Winner
                         </button>
                     )}
                     <button
@@ -568,7 +569,7 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
 
             {/* Lineage / SeedWalk badges (API-01 integration) */}
             {ready && (
-                <div className="compare-lab-lineage" data-testid="compare-lineage" style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <div className="compare-lab-lineage" data-testid="compare-lineage">
                     {pins.map((p) => {
                         const cur = lineage.get(p.id);
                         const walk = seedWalk.get(p.id);
@@ -576,10 +577,9 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
                         return (
                             <span
                                 key={`lin-${p.id}`}
-                                className="tag-chip include"
+                                className="tag-chip include compare-lineage-badge"
                                 title={`${p.filename} lineage`}
                                 data-testid={`lineage-badge-${p.id}`}
-                                style={{ fontSize: "9px" }}
                             >
                                 {cur ? `${cur.ancestors.length}↑ ${cur.children.length}↓` : "—"} {walk ? `• seed ${walk.length}` : ""}
                             </span>

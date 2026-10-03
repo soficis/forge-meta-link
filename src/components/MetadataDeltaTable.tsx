@@ -5,6 +5,7 @@ import {
     computeDelta,
     type CompareMetadata,
 } from "../utils/metadata";
+import { CrownIcon } from "./icons";
 
 export interface MetadataDeltaTableProps {
     pins: GalleryImageRecord[];
@@ -76,12 +77,11 @@ export function MetadataDeltaTable({
                                     <span className="metadata-delta-pin-label">{m.filename}</span>
                                     {m.id === winnerId ? (
                                         <div style={{ display: "flex", gap: "4px", alignItems: "center", marginTop: "2px" }}>
-                                            <span style={{ fontSize: "10px", color: "#fbbf24", fontWeight: "bold" }}>👑 Winner</span>
+                                            <span className="metadata-delta-winner-badge"><CrownIcon size={12} /> Winner</span>
                                             {onMutateWinner && (
                                                 <button
                                                     type="button"
-                                                    className="compare-lab-btn mutate-btn"
-                                                    style={{ fontSize: "10px", padding: "1px 6px" }}
+                                                    className="compare-lab-btn mutate-btn metadata-delta-action-btn"
                                                     data-testid={`mutate-col-${m.id}`}
                                                     onClick={() => onMutateWinner(m.id)}
                                                 >
@@ -93,8 +93,7 @@ export function MetadataDeltaTable({
                                         onPickWinner && (
                                             <button
                                                 type="button"
-                                                className="compare-lab-btn pick-winner-btn"
-                                                style={{ fontSize: "10px", padding: "1px 6px", marginTop: "2px" }}
+                                                className="compare-lab-btn pick-winner-btn metadata-delta-action-btn"
                                                 data-testid={`pick-winner-col-${m.id}`}
                                                 onClick={() => onPickWinner(m.id)}
                                             >
