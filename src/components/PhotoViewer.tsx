@@ -21,6 +21,8 @@ import {
     setLineageOverride,
 } from "../services/commands";
 import { PromptLibraryDialog } from "./PromptLibraryDialog";
+import { useRunOncePerActivation } from "../hooks/useRunOncePerActivation";
+import { shouldPopulateForgeOverrides } from "../utils/forgeOverridesGuard";
 import { REJECTED_SCHEDULERS } from "../utils/mutations";
 import {
     copyJpegImageToClipboard,
@@ -768,7 +770,13 @@ export function PhotoViewer({
         if (!currentImage || !currentDetail) {
             return;
         }
-        if (forgeOverridesImageIdRef.current === currentImage.id) {
+        if (
+            !shouldPopulateForgeOverrides({
+                imageId: currentImage.id,
+                detailId: currentDetail.id,
+                populatedForId: forgeOverridesImageIdRef.current,
+            })
+        ) {
             return;
         }
         setForgeOverrides(createForgeOverrides(currentImage, currentDetail));
@@ -826,11 +834,14 @@ export function PhotoViewer({
         void refreshForgeOptions();
     }, [refreshForgeOptions]);
 
-    useEffect(() => {
-        if (infoPanelTab === "forge" && (forgeOptionsWarning != null || forgeModelOptions.length === 0)) {
+    // Retry once when the Forge tab is opened if the last load failed or came back empty. This used
+    // to re-run on every warning/model change, and refreshForgeOptions itself changes both, so the
+    // panel refetched in a loop and flickered while Forge was unreachable or returned warnings.
+    useRunOncePerActivation(infoPanelTab === "forge", () => {
+        if (forgeOptionsWarning != null || forgeModelOptions.length === 0) {
             void refreshForgeOptions();
         }
-    }, [infoPanelTab, forgeOptionsWarning, forgeModelOptions.length, refreshForgeOptions]);
+    });
 
     useEffect(() => {
         if (!forgeModelOptions.length) {
