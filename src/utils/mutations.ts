@@ -76,6 +76,9 @@ export function applyOps(
                     throw new Error("Cannot apply seed step to random seed (-1)");
                 }
                 const stepped = seedBigInt + BigInt(op.value);
+                if (stepped > 9223372036854775807n) {
+                    throw new Error("Seed step overflows the 64-bit seed range");
+                }
                 next.seed = stepped.toString();
                 break;
             }

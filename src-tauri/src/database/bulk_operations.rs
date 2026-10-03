@@ -5,10 +5,12 @@ impl Database {
 
     /// Fetches all stored file mtimes in a single query for fast lookup.
     /// Returns a HashMap<filepath, mtime> enabling O(1) changed-file detection.
+    /// Culled (tombstoned) rows are excluded so a file restored from the OS trash
+    /// with an unchanged mtime is re-processed and resurrected instead of skipped.
     pub fn get_all_file_mtimes(&self) -> SqlResult<HashMap<String, i64>> {
         let conn = self.pool.get().map_err(pool_error)?;
         let mut stmt =
-            conn.prepare("SELECT filepath, file_mtime FROM images WHERE file_mtime IS NOT NULL")?;
+            conn.prepare("SELECT filepath, file_mtime FROM images WHERE file_mtime IS NOT NULL AND culled_at IS NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;

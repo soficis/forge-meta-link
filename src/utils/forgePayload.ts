@@ -43,10 +43,12 @@ function parseF32(value: string | null | undefined): number | undefined {
     return Number.isFinite(n) ? n : undefined;
 }
 
+// JS numbers are exact only up to 2^53-1. A larger seed would be sent silently altered,
+// so it is rejected here; the production requeue path (Rust) carries seeds as exact i64 strings.
 function parseI64(value: string | null | undefined): number | undefined {
     if (!value) return undefined;
     const n = Number(value.trim());
-    return Number.isFinite(n) && Number.isInteger(n) ? n : undefined;
+    return Number.isSafeInteger(n) ? n : undefined;
 }
 
 function extractLoraTokens(prompt: string): Array<{ name: string; weight: string }> {

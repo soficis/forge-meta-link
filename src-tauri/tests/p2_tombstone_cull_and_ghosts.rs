@@ -207,3 +207,24 @@ fn test_p2_rescan_upsert_resurrects_trash_culled_image() {
     let rec = db.get_image_by_id(id).unwrap().expect("record exists");
     assert_eq!(rec.prompt, "vintage astronaut painting restored");
 }
+
+#[test]
+fn test_p2_scan_mtime_map_excludes_culled_rows_so_restored_file_is_reprocessed() {
+    let db = test_db();
+    let p = GenerationParams {
+        prompt: "restored from recycle bin".to_string(),
+        raw_metadata: "restored from recycle bin".to_string(),
+        ..Default::default()
+    };
+    let live = db.upsert_image("/gallery/live.png", "live.png", "/gallery", &p, Some(1000)).unwrap();
+    let culled = db.upsert_image("/gallery/culled.png", "culled.png", "/gallery", &p, Some(2000)).unwrap();
+    assert_ne!(live, culled);
+
+    db.cull_images(&[culled], CullMode::Trash).unwrap();
+
+    // The scanner skips files whose mtime matches this map. A culled row must not be in it,
+    // otherwise an OS-trash restore (mtime preserved) is never re-ingested.
+    let map = db.get_all_file_mtimes().unwrap();
+    assert!(map.contains_key("/gallery/live.png"));
+    assert!(!map.contains_key("/gallery/culled.png"), "culled row must not mask a restored file");
+}

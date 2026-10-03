@@ -43,6 +43,11 @@ describe("mutations pure module", () => {
             expect(res.seed).toBe("9007199254740999");
         });
 
+        it("rejects a seed step that overflows the 64-bit seed range", () => {
+            const params = { ...baseParams, seed: "9223372036854775806" };
+            expect(() => applyOps(params, [{ kind: "seed_step", value: 2 }])).toThrow(/64-bit/);
+        });
+
         it("disallows seed_step on random seed (-1)", () => {
             const params = { ...baseParams, seed: "-1" };
             expect(() => applyOps(params, [{ kind: "seed_step", value: 1 }])).toThrow(
