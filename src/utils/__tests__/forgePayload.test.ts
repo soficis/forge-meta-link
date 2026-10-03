@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildForgePayload, type GenerationParams } from "../forgePayload";
+import { buildForgePayload, buildRequeuePayload, type GenerationParams } from "../forgePayload";
 
 const base: GenerationParams = {
     prompt: "p", negative_prompt: "", steps: "20", sampler: "Euler", schedule_type: "karras",
@@ -17,5 +17,12 @@ describe("buildForgePayload seed handling", () => {
     });
     it("forces batch_size 1", () => {
         expect(buildForgePayload(base).batch_size).toBe(1);
+    });
+    it("keeps LoRA tags in the prompt and never sends a LoRA always-on script (Forge answers 422)", () => {
+        const params = { ...base, prompt: "a cat <lora:style_a:0.7>" };
+        for (const payload of [buildForgePayload(params), buildRequeuePayload(params)]) {
+            expect(payload.prompt).toContain("<lora:style_a:0.7>");
+            expect(payload.alwayson_scripts).toBeUndefined();
+        }
     });
 });

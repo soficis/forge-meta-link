@@ -51,64 +51,6 @@ function parseI64(value: string | null | undefined): number | undefined {
     return Number.isSafeInteger(n) ? n : undefined;
 }
 
-function extractLoraTokens(prompt: string): Array<{ name: string; weight: string }> {
-    const tokens: Array<{ name: string; weight: string }> = [];
-    const lower = prompt.toLowerCase();
-    let cursor = 0;
-    while (true) {
-        const found = lower.indexOf("<lora:", cursor);
-        if (found === -1) break;
-        const start = found + "<lora:".length;
-        const end = prompt.indexOf(">", start);
-        const sliceEnd = end === -1 ? prompt.length : end;
-        const inner = prompt.slice(start, sliceEnd);
-        const colon = inner.indexOf(":");
-        let name: string;
-        let weight: string;
-        if (colon !== -1) {
-            name = inner.slice(0, colon).trim();
-            weight = inner.slice(colon + 1).trim();
-        } else {
-            name = inner.trim();
-            weight = "1.0";
-        }
-        if (name && !tokens.some((t) => t.name === name)) {
-            const w = Number(weight);
-            tokens.push({ name, weight: Number.isFinite(w) ? String(w) : "1.0" });
-        }
-        cursor = sliceEnd + 1;
-        if (cursor >= prompt.length) break;
-    }
-    return tokens;
-}
-
-function buildLoraAlwaysOn(params: GenerationParams): Record<string, unknown> | undefined {
-    const entries: Array<Record<string, unknown>> = [];
-    for (const tok of extractLoraTokens(params.prompt)) {
-        entries.push({ name: tok.name, weight: Number(tok.weight) });
-    }
-    for (const [key, val] of Object.entries(params.extra_params ?? {})) {
-        if (key.toLowerCase().includes("lora")) {
-            const name = val.split(":")[0]?.trim().replace(/^"|"$/g, "") ?? "";
-            if (name && !entries.some((e) => e["name"] === name)) {
-                entries.push({ name, weight: 1.0 });
-            }
-        }
-    }
-    if (entries.length === 0) return undefined;
-    return { LoRA: { args: entries } };
-}
-
-function mergeAlwaysOn(
-    a: Record<string, unknown> | undefined,
-    b: Record<string, unknown> | undefined
-): Record<string, unknown> | undefined {
-    if (!a && !b) return undefined;
-    if (a && !b) return a;
-    if (!a && b) return b;
-    return { ...(a as object), ...(b as object) };
-}
-
 export function buildForgePayload(
     params: GenerationParams,
     options?: {
@@ -126,7 +68,8 @@ export function buildForgePayload(
         ? { sd_model_checkpoint: modelCheckpoint }
         : undefined;
 
-    const loraScripts = buildLoraAlwaysOn(params);
+    // LoRAs are applied by Forge from the <lora:name:weight> tags in the prompt. A "LoRA"
+    // always-on script does not exist and makes Forge answer HTTP 422.
     const adetailerScripts: Record<string, unknown> | undefined = options?.adetailerEnabled
         ? {
               ADetailer: {
@@ -138,7 +81,7 @@ export function buildForgePayload(
               },
           }
         : undefined;
-    const alwaysonScripts = mergeAlwaysOn(loraScripts, adetailerScripts);
+    const alwaysonScripts = adetailerScripts;
 
     return {
         prompt: params.prompt,
@@ -187,10 +130,6 @@ export function buildRequeuePayload(
         override_settings: Object.keys(overrides).length > 0 ? overrides : undefined,
     };
 
-    if (!next.alwayson_scripts) {
-        const lora = buildLoraAlwaysOn(params);
-        if (lora) next.alwayson_scripts = lora;
-    }
 
     return next;
 }

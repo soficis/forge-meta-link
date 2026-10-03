@@ -587,22 +587,20 @@ fn lineage_e2e_chain_compare_requeue_loop() {
         let expected_sched = params.schedule_type.as_deref().unwrap();
         let expected_cfg = params.cfg_scale.as_deref().unwrap().parse::<f64>().unwrap();
         let expected_seed = params.seed.as_deref().unwrap().parse::<i64>().unwrap();
-        // LoRA via alwayson_scripts
-        let alwayson = payload
-            .alwayson_scripts
-            .as_ref()
-            .expect("LoRA alwayson_scripts locked");
-        let lora = alwayson.get("LoRA").expect("LoRA key");
-        let args = lora
-            .get("args")
-            .and_then(|v| v.as_array())
-            .expect("LoRA args array");
+        // LoRA travels as `<lora:..>` prompt tags; a "LoRA" always-on script gets HTTP 422 from Forge.
         let prompt_loras = lora_names(&params.prompt);
+        assert!(
+            payload
+                .alwayson_scripts
+                .as_ref()
+                .map_or(true, |a| a.get("LoRA").is_none()),
+            "{} must not send a LoRA always-on script",
+            label
+        );
         for l in &prompt_loras {
             assert!(
-                args.iter()
-                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(l.as_str())),
-                "{} lora {} must be in alwayson",
+                payload.prompt.contains(&format!("<lora:{}", l)),
+                "{} lora {} must stay in the prompt",
                 label,
                 l
             );

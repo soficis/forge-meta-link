@@ -199,6 +199,19 @@ pub struct ForgePayloadBuildInput<'a> {
     pub adetailer_face_model: Option<&'a str>,
 }
 
+/// Scheduler to send when re-generating a stored image: an explicit override wins, otherwise
+/// the `Schedule type` recorded in the image's own metadata block. `ImageRecord` has no
+/// scheduler column, so without this the scheduler was silently dropped (upstream issue #15521,
+/// reproduced in-app).
+pub fn resolve_scheduler(override_scheduler: Option<&str>, raw_metadata: &str) -> Option<String> {
+    if let Some(explicit) = parse_optional_text(override_scheduler) {
+        return Some(explicit);
+    }
+    crate::parser::parse_generation_metadata(raw_metadata)
+        .schedule_type
+        .and_then(|s| parse_optional_text(Some(&s)))
+}
+
 pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> ForgePayload {
     let ForgePayloadBuildInput {
         prompt,
@@ -279,10 +292,10 @@ pub fn build_payload_from_generation_params(
         .as_deref()
         .map(|name| json!({ "sd_model_checkpoint": name }));
 
-    let lora_scripts = build_lora_alwayson_from_generation_params(params);
-    let adetailer_scripts =
+    // LoRAs are applied by Forge from the `<lora:name:weight>` tags already in the prompt.
+    // There is no "LoRA" always-on script: sending one gets HTTP 422 "Script 'LoRA' not found".
+    let alwayson_scripts =
         build_adetailer_alwayson_scripts(adetailer_face_enabled, adetailer_face_model);
-    let alwayson_scripts = merge_alwayson_scripts(lora_scripts, adetailer_scripts);
 
     ForgePayload {
         prompt: params.prompt.clone(),
@@ -361,11 +374,6 @@ pub fn build_requeue_payload(params: &GenerationParams, include_seed: bool) -> F
         payload.override_settings = Some(serde_json::Value::Object(overrides));
     }
 
-    if payload.alwayson_scripts.is_none() {
-        if let Some(lora) = build_lora_alwayson_from_generation_params(params) {
-            payload.alwayson_scripts = Some(lora);
-        }
-    }
     payload
 }
 
@@ -403,96 +411,6 @@ pub async fn forge_requeue_image(
         }
     }
     Ok(result)
-}
-
-fn extract_lora_tokens(prompt: &str) -> Vec<(String, String)> {
-    let mut tokens = Vec::new();
-    let lower = prompt.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    while let Some(found) = lower[cursor..].find("<lora:") {
-        let start = cursor + found + "<lora:".len();
-        let rest = &prompt[start..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        let inner = &rest[..end];
-        let (name, weight) = if let Some((n, w)) = inner.split_once(':') {
-            (
-                n.trim().to_string(),
-                w.trim().trim_end_matches('>').to_string(),
-            )
-        } else {
-            (inner.trim().to_string(), "1.0".to_string())
-        };
-        if !name.is_empty() {
-            let w = if weight.parse::<f32>().is_ok() {
-                weight
-            } else {
-                "1.0".to_string()
-            };
-            if !tokens.iter().any(|(n, _)| n == &name) {
-                tokens.push((name, w));
-            }
-        }
-        cursor = start + end + 1;
-        if cursor >= prompt.len() {
-            break;
-        }
-    }
-    tokens
-}
-
-fn build_lora_alwayson_from_generation_params(
-    params: &GenerationParams,
-) -> Option<serde_json::Value> {
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for (name, weight) in extract_lora_tokens(&params.prompt) {
-        let w: f32 = weight.parse().unwrap_or(1.0);
-        entries.push(json!({ "name": name, "weight": w }));
-    }
-    for (key, val) in &params.extra_params {
-        let kl = key.to_ascii_lowercase();
-        if kl.contains("lora") {
-            let name = val
-                .split(':')
-                .next()
-                .unwrap_or(val)
-                .trim()
-                .trim_matches('"')
-                .to_string();
-            if !name.is_empty()
-                && !entries
-                    .iter()
-                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(&name))
-            {
-                entries.push(json!({ "name": name, "weight": 1.0 }));
-            }
-        }
-    }
-    if entries.is_empty() {
-        return None;
-    }
-    Some(json!({
-        "LoRA": {
-            "args": entries
-        }
-    }))
-}
-
-fn merge_alwayson_scripts(
-    a: Option<serde_json::Value>,
-    b: Option<serde_json::Value>,
-) -> Option<serde_json::Value> {
-    match (a, b) {
-        (None, None) => None,
-        (Some(v), None) | (None, Some(v)) => Some(v),
-        (Some(mut av), Some(bv)) => {
-            if let (Some(am), Some(bm)) = (av.as_object_mut(), bv.as_object()) {
-                for (k, v) in bm {
-                    am.insert(k.clone(), v.clone());
-                }
-            }
-            Some(av)
-        }
-    }
 }
 
 fn parse_u32(value: Option<&str>) -> Option<u32> {
@@ -704,7 +622,7 @@ fn build_client(
 mod tests {
     use super::{
         build_payload_from_generation_params, build_requeue_payload, build_sdapi_endpoint,
-        normalize_base_url, validate_base_url,
+        normalize_base_url, resolve_scheduler, validate_base_url,
     };
     use crate::parser::GenerationParams;
     use std::collections::HashMap;
@@ -812,18 +730,18 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("pony_v6.safetensors")
         );
-        let alwayson = payload
-            .alwayson_scripts
-            .expect("alwayson_scripts LoRA required");
-        assert!(alwayson.get("LoRA").is_some(), "LoRA via alwayson_scripts");
-        let lora_args = alwayson
-            .get("LoRA")
-            .and_then(|v| v.get("args"))
-            .and_then(|v| v.as_array())
-            .expect("LoRA args array");
-        assert!(lora_args
-            .iter()
-            .any(|e| e.get("name").and_then(|v| v.as_str()) == Some("my_lora")));
+        // LoRA is carried by the prompt tag; a "LoRA" always-on script makes Forge answer 422.
+        assert!(
+            payload.prompt.contains("<lora:my_lora"),
+            "LoRA tag must stay in the prompt"
+        );
+        assert!(
+            payload
+                .alwayson_scripts
+                .as_ref()
+                .map_or(true, |a| a.get("LoRA").is_none()),
+            "must not send a LoRA always-on script"
+        );
     }
 
     #[test]
@@ -863,10 +781,38 @@ mod tests {
         assert_eq!(payload.cfg_scale, Some(7.5));
         assert_eq!(payload.seed, Some(12345));
 
-        let alwayson = payload
-            .alwayson_scripts
-            .expect("LoRA locked via alwayson_scripts");
-        assert!(alwayson.get("LoRA").is_some());
+        assert!(
+            payload
+                .alwayson_scripts
+                .as_ref()
+                .map_or(true, |a| a.get("LoRA").is_none()),
+            "must not send a LoRA always-on script"
+        );
+    }
+
+    #[test]
+    fn resolve_scheduler_prefers_override_then_stored_metadata() {
+        let raw = "a cat
+Negative prompt: x
+Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 1, Size: 512x512";
+        assert_eq!(resolve_scheduler(Some("exponential"), raw).as_deref(), Some("exponential"));
+        assert_eq!(resolve_scheduler(None, raw).as_deref(), Some("Karras"));
+        assert_eq!(resolve_scheduler(Some("  "), raw).as_deref(), Some("Karras"));
+        assert_eq!(resolve_scheduler(None, "a cat
+Steps: 20, Sampler: Euler"), None);
+    }
+
+    #[test]
+    fn payload_never_sends_lora_always_on_script_even_for_lora_prompts() {
+        let mut params = sample_params();
+        params.prompt = "a cat <lora:style_a:0.7> <lora:style_b:1.0>".to_string();
+        for payload in [
+            build_requeue_payload(&params, true),
+            build_payload_from_generation_params(&params, true, false, None),
+        ] {
+            assert!(payload.prompt.contains("<lora:style_a:0.7>"));
+            assert!(payload.alwayson_scripts.is_none(), "Forge answers 422 to a LoRA script");
+        }
     }
 
     #[test]
@@ -919,8 +865,8 @@ mod tests {
             "payload has override_settings model"
         );
         assert!(
-            serialized.contains("LoRA"),
-            "payload has LoRA via alwayson_scripts"
+            serialized.contains("<lora:") && !serialized.contains("alwayson_scripts"),
+            "LoRA travels as a prompt tag, not an always-on script"
         );
 
         let result = tauri::async_runtime::block_on(async {
@@ -942,8 +888,8 @@ mod tests {
             body
         );
         assert!(
-            body.contains("LoRA"),
-            "mock received LoRA alwayson: {}",
+            body.contains("<lora:") && !body.contains("alwayson_scripts"),
+            "mock received LoRA as prompt tag only: {}",
             body
         );
         let res = result.expect("send_to_forge should succeed via mock");

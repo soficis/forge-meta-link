@@ -802,8 +802,9 @@ fn build_payload_for_image(
     let negative_prompt = override_negative_prompt.unwrap_or(image.negative_prompt.as_str());
     let steps = override_steps.or(image.steps.as_deref());
     let sampler = override_sampler.or(image.sampler.as_deref());
-    // Note: ImageRecord does not store a separate scheduler column in DB; scheduler is populated from overrides if present.
-    let scheduler = override_scheduler;
+    // ImageRecord has no scheduler column: fall back to the Schedule type in the stored metadata.
+    let resolved_scheduler = forge_api::resolve_scheduler(override_scheduler, &image.raw_metadata);
+    let scheduler = resolved_scheduler.as_deref();
     let cfg_scale = override_cfg_scale.or(image.cfg_scale.as_deref());
     let seed = override_seed.or(image.seed.as_deref());
     let model_name = override_model.or(image.model_name.as_deref());
@@ -1446,12 +1447,13 @@ pub async fn forge_requeue_image(
         .get_image_by_id(image_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Image not found: {}", image_id))?;
+    let stored = crate::parser::parse_generation_metadata(&image.raw_metadata);
     let params = crate::parser::GenerationParams {
         prompt: image.prompt.clone(),
         negative_prompt: image.negative_prompt.clone(),
         steps: image.steps.clone(),
         sampler: image.sampler.clone(),
-        schedule_type: None,
+        schedule_type: forge_api::resolve_scheduler(None, &image.raw_metadata),
         cfg_scale: image.cfg_scale.clone(),
         seed: image.seed.clone(),
         width: image.width,
@@ -1459,7 +1461,7 @@ pub async fn forge_requeue_image(
         model_hash: image.model_hash.clone(),
         model_name: image.model_name.clone(),
         generation_type: None,
-        extra_params: std::collections::HashMap::new(),
+        extra_params: stored.extra_params,
         raw_metadata: image.raw_metadata.clone(),
     };
     let api_result = forge_api::forge_requeue_image(
