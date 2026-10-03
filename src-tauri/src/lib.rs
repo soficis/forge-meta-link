@@ -21,6 +21,8 @@ use commands::{
     precache_all_thumbnails, save_sidecar_tags, scan_directory, search_images_cursor,
     set_forge_api_key, set_image_favorite, set_image_locked, set_images_favorite,
     set_images_locked, set_lineage_override, set_storage_profile,
+    delete_prompt, export_prompt_library, import_prompt_library, list_prompt_tags, list_prompts,
+    save_prompt, update_prompt, use_prompt,
 };
 use database::Database;
 use serde::{Deserialize, Serialize};
@@ -219,6 +221,14 @@ pub fn run() {
             get_tag_provenance,
             infer_lineage,
             set_lineage_override,
+            save_prompt,
+            list_prompts,
+            list_prompt_tags,
+            update_prompt,
+            delete_prompt,
+            use_prompt,
+            export_prompt_library,
+            import_prompt_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

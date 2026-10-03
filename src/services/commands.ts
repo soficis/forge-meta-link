@@ -27,6 +27,10 @@ import type {
     LineageTrace,
     LineageTraceNode,
     TagProvenance,
+    PromptEntry,
+    SavePromptResult,
+    ImportPromptsResult,
+    PromptTagCount,
 } from "../types/metadata";
 
 // ── Directory Scanning ──────────────────────────────────────────────────
@@ -535,4 +539,74 @@ export async function saveSidecarTags(
     notes: string | null
 ): Promise<void> {
     return invoke<void>("save_sidecar_tags", { filepath, tags, notes });
+}
+
+// ── Prompt library (N2) ─────────────────────────────────────────────────
+
+export interface SavePromptInput {
+    title?: string;
+    prompt: string;
+    negativePrompt?: string;
+    tags?: string;
+    notes?: string;
+    sourceImageId?: number;
+}
+
+export async function savePrompt(input: SavePromptInput): Promise<SavePromptResult> {
+    return invoke<SavePromptResult>("save_prompt", {
+        title: input.title ?? null,
+        prompt: input.prompt,
+        negativePrompt: input.negativePrompt ?? null,
+        tags: input.tags ?? null,
+        notes: input.notes ?? null,
+        sourceImageId: input.sourceImageId ?? null,
+    });
+}
+
+export async function listPrompts(
+    query?: string,
+    tag?: string,
+    limit = 200,
+    offset = 0
+): Promise<PromptEntry[]> {
+    return invoke<PromptEntry[]>("list_prompts", {
+        query: query?.trim() ? query : null,
+        tag: tag ?? null,
+        limit,
+        offset,
+    });
+}
+
+export async function listPromptTags(): Promise<PromptTagCount[]> {
+    return invoke<PromptTagCount[]>("list_prompt_tags");
+}
+
+export async function updatePrompt(
+    id: number,
+    fields: Omit<SavePromptInput, "sourceImageId">
+): Promise<PromptEntry> {
+    return invoke<PromptEntry>("update_prompt", {
+        id,
+        title: fields.title ?? null,
+        prompt: fields.prompt,
+        negativePrompt: fields.negativePrompt ?? null,
+        tags: fields.tags ?? null,
+        notes: fields.notes ?? null,
+    });
+}
+
+export async function deletePrompt(id: number): Promise<boolean> {
+    return invoke<boolean>("delete_prompt", { id });
+}
+
+export async function markPromptUsed(id: number): Promise<void> {
+    return invoke<void>("use_prompt", { id });
+}
+
+export async function exportPromptLibrary(outputPath: string): Promise<number> {
+    return invoke<number>("export_prompt_library", { outputPath });
+}
+
+export async function importPromptLibrary(inputPath: string): Promise<ImportPromptsResult> {
+    return invoke<ImportPromptsResult>("import_prompt_library", { inputPath });
 }

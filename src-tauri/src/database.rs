@@ -312,6 +312,53 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_lineage_edges_parent ON lineage_edges(parent_id);",
         )?;
 
+        // ── Migration: prompt_library_v1 (N2 prompt library) ──
+        let prompt_library_migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'prompt_library_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !prompt_library_migrated {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS prompt_library (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    negative_prompt TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    source_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    use_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_prompt_library_updated ON prompt_library(updated_at DESC);
+                 CREATE VIRTUAL TABLE IF NOT EXISTS prompt_library_fts USING fts5(
+                    title, prompt, negative_prompt, tags, notes,
+                    content='prompt_library', content_rowid='id', tokenize='porter unicode61'
+                 );
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_ai AFTER INSERT ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES (new.id, new.title, new.prompt, new.negative_prompt, new.tags, new.notes);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_ad AFTER DELETE ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(prompt_library_fts, rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES ('delete', old.id, old.title, old.prompt, old.negative_prompt, old.tags, old.notes);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS prompt_library_au
+                    AFTER UPDATE OF title, prompt, negative_prompt, tags, notes ON prompt_library BEGIN
+                    INSERT INTO prompt_library_fts(prompt_library_fts, rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES ('delete', old.id, old.title, old.prompt, old.negative_prompt, old.tags, old.notes);
+                    INSERT INTO prompt_library_fts(rowid, title, prompt, negative_prompt, tags, notes)
+                    VALUES (new.id, new.title, new.prompt, new.negative_prompt, new.tags, new.notes);
+                 END;
+                 INSERT OR IGNORE INTO app_migrations (name) VALUES ('prompt_library_v1');
+                 COMMIT;",
+            )?;
+        }
+
         // ── Migration: scope FTS update triggers to text columns ──
         let fts_migrated: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM app_migrations WHERE name = 'fts_triggers_scoped_v1')",
@@ -617,10 +664,14 @@ impl Database {
 mod bulk_operations;
 mod cursor_queries;
 mod lineage;
+mod prompt_library;
 mod read_queries;
 mod timeline;
 
 pub use lineage::{LineageCursor, LineageEdge, LineageTrace, LineageTraceNode, TagProvenance};
+pub use prompt_library::{
+    normalize_tags, prompt_content_hash, ImportPromptsResult, PromptEntry, SavePromptResult,
+};
 pub use read_queries::DuplicateGroup;
 
 impl Database {

@@ -281,6 +281,8 @@ include!("commands/timeline.rs");
 
 include!("commands/lineage.rs");
 
+include!("commands/prompt_library.rs");
+
 #[cfg(test)]
 mod path_validation_tests {
     use super::*;

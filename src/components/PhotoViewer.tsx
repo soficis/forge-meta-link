@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -15,9 +16,11 @@ import {
     getThumbnailPath,
     getThumbnailPaths,
     openFileLocation,
+    savePrompt,
     saveSidecarTags,
     setLineageOverride,
 } from "../services/commands";
+import { PromptLibraryDialog } from "./PromptLibraryDialog";
 import {
     copyJpegImageToClipboard,
     copyCompressedImageForDiscord,
@@ -393,6 +396,8 @@ export function PhotoViewer({
     const [linkRelationInput, setLinkRelationInput] = useState("seed_walk");
     const [isLineageMutating, setIsLineageMutating] = useState(false);
     const lineageRequestRef = useRef(0);
+    const [isPromptLibraryOpen, setIsPromptLibraryOpen] = useState(false);
+    const [promptLibraryNote, setPromptLibraryNote] = useState<string | null>(null);
     const [isSlideshow, setIsSlideshow] = useState(false);
     const [slideshowIntervalMs, setSlideshowIntervalMs] = usePersistedState(
         "viewerSlideshowIntervalMs",
@@ -1023,6 +1028,25 @@ export function PhotoViewer({
         },
         []
     );
+
+    const handleSavePromptToLibrary = useCallback(async () => {
+        if (!forgeOverrides.prompt.trim()) {
+            setPromptLibraryNote("Nothing to save: the prompt is empty.");
+            return;
+        }
+        try {
+            const result = await savePrompt({
+                prompt: forgeOverrides.prompt,
+                negativePrompt: forgeOverrides.negative_prompt,
+                sourceImageId: currentImage?.id,
+            });
+            setPromptLibraryNote(
+                result.created ? "Saved to prompt library." : "Already in the prompt library."
+            );
+        } catch (error) {
+            setPromptLibraryNote(error instanceof Error ? error.message : String(error));
+        }
+    }, [forgeOverrides.prompt, forgeOverrides.negative_prompt, currentImage?.id]);
 
     const handleResolutionPresetChange = useCallback((value: string) => {
         if (value === "custom") {
@@ -2547,7 +2571,36 @@ export function PhotoViewer({
                                                 {loraWeightValidationError}
                                             </div>
                                         )}
-                                        <div className="viewer-form-label">Prompt</div>
+                                        <div
+                                            className="viewer-form-label"
+                                            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                                        >
+                                            <span style={{ flex: 1 }}>Prompt</span>
+                                            <button
+                                                type="button"
+                                                className="sidebar-button"
+                                                onClick={() => void handleSavePromptToLibrary()}
+                                                title="Save the prompt below to the prompt library"
+                                            >
+                                                Save to library
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className="sidebar-button"
+                                                onClick={() => {
+                                                    setPromptLibraryNote(null);
+                                                    setIsPromptLibraryOpen(true);
+                                                }}
+                                                title="Browse the prompt library and apply a prompt"
+                                            >
+                                                Library
+                                            </button>
+                                        </div>
+                                        {promptLibraryNote && (
+                                            <div className="viewer-form-label" role="status">
+                                                {promptLibraryNote}
+                                            </div>
+                                        )}
                                         <textarea
                                             className="viewer-textarea"
                                             value={forgeOverrides.prompt}
@@ -3085,6 +3138,21 @@ export function PhotoViewer({
                     </div>
                 )}
             </div>
+            {isPromptLibraryOpen &&
+                createPortal(
+                    <PromptLibraryDialog
+                        onClose={() => setIsPromptLibraryOpen(false)}
+                        onApply={(entry) => {
+                            setForgeOverrides((prev) => ({
+                                ...prev,
+                                prompt: entry.prompt,
+                                negative_prompt: entry.negative_prompt,
+                            }));
+                            setPromptLibraryNote(`Applied "${entry.title}".`);
+                        }}
+                    />,
+                    document.body
+                )}
         </div>
     );
 }

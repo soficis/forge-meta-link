@@ -262,3 +262,36 @@ export interface TagProvenance {
     last_seen: number | null;
     sample_filepaths: string[];
 }
+
+// ── Prompt library (N2) ────────────────────────────────────────────────
+
+export interface PromptEntry {
+    id: number;
+    title: string;
+    prompt: string;
+    negative_prompt: string;
+    /** Normalized: lowercase, comma-separated. */
+    tags: string;
+    notes: string;
+    source_image_id: number | null;
+    use_count: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface SavePromptResult {
+    entry: PromptEntry;
+    /** False when an identical prompt already existed. */
+    created: boolean;
+}
+
+export interface ImportPromptsResult {
+    inserted: number;
+    skipped_duplicates: number;
+    skipped_invalid: number;
+}
+
+export interface PromptTagCount {
+    tag: string;
+    count: number;
+}

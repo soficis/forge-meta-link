@@ -18,6 +18,7 @@ interface SidebarProps {
     columnCount: number;
     onColumnCountChange: (count: number) => void;
     onOpenSettings: () => void;
+    onOpenPromptLibrary: () => void;
 }
 
 const SCAN_STAGE_LABELS: Record<ScanProgress["stage"], string> = {
@@ -119,6 +120,7 @@ export function Sidebar({
     columnCount,
     onColumnCountChange,
     onOpenSettings,
+    onOpenPromptLibrary,
 }: SidebarProps) {
     const [topTagsExpanded, setTopTagsExpanded] = useState(false);
     const [sectionExpanded, setSectionExpanded] = usePersistedState<
@@ -446,6 +448,16 @@ export function Sidebar({
             </div>}
 
             <div className="sidebar-footer">
+                <button
+                    type="button"
+                    className="sidebar-button"
+                    onClick={onOpenPromptLibrary}
+                    title="Prompt library"
+                    aria-label="Prompt library"
+                >
+                    <span aria-hidden="true">✎</span>
+                    {!isCollapsed && <span>Prompt library</span>}
+                </button>
                 <button
                     type="button"
                     className="sidebar-button sidebar-settings-button"

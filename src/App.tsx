@@ -11,6 +11,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TimelineHeatmap, type TimelineRange } from "./components/TimelineHeatmap";
 import { ToastHost } from "./components/ToastHost";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { PromptLibraryDialog } from "./components/PromptLibraryDialog";
 import { CompareLab } from "./components/CompareLab";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { resolveGalleryKeyTarget } from "./utils/galleryKeyTarget";
@@ -197,6 +198,7 @@ function AppContent() {
     const [deleteHistory, setDeleteHistory] = useState<DeleteHistoryEntry[]>([]);
     const deleteHistoryIdRef = useRef(0);
     const [isHelpOpen, setIsHelpOpen] = useState(false);
+    const [isPromptLibraryOpen, setIsPromptLibraryOpen] = useState(false);
     const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null);
 
     const pushToast = useCallback(
@@ -1815,6 +1817,7 @@ function AppContent() {
                 columnCount={columnCount}
                 onColumnCountChange={setColumnCount}
                 onOpenSettings={() => setSettingsSection("library")}
+                onOpenPromptLibrary={() => setIsPromptLibraryOpen(true)}
             />
 
             <main className="main-content">
@@ -1996,6 +1999,9 @@ function AppContent() {
                 onDismissToast={dismissToast}
             />
             {isHelpOpen && <HelpOverlay onClose={() => setIsHelpOpen(false)} />}
+            {isPromptLibraryOpen && (
+                <PromptLibraryDialog onClose={() => setIsPromptLibraryOpen(false)} />
+            )}
         </div>
     );
 }
