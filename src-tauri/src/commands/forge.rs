@@ -1289,6 +1289,67 @@ impl IngestOutcome {
 }
 
 #[cfg(test)]
+mod sanitize_stem_poc_tests {
+    use super::sanitize_stem;
+
+    /// `sanitize_stem` is the only guard between a Forge server response and
+    /// `output_dir.join(candidate_name)` (see `persist_forge_payloads`). The server
+    /// controls `source_filename`, so this locks the allowlist invariant: the result may
+    /// only ever contain [A-Za-z0-9_-]. No separator, no dot, no colon, no NUL can survive,
+    /// which makes traversal out of the output directory structurally impossible.
+    #[test]
+    fn hostile_server_filename_cannot_escape_the_output_dir() {
+        let hostile = [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32\\evil",
+            "/etc/shadow",
+            "\\absolute\\windows\\path",
+            "C:\\Windows\\System32\\cmd.exe",
+            "..",
+            ".",
+            "...",
+            "././././out",
+            "foo/../../../bar",
+            "a\0b",
+            "....//....//x",
+            "%2e%2e%2fetc",
+            "subdir/nested/deep.png",
+        ];
+
+        for input in hostile {
+            let out = sanitize_stem(input);
+            assert!(
+                out.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "sanitize_stem({input:?}) produced {out:?} with a disallowed character"
+            );
+            assert!(
+                !out.contains("..") && !out.contains('/') && !out.contains('\\'),
+                "sanitize_stem({input:?}) produced traversal-capable {out:?}"
+            );
+            assert!(
+                !out.is_empty(),
+                "sanitize_stem({input:?}) must fall back to a non-empty name"
+            );
+        }
+    }
+
+    /// Pins exact outputs so an allowlist-to-denylist refactor cannot silently change behaviour.
+    #[test]
+    fn sanitize_stem_expected_outputs() {
+        assert_eq!(sanitize_stem("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_stem("..\\..\\evil"), "evil");
+        assert_eq!(sanitize_stem("C:\\Windows\\evil"), "CWindowsevil");
+        assert_eq!(sanitize_stem("foo/../../../bar"), "foo______bar");
+        assert_eq!(sanitize_stem("a.b"), "a_b");
+        assert_eq!(sanitize_stem("keep-name_1"), "keep-name_1");
+        // An empty stem would produce a bare ".png" style name.
+        assert_eq!(sanitize_stem("..."), "image");
+        assert_eq!(sanitize_stem("   "), "image");
+    }
+}
+
+#[cfg(test)]
 mod ingest_outcome_tests {
     use super::*;
     use std::cell::Cell;
