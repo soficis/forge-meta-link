@@ -208,6 +208,7 @@ mod dpapi {
     }
 }
 
+#[cfg(windows)]
 const DPAPI_HEADER: &[u8] = b"DPAPI:";
 
 fn read_plaintext_file(path: &Path) -> Option<String> {
