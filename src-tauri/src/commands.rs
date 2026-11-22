@@ -288,6 +288,8 @@ include!("commands/lineage.rs");
 
 include!("commands/prompt_library.rs");
 
+include!("commands/assets.rs");
+
 #[cfg(test)]
 mod path_validation_tests {
     use super::*;

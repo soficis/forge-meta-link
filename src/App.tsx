@@ -15,6 +15,9 @@ import { HelpOverlay } from "./components/HelpOverlay";
 import { PromptLibraryDialog } from "./components/PromptLibraryDialog";
 import { CompareLab } from "./components/CompareLab";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { RapidCullBoard } from "./components/RapidCullBoard";
+import { XyzRebuilder } from "./components/XyzRebuilder";
+import { MissingAssetsPanel } from "./components/MissingAssetsPanel";
 import { resolveGalleryKeyTarget } from "./utils/galleryKeyTarget";
 import { isTypingTarget } from "./utils/typingTarget";
 import { useAppSettings } from "./hooks/useAppSettings";
@@ -36,6 +39,7 @@ import {
     exportImages,
     exportImagesAsFiles,
     forgeTestConnection,
+    getImageDetail,
     getStorageProfile,
     moveImagesToDirectory,
     onForgeImagesIngested,
@@ -53,6 +57,7 @@ import type {
     DeleteHistoryEntry,
     GalleryImageRecord,
     ImageExportFormat,
+    ImageRecord,
     StorageProfile,
 } from "./types/metadata";
 import { needsBulkTrashConfirm } from "./utils/deleteHelpers";
@@ -192,6 +197,10 @@ function AppContent() {
     const deleteHistoryIdRef = useRef(0);
     const [isHelpOpen, setIsHelpOpen] = useState(false);
     const [isPromptLibraryOpen, setIsPromptLibraryOpen] = useState(false);
+    const [isRapidCullOpen, setIsRapidCullOpen] = useState(false);
+    const [isMissingAssetsOpen, setIsMissingAssetsOpen] = useState(false);
+    const [isXyzRebuilderOpen, setIsXyzRebuilderOpen] = useState(false);
+    const [xyzImages, setXyzImages] = useState<ImageRecord[]>([]);
     const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null);
 
     const pushToast = useCallback(
@@ -257,6 +266,8 @@ function AppContent() {
         hasNextPage,
         isFetchingNextPage,
         isLoading,
+        isError,
+        error,
     } = useImages(
         searchQuery,
         includeTags,
@@ -330,6 +341,43 @@ function AppContent() {
             return m >= timelineRange.start && m < timelineRange.end;
         });
     }, [images, timelineRange]);
+
+    // Gallery rows do not carry CFG/steps/sampler, so resolve the full structured
+    // record only while the rebuilder is open. Unknown fields stay null; a failed
+    // lookup falls back to the already-loaded row instead of inventing values.
+    useEffect(() => {
+        if (!isXyzRebuilderOpen) {
+            return;
+        }
+        let active = true;
+        const fallback = (entry: GalleryImageRecord): ImageRecord => ({
+            ...entry,
+            prompt: "",
+            negative_prompt: "",
+            steps: null,
+            sampler: null,
+            schedule_type: null,
+            extra_params: null,
+            text_chunks: null,
+            cfg_scale: null,
+            model_hash: null,
+            raw_metadata: "",
+        });
+        void Promise.all(
+            timelineFilteredImages.map((entry) =>
+                getImageDetail(entry.id)
+                    .then((detail) => detail ?? fallback(entry))
+                    .catch(() => fallback(entry))
+            )
+        ).then((records) => {
+            if (active) {
+                setXyzImages(records);
+            }
+        });
+        return () => {
+            active = false;
+        };
+    }, [isXyzRebuilderOpen, timelineFilteredImages]);
 
     const viewerImageState = useMemo(
         () => buildJpegPreferredViewerState(timelineFilteredImages),
@@ -406,6 +454,8 @@ function AppContent() {
                 queryClient.invalidateQueries({ queryKey: ["topTags"] });
                 queryClient.invalidateQueries({ queryKey: ["models"] });
                 queryClient.invalidateQueries({ queryKey: ["directories"] });
+                queryClient.invalidateQueries({ queryKey: ["loraTags"] });
+                queryClient.invalidateQueries({ queryKey: ["fileMtimes"] });
                 pushToast(
                     `Generated ${paths.length} image${paths.length === 1 ? "" : "s"} added to gallery`,
                     { tone: "success" }
@@ -534,6 +584,9 @@ function AppContent() {
         queryClient.invalidateQueries({ queryKey: ["totalCount"] });
         queryClient.invalidateQueries({ queryKey: ["topTags"] });
         queryClient.invalidateQueries({ queryKey: ["models"] });
+        queryClient.invalidateQueries({ queryKey: ["loraTags"] });
+        queryClient.invalidateQueries({ queryKey: ["fileMtimes"] });
+        queryClient.invalidateQueries({ queryKey: ["directories"] });
     }, []);
 
     const finalizeDeleteOperation = useCallback(
@@ -1362,7 +1415,7 @@ function AppContent() {
             chips.push({ id: `exclude:${tag}`, label: `Not: ${tag}`, onRemove: () => removeTagFilter(tag) });
         }
         if (selectedModelFilter) {
-            chips.push({ id: "model", label: `Model: ${selectedModelFilter}`, onRemove: () => setSelectedModelFilter("") });
+            chips.push({ id: "model", label: `Checkpoint: ${selectedModelFilter}`, onRemove: () => setSelectedModelFilter("") });
         }
         if (selectedLoraFilter) {
             chips.push({
@@ -1555,10 +1608,12 @@ function AppContent() {
         hasSearchQuery || hasSidebarTagFilters || hasFilterControls || timelineRange != null;
 
     const galleryEmptyState = useMemo(() => {
+        // The rescan copy is only honest when the library itself is empty.
+        // A failed query gets its own error panel (see the render below).
         if (totalCount === 0) {
             return {
-                title: "No images yet",
-                message: "Pick a folder of AI-generated images. ForgeMetaLink reads their prompts and settings so you can search them.",
+                title: "No images available",
+                message: "Rescan your folder if images should appear here.",
                 action: isScanning
                     ? undefined
                     : { label: "Scan a folder", onClick: () => void handlePickFolderToScan() },
@@ -1576,11 +1631,9 @@ function AppContent() {
         }
 
         return {
-            title: "No images available",
-            message: "Rescan your folder if images should appear here.",
-            action: isScanning
-                ? undefined
-                : { label: "Scan a folder", onClick: () => void handlePickFolderToScan() },
+            title: "No images to display",
+            message: "The current view has no images. Clear filters or choose a different range.",
+            action: { label: "Clear all filters", onClick: handleClearAllFilters },
         };
     }, [
         activeFilters.length,
@@ -1793,6 +1846,33 @@ function AppContent() {
             />
 
             <main className="main-content">
+                <div className="rapid-cull-toolbar">
+                    <button
+                        type="button"
+                        className="rapid-cull-toggle"
+                        aria-label="Open rapid cull board"
+                        aria-pressed={isRapidCullOpen}
+                        onClick={() => setIsRapidCullOpen((open) => !open)}
+                    >
+                        Rapid cull
+                    </button>
+                    <button
+                        type="button"
+                        className="rapid-cull-toggle"
+                        onClick={() => setIsMissingAssetsOpen(true)}
+                    >
+                        Check assets
+                    </button>
+                    <button
+                        type="button"
+                        className="rapid-cull-toggle"
+                        aria-label="Rebuild X/Y/Z"
+                        aria-pressed={isXyzRebuilderOpen}
+                        onClick={() => setIsXyzRebuilderOpen((open) => !open)}
+                    >
+                        Rebuild X/Y/Z
+                    </button>
+                </div>
                 <SearchBar
                     searchValue={searchQuery}
                     onSearch={handleSearch}
@@ -1848,7 +1928,26 @@ function AppContent() {
                     onShowToast={pushToast}
                 />
 
-                {isLoading && images.length === 0 ? (
+                {isError ? (
+                    <div className="loading-state" role="alert" data-testid="images-error-state">
+                        <h2>Couldn't load images</h2>
+                        <p>The gallery could not be loaded. Check your library and try again.</p>
+                        <button
+                            type="button"
+                            className="detail-action-button"
+                            style={{ color: "#ffb4b4" }}
+                            onClick={() =>
+                                queryClient.invalidateQueries({ queryKey: ["images"] })
+                            }
+                        >
+                            Retry
+                        </button>
+                        <details>
+                            <summary>Show error details</summary>
+                            <pre>{error instanceof Error ? error.message : String(error)}</pre>
+                        </details>
+                    </div>
+                ) : isLoading && images.length === 0 ? (
                     <div className="loading-state">
                         <div className="spinner large" />
                         <p>Loading images...</p>
@@ -1969,6 +2068,33 @@ function AppContent() {
                             target.fallbackViewerImageId
                         );
                     }}
+                />
+            )}
+
+            {isRapidCullOpen && (
+                <RapidCullBoard
+                    images={timelineFilteredImages}
+                    onClose={() => setIsRapidCullOpen(false)}
+                    onCulled={(id) => {
+                        setImages((previous) => previous.filter((image) => image.id !== id));
+                        invalidateImageQueries();
+                    }}
+                />
+            )}
+
+            {isMissingAssetsOpen && (
+                <MissingAssetsPanel
+                    onClose={() => setIsMissingAssetsOpen(false)}
+                    forgeBaseUrl={forge.forgeBaseUrl}
+                    forgeApiKey={forge.forgeApiKey}
+                />
+            )}
+
+            {isXyzRebuilderOpen && (
+                <XyzRebuilder
+                    images={xyzImages}
+                    onClose={() => setIsXyzRebuilderOpen(false)}
+                    onPin={(ids) => addToSelection(ids)}
                 />
             )}
 

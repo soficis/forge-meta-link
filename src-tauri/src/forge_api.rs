@@ -291,6 +291,7 @@ pub fn enrich_override_settings_from_forge_options(
     payload: &mut ForgePayload,
     target_model: &str,
     opts: &serde_json::Value,
+    source: Option<&GenerationParams>,
 ) {
     let is_forge_neo = opts.get("forge_preset").is_some()
         || opts.get("forge_additional_modules").is_some()
@@ -304,8 +305,8 @@ pub fn enrich_override_settings_from_forge_options(
     }
 
     const FORGE_PRESETS: &[&str] = &[
-        "zit", "krea", "qwen", "flux", "klein", "anima", "lumina", "wan", "ernie", "pid", "xl",
-        "sd",
+        "zit", "krea", "qwen21", "qwen", "moss", "flux", "klein", "anima", "lumina", "wan",
+        "ernie", "pid", "xl", "sd",
     ];
 
     let target_lower = target_model.to_ascii_lowercase();
@@ -349,8 +350,16 @@ pub fn enrich_override_settings_from_forge_options(
             matched_preset = Some("zit");
         } else if target_lower.contains("krea") {
             matched_preset = Some("krea");
+        } else if target_lower.contains("qwen2.1")
+            || target_lower.contains("qwen 2.1")
+            || target_lower.contains("qwen21")
+            || (target_lower.contains("qwen") && target_lower.contains("2512"))
+        {
+            matched_preset = Some("qwen21");
         } else if target_lower.contains("qwen") {
             matched_preset = Some("qwen");
+        } else if target_lower.contains("moss") {
+            matched_preset = Some("moss");
         } else if target_lower.contains("klein")
             || target_lower.contains("flux-2")
             || target_lower.contains("flux2")
@@ -388,25 +397,342 @@ pub fn enrich_override_settings_from_forge_options(
         let modules_key = format!("forge_additional_modules_{}", preset);
         let dtype_key = format!("forge_unet_storage_dtype_{}", preset);
 
-        let modules_val = opts.get(&modules_key).cloned().unwrap_or_else(|| json!([]));
-
         let mut overrides = match payload.override_settings.take() {
             Some(serde_json::Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
 
-        overrides.insert("forge_additional_modules".to_string(), modules_val);
-
-        if let Some(dtype_str) = opts.get(&dtype_key).and_then(|v| v.as_str()) {
-            if !dtype_str.trim().is_empty() && dtype_str != "None" {
+        // 3a. Restore modules from the image itself: Module 1, Module 2, ...
+        // (case-insensitive; also inside extra_params). Each basename is matched to a
+        // full path from forge_additional_modules_{preset} / forge_additional_modules
+        // by file stem, case-insensitively. All must resolve or we fall back.
+        let image_modules = collect_image_modules(source);
+        let mut restored = false;
+        if !image_modules.is_empty() && !has_usable_modules_value(&overrides) {
+            let candidates = candidate_module_paths(opts, Some(&modules_key));
+            let mut resolved: Vec<String> = Vec::with_capacity(image_modules.len());
+            let mut all_ok = !candidates.is_empty();
+            for wanted in &image_modules {
+                match resolve_module_path(wanted, &candidates) {
+                    Some(full) => resolved.push(full),
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok && !resolved.is_empty() {
                 overrides.insert(
-                    "forge_unet_storage_dtype".to_string(),
-                    serde_json::Value::String(dtype_str.to_string()),
+                    "forge_additional_modules".to_string(),
+                    serde_json::Value::Array(
+                        resolved
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
                 );
+                restored = true;
             }
         }
 
+        // 3b. Fallback: live options for this preset (string -> array), else generic key.
+        if !restored && !has_usable_modules_value(&overrides) {
+            let raw = opts
+                .get(&modules_key)
+                .or_else(|| opts.get("forge_additional_modules"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            overrides.insert(
+                "forge_additional_modules".to_string(),
+                normalize_modules_value(&raw),
+            );
+        }
+
+        if !overrides.contains_key("forge_unet_storage_dtype") {
+            if let Some(dtype_str) = opts.get(&dtype_key).and_then(|v| v.as_str()) {
+                if !is_omitted_dtype(dtype_str) {
+                    overrides.insert(
+                        "forge_unet_storage_dtype".to_string(),
+                        serde_json::Value::String(dtype_str.to_string()),
+                    );
+                }
+            }
+        }
+
+        // 3c. Carry image-recorded extras into override_settings without clobbering caller values.
+        apply_source_extras_to_overrides(&mut overrides, source);
+
         payload.override_settings = Some(serde_json::Value::Object(overrides));
+    }
+}
+
+fn is_omitted_dtype(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("automatic")
+}
+
+fn is_nonempty_modules_value(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|s| !s.trim().is_empty()),
+        Some(serde_json::Value::String(text)) => !text.trim().is_empty(),
+        Some(_) => false,
+        None => false,
+    }
+}
+
+fn has_usable_modules_value(overrides: &serde_json::Map<String, serde_json::Value>) -> bool {
+    is_nonempty_modules_value(overrides.get("forge_additional_modules"))
+}
+
+fn is_plausible_module_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Live Neo joins full paths with spaces; a fragment like `C:\My` has no model
+    // extension and must not be sent as a module entry.
+    lower.ends_with(".safetensors")
+        || lower.ends_with(".gguf")
+        || lower.ends_with(".ckpt")
+        || lower.ends_with(".pt")
+}
+
+fn normalize_modules_value(raw: &serde_json::Value) -> serde_json::Value {
+    match raw {
+        serde_json::Value::Array(items) => {
+            let arr: Vec<serde_json::Value> = items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && is_plausible_module_path(s))
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .collect();
+            serde_json::Value::Array(arr)
+        }
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+                return serde_json::Value::Array(vec![serde_json::Value::String(
+                    trimmed.to_string(),
+                )]);
+            }
+            let arr: Vec<serde_json::Value> = text
+                .split_whitespace()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && is_plausible_module_path(s))
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .collect();
+            serde_json::Value::Array(arr)
+        }
+        _ => json!([]),
+    }
+}
+
+fn candidate_module_paths(opts: &serde_json::Value, preset_key: Option<&str>) -> Vec<String> {
+    let raw = preset_key
+        .and_then(|k| opts.get(k))
+        .or_else(|| opts.get("forge_additional_modules"));
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    match normalize_modules_value(raw) {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn module_file_stem(value: &str) -> String {
+    let trimmed = value.trim();
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    base.rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(base)
+        .to_ascii_lowercase()
+}
+
+fn resolve_module_path(wanted: &str, candidates: &[String]) -> Option<String> {
+    let wanted_stem = module_file_stem(wanted);
+    let wanted_full = wanted.trim().to_ascii_lowercase();
+    // Exact basename match wins (case-insensitive).
+    for candidate in candidates {
+        let cand_base = candidate
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(candidate)
+            .to_ascii_lowercase();
+        if cand_base == wanted_full {
+            return Some(candidate.clone());
+        }
+    }
+    // Stem-only fallback: a single stem hit resolves, but a tie (>1 candidate
+    // sharing the stem, e.g. fp8 vs bf16 variants) fails closed so the caller
+    // falls back to the normalized live-options list instead of a first-hit guess.
+    let mut stem_hits: Vec<&String> = Vec::new();
+    if !wanted_stem.is_empty() {
+        for candidate in candidates {
+            if module_file_stem(candidate) == wanted_stem {
+                stem_hits.push(candidate);
+            }
+        }
+    }
+    if stem_hits.len() == 1 {
+        return Some(stem_hits[0].clone());
+    }
+    None
+}
+
+fn collect_image_modules(source: Option<&GenerationParams>) -> Vec<String> {
+    let Some(params) = source else {
+        return Vec::new();
+    };
+    let mut indexed: Vec<(usize, String)> = Vec::new();
+    let mut extra_lists: Vec<String> = Vec::new();
+    for (key, value) in &params.extra_params {
+        let lowered = key.trim().to_ascii_lowercase();
+        if lowered == "forge additional modules" || lowered == "additional modules" {
+            extra_lists.extend(split_extra_module_list(value));
+            continue;
+        }
+        let Some(suffix) = lowered.strip_prefix("module") else {
+            continue;
+        };
+        let num: usize = suffix
+            .trim()
+            .trim_start_matches(['_', '-', ' '])
+            .parse()
+            .unwrap_or(0);
+        if num == 0 {
+            continue;
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        indexed.push((num, trimmed.to_string()));
+    }
+    indexed.sort_by_key(|(num, _)| *num);
+    let mut out: Vec<String> = indexed.into_iter().map(|(_, v)| v).collect();
+    out.extend(extra_lists);
+    out
+}
+
+/// Splits a `forge additional modules` / `additional modules` extra value: a JSON
+/// array of strings wins when present, otherwise a comma-separated list. Empty and
+/// whitespace-only entries are dropped.
+fn split_extra_module_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        match parsed {
+            serde_json::Value::Array(items) => {
+                return items
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(str::trim).map(str::to_string))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            serde_json::Value::String(inner) => {
+                return split_extra_module_list(&inner);
+            }
+            _ => {}
+        }
+    }
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn extra_lookup<'a>(
+    extra: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    extra.get(key).map(String::as_str).or_else(|| {
+        let lowered = key.to_ascii_lowercase();
+        extra
+            .iter()
+            .find(|(k, _)| k.trim().to_ascii_lowercase() == lowered)
+            .map(|(_, v)| v.as_str())
+    })
+}
+
+fn apply_source_extras_to_overrides(
+    overrides: &mut serde_json::Map<String, serde_json::Value>,
+    source: Option<&GenerationParams>,
+) {
+    let Some(params) = source else {
+        return;
+    };
+    let extra = &params.extra_params;
+
+    if !overrides.contains_key("img2img_background_color") {
+        if let Some(val) = extra_lookup(extra, "img2img_background_color") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                overrides.insert(
+                    "img2img_background_color".to_string(),
+                    serde_json::Value::String(trimmed.to_string()),
+                );
+            }
+        }
+    }
+
+    if !overrides.contains_key("CLIP_stop_at_last_layers") {
+        let clip_raw = extra_lookup(extra, "CLIP_stop_at_last_layers")
+            .or_else(|| extra_lookup(extra, "CLIP skip"))
+            .or_else(|| extra_lookup(extra, "clip_skip"));
+        if let Some(raw) = clip_raw {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                if let Ok(num) = trimmed.parse::<i64>() {
+                    overrides.insert(
+                        "CLIP_stop_at_last_layers".to_string(),
+                        serde_json::Value::Number(num.into()),
+                    );
+                } else if let Ok(num) = trimmed.parse::<f64>() {
+                    if let Some(n) = serde_json::Number::from_f64(num) {
+                        overrides.insert(
+                            "CLIP_stop_at_last_layers".to_string(),
+                            serde_json::Value::Number(n),
+                        );
+                    }
+                } else {
+                    overrides.insert(
+                        "CLIP_stop_at_last_layers".to_string(),
+                        serde_json::Value::String(trimmed.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    if !overrides.contains_key("forge_unet_storage_dtype") {
+        let dtype_raw = extra_lookup(extra, "forge_unet_storage_dtype")
+            .or_else(|| extra_lookup(extra, "unet_storage_dtype"))
+            .or_else(|| extra_lookup(extra, "forge_unet_dtype"))
+            .or_else(|| extra_lookup(extra, "unet_dtype"));
+        if let Some(raw) = dtype_raw {
+            if !is_omitted_dtype(raw) {
+                overrides.insert(
+                    "forge_unet_storage_dtype".to_string(),
+                    serde_json::Value::String(raw.trim().to_string()),
+                );
+            }
+        }
     }
 }
 
@@ -414,6 +740,19 @@ pub async fn enrich_payload_for_forge_neo(
     payload: &mut ForgePayload,
     base_url: &str,
     api_key: Option<&str>,
+) {
+    enrich_payload_for_forge_neo_with_source(payload, base_url, api_key, None).await;
+}
+
+/// Same as [`enrich_payload_for_forge_neo`] but also restores `forge_additional_modules`
+/// (plus background color / CLIP / dtype extras) from the image's own source params.
+/// Callers that own the [`GenerationParams`] (e.g. [`forge_requeue_image`]) should prefer
+/// this variant; callers with only a [`ForgePayload`] keep using the 3-arg version.
+pub async fn enrich_payload_for_forge_neo_with_source(
+    payload: &mut ForgePayload,
+    base_url: &str,
+    api_key: Option<&str>,
+    source: Option<&GenerationParams>,
 ) {
     let target_model = payload
         .override_settings
@@ -429,14 +768,14 @@ pub async fn enrich_payload_for_forge_neo(
     if payload
         .override_settings
         .as_ref()
-        .and_then(|ov| ov.get("forge_additional_modules"))
-        .is_some()
+        .and_then(|ov| ov.as_object())
+        .is_some_and(has_usable_modules_value)
     {
         return;
     }
 
     if let Ok(opts) = get_forge_options(base_url, api_key).await {
-        enrich_override_settings_from_forge_options(payload, &target_model, &opts);
+        enrich_override_settings_from_forge_options(payload, &target_model, &opts, source);
     }
 }
 
@@ -528,17 +867,37 @@ pub struct ForgePayloadBuildInput<'a> {
     pub forge_additional_modules: Option<&'a [String]>,
 }
 
+/// Normalizes a scheduler label to the Forge API name: known labels map
+/// case-insensitively (`Karras`->`karras`, `SGM Uniform`->`sgm_uniform`, ...);
+/// anything else is trimmed, lowercased, and has whitespace runs folded to `_`.
+pub fn normalize_scheduler(value: &str) -> String {
+    let lowered = value.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "karras" => "karras".to_string(),
+        "exponential" => "exponential".to_string(),
+        "sgm uniform" => "sgm_uniform".to_string(),
+        "simple" => "simple".to_string(),
+        "beta" => "beta".to_string(),
+        "linear" => "linear".to_string(),
+        "ddim uniform" => "ddim_uniform".to_string(),
+        "normal" => "normal".to_string(),
+        "uniform" => "uniform".to_string(),
+        _ => lowered.split_whitespace().collect::<Vec<_>>().join("_"),
+    }
+}
+
 /// Scheduler to send when re-generating a stored image: an explicit override wins, otherwise
-/// the `Schedule type` recorded in the image's own metadata block. `ImageRecord` has no
-/// scheduler column, so without this the scheduler was silently dropped (upstream issue #15521,
-/// reproduced in-app).
+/// the `Schedule type` recorded in the image's own metadata block (also mirrored on
+/// `ImageRecord.schedule_type`). Labels are normalized via [`normalize_scheduler`];
+/// without this the scheduler was silently dropped (upstream issue #15521, reproduced in-app).
 pub fn resolve_scheduler(override_scheduler: Option<&str>, raw_metadata: &str) -> Option<String> {
     if let Some(explicit) = parse_optional_text(override_scheduler) {
-        return Some(explicit);
+        return Some(normalize_scheduler(&explicit));
     }
     crate::parser::parse_generation_metadata(raw_metadata)
         .schedule_type
         .and_then(|s| parse_optional_text(Some(&s)))
+        .map(|s| normalize_scheduler(&s))
 }
 
 /// Per-field overrides applied on top of a stored image when re-generating it. `None` means
@@ -621,7 +980,9 @@ pub fn build_payload_from_image_record(input: ForgePayloadBuildInput<'_>) -> For
         let mut obj = serde_json::Map::new();
         obj.insert("sd_model_checkpoint".to_string(), json!(name));
         if let Some(modules) = forge_additional_modules {
-            obj.insert("forge_additional_modules".to_string(), json!(modules));
+            if !modules.is_empty() {
+                obj.insert("forge_additional_modules".to_string(), json!(modules));
+            }
         }
         serde_json::Value::Object(obj)
     });
@@ -670,7 +1031,7 @@ pub fn build_payload_from_generation_params(
         if t.is_empty() {
             None
         } else {
-            Some(t.to_string())
+            Some(normalize_scheduler(t))
         }
     });
     let model_name = params.model_name.as_deref().and_then(|s| {
@@ -752,15 +1113,48 @@ pub fn build_requeue_payload(params: &GenerationParams, include_seed: bool) -> F
         );
     }
 
-    if let Some(clip_skip_str) = params
-        .extra_params
-        .get("Clip skip")
-        .or_else(|| params.extra_params.get("clip_skip"))
+    if let Some(clip_skip_str) = extra_lookup(&params.extra_params, "CLIP_stop_at_last_layers")
+        .or_else(|| extra_lookup(&params.extra_params, "CLIP skip"))
+        .or_else(|| extra_lookup(&params.extra_params, "clip_skip"))
+        .or_else(|| extra_lookup(&params.extra_params, "Clip skip"))
     {
-        if let Ok(clip_skip) = clip_skip_str.trim().parse::<i64>() {
+        let trimmed = clip_skip_str.trim();
+        if !trimmed.is_empty() {
+            if let Ok(clip_skip) = trimmed.parse::<i64>() {
+                overrides.insert(
+                    "CLIP_stop_at_last_layers".to_string(),
+                    serde_json::Value::Number(clip_skip.into()),
+                );
+            } else if let Ok(as_float) = trimmed.parse::<f64>() {
+                if let Some(n) = serde_json::Number::from_f64(as_float) {
+                    overrides.insert(
+                        "CLIP_stop_at_last_layers".to_string(),
+                        serde_json::Value::Number(n),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(bg) = extra_lookup(&params.extra_params, "img2img_background_color") {
+        let trimmed = bg.trim();
+        if !trimmed.is_empty() {
             overrides.insert(
-                "CLIP_stop_at_last_layers".to_string(),
-                serde_json::Value::Number(clip_skip.into()),
+                "img2img_background_color".to_string(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
+    }
+
+    if let Some(dtype) = extra_lookup(&params.extra_params, "forge_unet_storage_dtype")
+        .or_else(|| extra_lookup(&params.extra_params, "unet_storage_dtype"))
+        .or_else(|| extra_lookup(&params.extra_params, "forge_unet_dtype"))
+        .or_else(|| extra_lookup(&params.extra_params, "unet_dtype"))
+    {
+        if !is_omitted_dtype(dtype) {
+            overrides.insert(
+                "forge_unet_storage_dtype".to_string(),
+                serde_json::Value::String(dtype.trim().to_string()),
             );
         }
     }
@@ -789,7 +1183,7 @@ pub async fn forge_requeue_image(
         });
     }
     let mut payload = build_requeue_payload(params, include_seed);
-    enrich_payload_for_forge_neo(&mut payload, base_url, api_key).await;
+    enrich_payload_for_forge_neo_with_source(&mut payload, base_url, api_key, Some(params)).await;
     let mut result = send_to_forge(&payload, base_url, api_key).await?;
     if result.ok {
         if let Some(info) = result.info.as_deref() {
@@ -1102,6 +1496,7 @@ mod tests {
             model_name: Some("pony_v6.safetensors".to_string()),
             generation_type: Some("txt2img".to_string()),
             extra_params: extra,
+            text_chunks: HashMap::new(),
             raw_metadata: "raw".to_string(),
         }
     }
@@ -1114,7 +1509,7 @@ mod tests {
         assert_eq!(payload.negative_prompt, params.negative_prompt);
         assert_eq!(payload.steps, Some(28));
         assert_eq!(payload.sampler_name.as_deref(), Some("Euler a"));
-        assert_eq!(payload.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(payload.scheduler.as_deref(), Some("karras"));
         assert_eq!(payload.cfg_scale, Some(7.5));
         assert_eq!(payload.seed, Some(12345));
         assert_eq!(payload.width, Some(1024));
@@ -1176,7 +1571,7 @@ mod tests {
 
         // Top-level payload fields must be set correctly
         assert_eq!(payload.sampler_name.as_deref(), Some("Euler a"));
-        assert_eq!(payload.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(payload.scheduler.as_deref(), Some("karras"));
         assert_eq!(payload.cfg_scale, Some(7.5));
         assert_eq!(payload.seed, Some(12345));
 
@@ -1211,6 +1606,9 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 42949672
                 .into(),
             is_favorite: false,
             is_locked: false,
+            schedule_type: Some("karras".into()),
+            extra_params: None,
+            text_chunks: None,
         }
     }
 
@@ -1241,7 +1639,7 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 42949672
         assert_eq!(p.sampler_name.as_deref(), Some("Euler a"));
         assert_eq!(p.cfg_scale, Some(7.0));
         assert_eq!(p.seed, Some(4294967299));
-        assert_eq!(p.scheduler.as_deref(), Some("Karras"));
+        assert_eq!(p.scheduler.as_deref(), Some("karras"));
     }
 
     #[test]
@@ -1270,10 +1668,10 @@ Steps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 7, Seed: 1, Size:
             resolve_scheduler(Some("exponential"), raw).as_deref(),
             Some("exponential")
         );
-        assert_eq!(resolve_scheduler(None, raw).as_deref(), Some("Karras"));
+        assert_eq!(resolve_scheduler(None, raw).as_deref(), Some("karras"));
         assert_eq!(
             resolve_scheduler(Some("  "), raw).as_deref(),
-            Some("Karras")
+            Some("karras")
         );
         assert_eq!(
             resolve_scheduler(
@@ -1283,6 +1681,29 @@ Steps: 20, Sampler: Euler"
             ),
             None
         );
+    }
+
+    #[test]
+    fn normalize_scheduler_maps_known_labels_case_insensitively() {
+        for (input, expected) in [
+            ("Karras", "karras"),
+            ("KARRAS", "karras"),
+            ("Exponential", "exponential"),
+            ("SGM Uniform", "sgm_uniform"),
+            ("sgm uniform", "sgm_uniform"),
+            ("Simple", "simple"),
+            ("Beta", "beta"),
+            ("Linear", "linear"),
+            ("DDIM Uniform", "ddim_uniform"),
+            ("Normal", "normal"),
+            ("Uniform", "uniform"),
+        ] {
+            assert_eq!(super::normalize_scheduler(input), expected, "{input}");
+        }
+        assert_eq!(super::normalize_scheduler("  Karras  "), "karras");
+        // Unknown labels fall back to trimmed lowercase with spaces folded to `_`.
+        assert_eq!(super::normalize_scheduler("Foo Bar"), "foo_bar");
+        assert_eq!(super::normalize_scheduler("  Exponential  "), "exponential");
     }
 
     #[test]
@@ -1460,6 +1881,7 @@ Steps: 20, Sampler: Euler"
             &mut payload_zit,
             "z_image_turbo_bf16.safetensors",
             &forge_neo_opts,
+            None,
         );
         let ov_zit = payload_zit.override_settings.unwrap();
         assert_eq!(
@@ -1499,6 +1921,7 @@ Steps: 20, Sampler: Euler"
             &mut payload_krea,
             "krea2_turbo_fp8_scaled.safetensors",
             &forge_neo_opts,
+            None,
         );
         let ov_krea = payload_krea.override_settings.unwrap();
         assert_eq!(
@@ -1531,6 +1954,7 @@ Steps: 20, Sampler: Euler"
             &mut payload_xl,
             "sd_xl_base_1.0.safetensors",
             &forge_neo_opts,
+            None,
         );
         let ov_xl = payload_xl.override_settings.unwrap();
         assert_eq!(ov_xl.get("forge_additional_modules").unwrap(), &json!([]));
@@ -1561,8 +1985,501 @@ Steps: 20, Sampler: Euler"
             &mut payload_std,
             "v1-5-pruned.safetensors",
             &standard_opts,
+            None,
         );
         let ov_std = payload_std.override_settings.unwrap();
         assert!(ov_std.get("forge_additional_modules").is_none());
+    }
+
+    fn live_shaped_opts() -> serde_json::Value {
+        // Mirrors live Forge Neo 2.32 /sdapi/v1/options: forge_additional_modules is a
+        // SPACE-SEPARATED STRING of full paths, with per-preset variants.
+        serde_json::json!({
+            "forge_preset": "krea",
+            "forge_additional_modules": "/models/vae/krea2RealVae_v10.safetensors /models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors",
+            "forge_checkpoint_krea": "Krea2Turbo_W4A8.safetensors",
+            "forge_additional_modules_krea": "/models/vae/krea2RealVae_v10.safetensors /models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors",
+            "forge_unet_storage_dtype_krea": "bf16",
+            "forge_checkpoint_qwen21": "qwen2.1-7b.safetensors",
+            "forge_additional_modules_qwen21": "/models/vae/qwen_vae.safetensors /models/llm/qwen21_text.safetensors",
+            "forge_checkpoint_moss": "moss-image-v1.safetensors",
+            "forge_additional_modules_moss": "/models/vae/moss_vae.safetensors",
+            "forge_unet_storage_dtype_moss": "Automatic",
+        })
+    }
+
+    fn payload_for(model: &str) -> super::ForgePayload {
+        super::ForgePayload {
+            prompt: "a".to_string(),
+            negative_prompt: "".to_string(),
+            steps: Some(1),
+            sampler_name: Some("Euler".to_string()),
+            scheduler: Some("karras".to_string()),
+            cfg_scale: Some(1.0),
+            seed: Some(3),
+            width: Some(64),
+            height: Some(64),
+            override_settings: Some(serde_json::json!({ "sd_model_checkpoint": model })),
+            send_images: Some(true),
+            save_images: Some(false),
+            alwayson_scripts: None,
+            batch_size: Some(1),
+            n_iter: Some(1),
+        }
+    }
+
+    #[test]
+    fn enrich_restores_modules_from_image_basenames_to_full_paths() {
+        // Real txt2img infotext shape from live Forge Neo 2.32.
+        let raw = "a\nSteps: 1, Sampler: Euler, Schedule type: Karras, CFG scale: 1.0, Seed: 3, Size: 64x64, Model: Krea2Turbo_W4A8, Model hash: 64aff423d3, Module 1: krea2RealVae_v10, Module 2: qwen3-vl-4b-heretic_fp8_e4m3fn, RNG: CPU, Version: neo-2.32";
+        let params = crate::parser::parse_generation_metadata(raw);
+        assert_eq!(
+            params.extra_params.get("Module 1").map(String::as_str),
+            Some("krea2RealVae_v10")
+        );
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        let opts = live_shaped_opts();
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/krea2RealVae_v10.safetensors",
+                "/models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors"
+            ])
+        );
+    }
+
+    #[test]
+    fn enrich_unresolved_module_falls_back_to_live_options() {
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "krea2RealVae_v10".to_string());
+        extra.insert(
+            "Module 2".to_string(),
+            "totally_unknown_module_xyz".to_string(),
+        );
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        let opts = live_shaped_opts();
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        // Nothing invented: falls back to the normalized live-options array.
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/krea2RealVae_v10.safetensors",
+                "/models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors"
+            ])
+        );
+    }
+
+    #[test]
+    fn enrich_qwen21_and_moss_classification() {
+        let opts = live_shaped_opts();
+        let mut payload_q = payload_for("qwen2.1-7b.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_q,
+            "qwen2.1-7b.safetensors",
+            &opts,
+            None,
+        );
+        let ov_q = payload_q.override_settings.unwrap();
+        assert_eq!(
+            ov_q.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/qwen_vae.safetensors",
+                "/models/llm/qwen21_text.safetensors"
+            ]),
+            "qwen 2.1 must map to the qwen21 preset"
+        );
+
+        // 2512 alias also maps to qwen21.
+        let mut payload_2512 = payload_for("Qwen-Image-2512_fp8.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_2512,
+            "Qwen-Image-2512_fp8.safetensors",
+            &opts,
+            None,
+        );
+        let ov_2512 = payload_2512.override_settings.unwrap();
+        assert_eq!(
+            ov_2512.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/qwen_vae.safetensors",
+                "/models/llm/qwen21_text.safetensors"
+            ]),
+            "2512 must map to the qwen21 preset"
+        );
+
+        let mut payload_m = payload_for("moss-image-v1.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload_m,
+            "moss-image-v1.safetensors",
+            &opts,
+            None,
+        );
+        let ov_m = payload_m.override_settings.unwrap();
+        assert_eq!(
+            ov_m.get("forge_additional_modules").unwrap(),
+            &serde_json::json!(["/models/vae/moss_vae.safetensors"])
+        );
+        // Live dtype "Automatic" is omitted.
+        assert!(
+            ov_m.get("forge_unet_storage_dtype").is_none(),
+            "Automatic dtype must be omitted"
+        );
+    }
+
+    #[test]
+    fn enrich_converts_string_modules_to_array_and_applies_extras() {
+        let opts = serde_json::json!({
+            "forge_preset": "krea",
+            "forge_additional_modules_krea": "/a/vae.safetensors /b/llm.gguf",
+            "forge_unet_storage_dtype_krea": "None",
+        });
+        let mut extra = HashMap::new();
+        extra.insert(
+            "img2img_background_color".to_string(),
+            "(255,255,255)".to_string(),
+        );
+        extra.insert("CLIP skip".to_string(), "2.0".to_string());
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!(["/a/vae.safetensors", "/b/llm.gguf"]),
+            "string-valued modules must become an array"
+        );
+        assert_eq!(
+            ov.get("img2img_background_color").and_then(|v| v.as_str()),
+            Some("(255,255,255)")
+        );
+        assert!(
+            ov.get("forge_unet_storage_dtype").is_none(),
+            "None dtype must be omitted"
+        );
+        assert!(ov.get("CLIP_stop_at_last_layers").is_some());
+    }
+
+    #[test]
+    fn enrich_preserves_caller_set_modules() {
+        let opts = live_shaped_opts();
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        payload.override_settings = Some(serde_json::json!({
+            "sd_model_checkpoint": "Krea2Turbo_W4A8.safetensors",
+            "forge_additional_modules": ["/custom/keep.safetensors"],
+        }));
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "krea2RealVae_v10".to_string());
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!(["/custom/keep.safetensors"]),
+            "caller-set modules must be preserved"
+        );
+    }
+
+    #[test]
+    fn from_image_record_restores_modules_when_live_options_point_elsewhere() {
+        let record = crate::database::ImageRecord {
+            id: 7,
+            filepath: "/lib/a.png".into(),
+            filename: "a.png".into(),
+            directory: "/lib".into(),
+            prompt: "a cat".into(),
+            negative_prompt: "blurry".into(),
+            steps: Some("20".into()),
+            sampler: Some("Euler".into()),
+            cfg_scale: Some("7".into()),
+            seed: Some("3".into()),
+            width: Some(64),
+            height: Some(64),
+            model_hash: None,
+            model_name: Some("Krea2Turbo_W4A8.safetensors".into()),
+            raw_metadata: "a\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 3, Module 1: krea2RealVae_v10, Module 2: qwen3-vl-4b-heretic_fp8_e4m3fn".into(),
+            is_favorite: false,
+            is_locked: false,
+            schedule_type: Some("karras".into()),
+            extra_params: Some({
+                let mut m = HashMap::new();
+                m.insert("Module 1".to_string(), "krea2RealVae_v10".to_string());
+                m.insert(
+                    "Module 2".to_string(),
+                    "qwen3-vl-4b-heretic_fp8_e4m3fn".to_string(),
+                );
+                m
+            }),
+            text_chunks: Some({
+                let mut m = HashMap::new();
+                m.insert("parameters".to_string(), "a\nSteps: 20".to_string());
+                m
+            }),
+        };
+        let params = GenerationParams::from_image_record(&record);
+        assert_eq!(params.prompt, "a cat");
+        assert_eq!(params.schedule_type.as_deref(), Some("karras"));
+        assert_eq!(
+            params.extra_params.get("Module 1").map(String::as_str),
+            Some("krea2RealVae_v10")
+        );
+        assert_eq!(params.text_chunks.len(), 1);
+        assert!(params.generation_type.is_some());
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        let mut opts = live_shaped_opts();
+        // Point the generic live key elsewhere; the preset key still holds the
+        // image's real modules, so restore must win over the generic fallback.
+        opts["forge_additional_modules"] =
+            serde_json::json!("/other/unrelated_a.safetensors /other/unrelated_b.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/krea2RealVae_v10.safetensors",
+                "/models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors"
+            ]),
+            "image modules must win over live options pointing elsewhere"
+        );
+    }
+
+    #[test]
+    fn classifier_2512_without_qwen_anchor_does_not_map_to_qwen21() {
+        let opts = live_shaped_opts();
+        let mut payload = payload_for("run_2512_steps.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "run_2512_steps.safetensors",
+            &opts,
+            None,
+        );
+        let ov = payload.override_settings.unwrap();
+        // run_2512_steps has no model anchor and no qwen context: must not
+        // receive the qwen21 preset modules.
+        let modules = ov
+            .get("forge_additional_modules")
+            .cloned()
+            .unwrap_or_default();
+        assert_ne!(
+            modules,
+            serde_json::json!([
+                "/models/vae/qwen_vae.safetensors",
+                "/models/llm/qwen21_text.safetensors"
+            ]),
+            "bare 2512 must not map to qwen21"
+        );
+    }
+
+    #[test]
+    fn stem_tie_fails_closed_to_live_fallback() {
+        let opts = serde_json::json!({
+            "forge_preset": "krea",
+            "forge_checkpoint_krea": "Krea2Turbo.safetensors",
+            "forge_additional_modules_krea": ["/a/foo_fp8.safetensors", "/b/foo_bf16.safetensors"],
+        });
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "foo".to_string());
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        let mut payload = payload_for("Krea2Turbo.safetensors");
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        // Two stem-only candidates tie: must fall back to normalized live list,
+        // not a first-hit guess of one precision variant.
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!(["/a/foo_fp8.safetensors", "/b/foo_bf16.safetensors"])
+        );
+    }
+
+    #[test]
+    fn empty_caller_modules_are_treated_as_absent() {
+        let opts = live_shaped_opts();
+        // Empty caller array must not block image restore.
+        let mut payload = payload_for("Krea2Turbo_W4A8.safetensors");
+        payload.override_settings = Some(serde_json::json!({
+            "sd_model_checkpoint": "Krea2Turbo_W4A8.safetensors",
+            "forge_additional_modules": [],
+        }));
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "krea2RealVae_v10".to_string());
+        extra.insert(
+            "Module 2".to_string(),
+            "qwen3-vl-4b-heretic_fp8_e4m3fn".to_string(),
+        );
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        super::enrich_override_settings_from_forge_options(
+            &mut payload,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            Some(&params),
+        );
+        let ov = payload.override_settings.unwrap();
+        assert_eq!(
+            ov.get("forge_additional_modules").unwrap(),
+            &serde_json::json!([
+                "/models/vae/krea2RealVae_v10.safetensors",
+                "/models/llm/qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors"
+            ]),
+            "empty caller array must not suppress restore"
+        );
+        // Empty caller array with no source must fall back to live options.
+        let mut payload2 = payload_for("Krea2Turbo_W4A8.safetensors");
+        payload2.override_settings = Some(serde_json::json!({
+            "sd_model_checkpoint": "Krea2Turbo_W4A8.safetensors",
+            "forge_additional_modules": [],
+        }));
+        super::enrich_override_settings_from_forge_options(
+            &mut payload2,
+            "Krea2Turbo_W4A8.safetensors",
+            &opts,
+            None,
+        );
+        let ov2 = payload2.override_settings.unwrap();
+        assert!(
+            ov2.get("forge_additional_modules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty()),
+            "empty caller array must fall back to live modules, got {:?}",
+            ov2.get("forge_additional_modules")
+        );
+    }
+
+    #[test]
+    fn space_containing_live_path_is_not_split_into_bogus_entries() {
+        let raw = serde_json::json!("C:\\My Models\\vae.safetensors");
+        let normalized = super::normalize_modules_value(&raw);
+        let arr = normalized.as_array().expect("array");
+        assert!(
+            !arr.iter().any(|v| v.as_str() == Some("C:\\My")),
+            "space-joined split must not emit bogus fragment {:?}",
+            arr
+        );
+        // Array input with empty/invalid entries is filtered too.
+        let raw_arr = serde_json::json!(["", "   ", "/a/vae.safetensors", "not-a-module"]);
+        let normalized_arr = super::normalize_modules_value(&raw_arr);
+        assert_eq!(
+            normalized_arr,
+            serde_json::json!(["/a/vae.safetensors"]),
+            "invalid/empty entries must be dropped"
+        );
+    }
+
+    #[test]
+    fn spaced_existing_file_path_is_preserved_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "forge spaced modules {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create spaced temp dir");
+        let file_path = dir.join("vae model.safetensors");
+        std::fs::write(&file_path, b"stub").expect("write spaced temp file");
+        let path_str = file_path.to_string_lossy().to_string();
+        let normalized = super::normalize_modules_value(&serde_json::json!(path_str));
+        assert_eq!(
+            normalized,
+            serde_json::json!([path_str]),
+            "existing spaced path must be preserved whole"
+        );
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn collect_image_modules_accepts_forge_additional_modules_keys() {
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "krea2RealVae_v10".to_string());
+        extra.insert(
+            "Forge additional modules".to_string(),
+            "extra_a.safetensors, extra_b.safetensors".to_string(),
+        );
+        let params = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        let modules = super::collect_image_modules(Some(&params));
+        assert!(modules.contains(&"krea2RealVae_v10".to_string()));
+        assert!(modules.contains(&"extra_a.safetensors".to_string()));
+        assert!(modules.contains(&"extra_b.safetensors".to_string()));
+
+        let mut extra_json = HashMap::new();
+        extra_json.insert(
+            "additional modules".to_string(),
+            r#"["j1.safetensors", "j2.safetensors"]"#.to_string(),
+        );
+        let params_json = GenerationParams {
+            prompt: "a".to_string(),
+            extra_params: extra_json,
+            raw_metadata: "a".to_string(),
+            ..Default::default()
+        };
+        let modules_json = super::collect_image_modules(Some(&params_json));
+        assert_eq!(
+            modules_json,
+            vec!["j1.safetensors".to_string(), "j2.safetensors".to_string()]
+        );
     }
 }

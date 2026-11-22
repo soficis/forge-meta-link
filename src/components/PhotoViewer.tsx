@@ -26,6 +26,7 @@ import { PromptLibraryDialog } from "./PromptLibraryDialog";
 import { useRunOncePerActivation } from "../hooks/useRunOncePerActivation";
 import { shouldPopulateForgeOverrides } from "../utils/forgeOverridesGuard";
 import { REJECTED_SCHEDULERS } from "../utils/mutations";
+import { parseScheduleType } from "../utils/metadata";
 import {
     copyJpegImageToClipboard,
     copyCompressedImageForDiscord,
@@ -291,7 +292,9 @@ function createForgeOverrides(
         negative_prompt: detail?.negative_prompt ?? "",
         steps: detail?.steps ?? "",
         sampler_name: detail?.sampler ?? "",
-        scheduler: "",
+        // Prefer the structured field; older details only carry the schedule in raw_metadata.
+        // Never infer it from the gallery filename.
+        scheduler: detail?.schedule_type ?? parseScheduleType(detail?.raw_metadata) ?? "",
         cfg_scale: detail?.cfg_scale ?? "",
         seed: detail?.seed ?? image.seed ?? "",
         width: String(detail?.width ?? image.width ?? ""),
@@ -537,6 +540,13 @@ export function PhotoViewer({
         const entries: [string, string][] = [];
         if (detail?.steps) entries.push(["Steps", detail.steps]);
         if (detail?.sampler) entries.push(["Sampler", detail.sampler]);
+        // The structured field wins when present; older details only carry the
+        // schedule in raw_metadata. Never infer it from the filename.
+        const detailedSchedule = (
+            detail as unknown as { schedule_type?: string | null } | null
+        )?.schedule_type?.trim();
+        const schedule = detailedSchedule || parseScheduleType(detail?.raw_metadata);
+        if (schedule) entries.push(["Scheduler", schedule]);
         if (detail?.cfg_scale) entries.push(["CFG Scale", detail.cfg_scale]);
 
         const seed = detail?.seed ?? currentImage.seed;
@@ -549,8 +559,8 @@ export function PhotoViewer({
         }
 
         const modelName = detail?.model_name ?? currentImage.model_name;
-        if (modelName) entries.push(["Model", modelName]);
-        if (detail?.model_hash) entries.push(["Model Hash", detail.model_hash]);
+        if (modelName) entries.push(["Checkpoint", modelName]);
+        if (detail?.model_hash) entries.push(["Checkpoint Hash", detail.model_hash]);
         return entries;
     }, [currentDetail, currentImage]);
 
@@ -2732,7 +2742,7 @@ export function PhotoViewer({
                                                             updateForgeOverride("scheduler", event.target.value)
                                                         }
                                                     >
-                                                        <option value="">Scheduler (auto/default)</option>
+                                                        <option value="">Scheduler</option>
                                                         {schedulerDropdownOptions.map((scheduler) => (
                                                             <option key={scheduler} value={scheduler}>
                                                                 {scheduler}
@@ -2907,10 +2917,10 @@ export function PhotoViewer({
                                             className="viewer-collapsible-section"
                                         >
                                             <summary className="viewer-section-summary">
-                                                <span className="viewer-summary-title">Model &amp; LoRA</span>
+                                                <span className="viewer-summary-title">Checkpoint &amp; LoRA</span>
                                             </summary>
                                             <div className="viewer-section-content">
-                                                <div className="viewer-form-label">Model Checkpoint</div>
+                                                <div className="viewer-form-label">Checkpoint</div>
                                                 <label className="viewer-toggle-row" style={{ margin: "2px 0 6px 0", fontSize: "12px" }}>
                                                     <input
                                                         type="checkbox"
@@ -2939,7 +2949,7 @@ export function PhotoViewer({
                                                         }
                                                     }}
                                                 >
-                                                    <option value="">Model checkpoint (none/default)</option>
+                                                    <option value="">Checkpoint (none/default)</option>
                                                     {familyCompatibleModelOptions.map((model) => (
                                                         <option key={model} value={model}>
                                                             {model}
@@ -2951,7 +2961,7 @@ export function PhotoViewer({
                                                         forgeOverrides.model_name
                                                     ) && (
                                                         <div className="photo-viewer-note">
-                                                            Current image model is not in detected checkpoint scan.
+                                                            Current image checkpoint is not in the detected checkpoint scan.
                                                         </div>
                                                     )}
                                                 <div className="viewer-forge-folders">
@@ -3446,7 +3456,7 @@ export function PhotoViewer({
                                                                                     )}
                                                                                     {(node.sampler || node.scheduler || node.model_name) && (
                                                                                         <div data-testid="ghost-detail-model">
-                                                                                            <strong>Model &amp; Sampler:</strong> {[node.model_name, node.sampler, node.scheduler].filter(Boolean).join(" · ")}
+                                                                                            <strong>Checkpoint &amp; Sampler:</strong> {[node.model_name, node.sampler, node.scheduler].filter(Boolean).join(" · ")}
                                                                                         </div>
                                                                                     )}
                                                                                     {(hasSeed || hasCfg || hasSteps) && (

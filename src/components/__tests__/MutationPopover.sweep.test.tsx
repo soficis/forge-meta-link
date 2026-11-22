@@ -25,6 +25,9 @@ const details = (over: Partial<ImageRecord> = {}): ImageRecord => ({
     steps: "20",
     sampler: "Euler a",
     cfg_scale: "5.5",
+    schedule_type: "Exponential",
+    extra_params: {},
+    text_chunks: null,
     model_hash: "abc",
     raw_metadata: "a lighthouse\nSteps: 20, Sampler: Euler a, Schedule type: Exponential, CFG scale: 5.5, Seed: 100",
     ...over,
@@ -68,6 +71,8 @@ const sent = () =>
 
 beforeEach(() => {
     sendResult = () => ({ ok: true, message: "ok", output_dir: "/out", generated_count: 1, saved_paths: [], children: [] });
+    // MutationPopover now restores its last-used selection on mount; keep tests independent.
+    localStorage.removeItem("fml.mutationSweep.selection");
 });
 
 describe("MutationPopover sweep", () => {

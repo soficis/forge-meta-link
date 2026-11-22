@@ -19,6 +19,10 @@ export interface ImageRecord extends GalleryImageRecord {
     negative_prompt: string;
     steps: string | null;
     sampler: string | null;
+    schedule_type: string | null;
+    extra_params: Record<string, string> | null;
+    /** All PNG tEXt/zTXt/iTXt chunks exposed by the backend, not just the primary `parameters` chunk. */
+    text_chunks: Record<string, string> | null;
     cfg_scale: string | null;
     model_hash: string | null;
     raw_metadata: string;
@@ -297,3 +301,5 @@ export interface PromptTagCount {
     tag: string;
     count: number;
 }
+
+export type { AssetReport, AssetStatus } from "./assets";

@@ -1011,9 +1011,16 @@ async fn send_payload_and_save(
     output_dir: &Path,
     source_filename: &str,
     variant_label: Option<&str>,
+    source: Option<&parser::GenerationParams>,
 ) -> Result<Vec<String>, String> {
     let mut enriched_payload = payload.clone();
-    forge_api::enrich_payload_for_forge_neo(&mut enriched_payload, base_url, api_key).await;
+    forge_api::enrich_payload_for_forge_neo_with_source(
+        &mut enriched_payload,
+        base_url,
+        api_key,
+        source,
+    )
+    .await;
 
     let api_result = forge_api::send_to_forge(&enriched_payload, base_url, api_key)
         .await
@@ -1042,6 +1049,7 @@ async fn send_image_record_to_forge(
     let mut failures = Vec::new();
     let mut unprocessed_count = 0usize;
     let mut processed_count = 0usize;
+    let source_params = parser::GenerationParams::from_image_record(image);
 
     if context.adetailer_face_enabled {
         let mut unprocessed_payload = build_payload_for_image(
@@ -1062,6 +1070,7 @@ async fn send_image_record_to_forge(
             context.output_dir,
             &image.filename,
             Some("unprocessed"),
+            Some(&source_params),
         )
         .await
         {
@@ -1104,6 +1113,7 @@ async fn send_image_record_to_forge(
         context.output_dir,
         &image.filename,
         processed_variant,
+        Some(&source_params),
     )
     .await
     {
@@ -1290,8 +1300,8 @@ fn ingest_children_blocking(
             Err(_) => (0, 0),
         };
 
-        let raw_metadata = extract_parameters_metadata(&path, None);
-        let params = if raw_metadata.trim().is_empty() {
+        let (raw_metadata, text_chunks) = extract_parameters_with_chunks(&path, None);
+        let mut params = if raw_metadata.trim().is_empty() {
             parser::GenerationParams {
                 raw_metadata: String::new(),
                 ..Default::default()
@@ -1299,6 +1309,7 @@ fn ingest_children_blocking(
         } else {
             parser::parse_generation_metadata(&raw_metadata)
         };
+        params.text_chunks = text_chunks;
         let mut tags = parser::extract_tags(&params.prompt);
         if let Some(sidecar_data) = sidecar::read_sidecar(&path) {
             tags.extend(sidecar_data.tags);
@@ -1581,6 +1592,61 @@ mod ingest_outcome_tests {
         assert_eq!(edge_count(&rig), 0, "parent id 0 means no edge");
         let _ = std::fs::remove_dir_all(&rig.dir);
     }
+
+    fn png_with_chunks(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        for (key, value) in pairs {
+            let mut data = Vec::new();
+            data.extend_from_slice(key.as_bytes());
+            data.push(0);
+            data.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(b"tEXt");
+            out.extend_from_slice(&data);
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        // IEND
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn ingest_persists_secondary_text_chunk() {
+        let rig = rig();
+        let path = rig.dir.join("child.png");
+        let primary = "a picture\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 3";
+        let secondary = "secondary-metadata-payload";
+        std::fs::write(
+            &path,
+            png_with_chunks(&[("parameters", primary), ("comment", secondary)]),
+        )
+        .unwrap();
+        let outcome = run(&rig, &[child(&path, 0)]);
+        assert_eq!(outcome.ingested, 1);
+        let conn = rig.db.pool_get_for_test().unwrap();
+        let chunks_json: Option<String> = conn
+            .query_row(
+                "SELECT text_chunks FROM images WHERE filepath = ?1",
+                [path.to_string_lossy().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let raw = chunks_json.unwrap_or_default();
+        let map: std::collections::HashMap<String, String> =
+            serde_json::from_str(&raw).unwrap_or_default();
+        assert_eq!(
+            map.get("comment").map(String::as_str),
+            Some(secondary),
+            "secondary chunk must survive ingest, got {raw}"
+        );
+        assert_eq!(
+            map.get("parameters").map(String::as_str),
+            Some(primary)
+        );
+        let _ = std::fs::remove_dir_all(&rig.dir);
+    }
 }
 
 /// Appends an ingest warning to a result message.
@@ -1835,6 +1901,7 @@ pub async fn forge_requeue_image(
         model_name: image.model_name.clone(),
         generation_type: None,
         extra_params: stored.extra_params,
+        text_chunks: image.text_chunks.clone().unwrap_or_default(),
         raw_metadata: image.raw_metadata.clone(),
     };
     let api_result = forge_api::forge_requeue_image(

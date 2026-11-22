@@ -113,10 +113,10 @@ export function toCompareMetadata(
     const seed = detail?.seed ?? gallery.seed ?? null;
     const cfg = detail?.cfg_scale ?? null;
     const sampler = detail?.sampler ?? null;
-    // schedule_type lives in ImageRecord via raw_metadata parsing? But ImageRecord
-    // doesn't expose schedule_type directly. We parse from raw_metadata if needed.
-    // For now, try to parse from raw or detail extra.
-    const schedule = parseScheduleType(detail?.raw_metadata ?? gallery.filename) ?? null;
+    // Prefer the structured field; older details only carry the schedule in raw_metadata.
+    // The gallery filename is never a source for the scheduler.
+    const schedule =
+        detail?.schedule_type?.trim() || parseScheduleType(detail?.raw_metadata) || null;
 
     const modelName = detail?.model_name ?? gallery.model_name ?? null;
     const modelHash = detail?.model_hash ?? null;

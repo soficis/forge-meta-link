@@ -1,10 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { DeleteMode, ImageExportFormat } from "../types/metadata";
 import type { ShowToastOptions } from "../hooks/useToast";
 import type { ForgeSettings } from "../hooks/useForgeSettings";
-import { getForgeUrlError } from "../utils/forgeUrl";
 import { buildLoraWeightMap } from "../utils/forgeSendOptions";
-import { ForgeRequeueButton } from "./ForgeRequeueButton";
+import { BatchReconciliationSheet } from "./BatchReconciliationSheet";
 
 interface SelectionActionBarProps {
     selectedCount: number;
@@ -60,8 +59,9 @@ export function SelectionActionBar({
     const [exportFormat, setExportFormat] = useState<ImageExportFormat>("original");
     const [exportQuality, setExportQuality] = useState(85);
     const [randomSeedBatch, setRandomSeedBatch] = useState(false);
+    const [isReconciliationOpen, setIsReconciliationOpen] = useState(false);
+    const sendButtonRef = useRef<HTMLButtonElement>(null);
     const showQualitySlider = exportFormat === "jpeg" || exportFormat === "webp";
-    const forgeUrlError = getForgeUrlError(forge.forgeBaseUrl);
     const parsedLoraWeight = forge.forgeLoraWeight.trim() ? Number(forge.forgeLoraWeight) : null;
     const selectedLoraWeights = buildLoraWeightMap(forge.forgeSelectedLoras, forge.forgeLoraWeights);
 
@@ -70,6 +70,7 @@ export function SelectionActionBar({
     }
 
     return (
+        <>
         <div className="selection-bar" role="toolbar" aria-label={`Actions for ${selectedCount} selected images`}>
             <span className="selection-bar-count" aria-live="polite">
                 {selectedCount.toLocaleString()} selected
@@ -172,34 +173,16 @@ export function SelectionActionBar({
                     🎲 Random Seed
                 </button>
 
-                <ForgeRequeueButton
-                    imageIds={selectedImageIds}
-                    baseUrl={forge.forgeBaseUrl}
-                    apiKey={forge.forgeApiKey}
-                    outputDir={forge.forgeOutputDir.trim() ? forge.forgeOutputDir : null}
-                    includeSeed={randomSeedBatch ? true : forge.forgeIncludeSeed}
-                    overrides={randomSeedBatch ? { seed: "-1" } : undefined}
-                    adetailerEnabled={forge.forgeAdetailerFaceEnabled}
-                    adetailerModel={forge.forgeAdetailerFaceModel.trim() ? forge.forgeAdetailerFaceModel : null}
-                    loraTokens={forge.forgeSelectedLoras.length > 0 ? forge.forgeSelectedLoras : null}
-                    loraWeight={parsedLoraWeight}
-                    loraWeights={selectedLoraWeights}
-                    saveForgeCopy={forge.forgeSaveCopy}
-                    disabled={isBusy || forgeUrlError != null}
-                    validate={() => {
-                        if (
-                            parsedLoraWeight != null &&
-                            (!Number.isFinite(parsedLoraWeight) || parsedLoraWeight < 0 || parsedLoraWeight > 2)
-                        ) {
-                            return "LoRA weight must be between 0 and 2 before sending to Forge.";
-                        }
-                        return null;
-                    }}
-                    onQueued={(_queueId, result) => onShowToast(result.message, { tone: "success" })}
-                    onError={(message) => onShowToast(message, { tone: "error" })}
-                    label="Send to Forge"
+                <button
+                    ref={sendButtonRef}
+                    type="button"
                     className="selection-bar-button"
-                />
+                    disabled={isBusy}
+                    title="Review what each image will send before queuing to Forge"
+                    onClick={() => setIsReconciliationOpen(true)}
+                >
+                    Send to Forge
+                </button>
             </div>
 
             <div className="selection-bar-group selection-bar-danger-zone" role="group" aria-label="Delete">
@@ -232,5 +215,28 @@ export function SelectionActionBar({
                 </details>
             </div>
         </div>
+        {isReconciliationOpen ? (
+            <BatchReconciliationSheet
+                imageIds={selectedImageIds}
+                baseUrl={forge.forgeBaseUrl}
+                apiKey={forge.forgeApiKey}
+                outputDir={forge.forgeOutputDir.trim() ? forge.forgeOutputDir : null}
+                includeSeed={randomSeedBatch || !forge.forgeIncludeSeed}
+                overrides={randomSeedBatch ? { seed: "-1" } : undefined}
+                adetailerEnabled={forge.forgeAdetailerFaceEnabled}
+                adetailerModel={forge.forgeAdetailerFaceModel.trim() ? forge.forgeAdetailerFaceModel : null}
+                loraTokens={forge.forgeSelectedLoras.length > 0 ? forge.forgeSelectedLoras : null}
+                loraWeight={parsedLoraWeight}
+                loraWeights={selectedLoraWeights}
+                saveForgeCopy={forge.forgeSaveCopy}
+                onQueued={(_queueId, result) => onShowToast(result.message, { tone: "success" })}
+                onError={(message) => onShowToast(message, { tone: "error" })}
+                onClose={() => {
+                    setIsReconciliationOpen(false);
+                    sendButtonRef.current?.focus();
+                }}
+            />
+        ) : null}
+        </>
     );
 }

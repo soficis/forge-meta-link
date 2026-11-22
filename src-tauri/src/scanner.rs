@@ -21,6 +21,10 @@ const PNG_READER_CAPACITY: usize = 128 * 1024;
 const QUICK_HASH_SAMPLE_BYTES: usize = 64 * 1024;
 pub const MAX_TEXT_CHUNK_BYTES: u32 = 16 * 1024 * 1024; // 16 MiB
 pub const MAX_DECOMPRESSED_TEXT_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+/// Cumulative cap across all text chunks in one file, plus a chunk-count cap.
+/// A hostile PNG with many near-16 MiB chunks must not stage hundreds of MB per row.
+pub const MAX_TOTAL_TEXT_CHUNKS_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+pub const MAX_TEXT_CHUNK_COUNT: usize = 64;
 const PRIMARY_METADATA_KEYS: &[&str] = &[
     "parameters",
     "Parameters",
@@ -67,6 +71,7 @@ pub fn extract_text_chunks(
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(PNG_READER_CAPACITY, file);
     let mut text_chunks = HashMap::new();
+    let mut total_bytes: usize = 0;
 
     // Verify PNG signature
     let mut sig = [0u8; 8];
@@ -110,6 +115,14 @@ pub fn extract_text_chunks(
                 };
 
                 if let Some((key, value)) = maybe_pair {
+                    if text_chunks.len() >= MAX_TEXT_CHUNK_COUNT {
+                        break;
+                    }
+                    let entry_bytes = key.len().saturating_add(value.len());
+                    if total_bytes.saturating_add(entry_bytes) > MAX_TOTAL_TEXT_CHUNKS_BYTES {
+                        break;
+                    }
+                    total_bytes = total_bytes.saturating_add(entry_bytes);
                     text_chunks.insert(key, value);
                 }
             }
@@ -131,11 +144,23 @@ pub fn extract_text_chunks(
 
 /// Extracts the best available metadata payload from PNG text chunks.
 pub fn extract_metadata(path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    Ok(extract_metadata_with_chunks(path)?.0)
+}
+
+/// The selected primary metadata string plus every PNG text chunk, keyed by keyword.
+type MetadataWithChunks = (Option<String>, HashMap<String, String>);
+
+/// Returns BOTH the selected primary metadata string and the full chunk map.
+/// Keeps `extract_text_chunks` and `extract_metadata` working for existing callers.
+pub fn extract_metadata_with_chunks(
+    path: &Path,
+) -> Result<MetadataWithChunks, Box<dyn std::error::Error>> {
     if !supports_png_metadata(path) {
-        return Ok(None);
+        return Ok((None, HashMap::new()));
     }
     let chunks = extract_text_chunks(path)?;
-    Ok(select_primary_metadata(&chunks))
+    let primary = select_primary_metadata(&chunks);
+    Ok((primary, chunks))
 }
 
 fn supports_png_metadata(path: &Path) -> bool {
@@ -672,6 +697,56 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_metadata_with_chunks_returns_primary_and_full_map() {
+        // Multi-chunk PNG: primary `parameters` (tEXt) plus zTXt + iTXt siblings.
+        let primary = "a\nSteps: 1, Sampler: Euler, CFG scale: 1.0, Seed: 3";
+        let mut text_data = b"parameters\0".to_vec();
+        text_data.extend_from_slice(primary.as_bytes());
+
+        let mut ztxt_data = b"comment\0".to_vec();
+        ztxt_data.push(0);
+        let mut z_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        z_encoder
+            .write_all(b"sidecar ztxt")
+            .expect("failed to write ztxt payload");
+        ztxt_data.extend_from_slice(&z_encoder.finish().expect("failed to finish ztxt payload"));
+
+        let mut itxt_data = b"description\0".to_vec();
+        itxt_data.push(0); // uncompressed
+        itxt_data.push(0);
+        itxt_data.push(0);
+        itxt_data.push(0);
+        itxt_data.extend_from_slice(b"sidecar itxt");
+
+        let png_bytes = build_test_png(vec![
+            (*b"tEXt", text_data),
+            (*b"zTXt", ztxt_data),
+            (*b"iTXt", itxt_data),
+        ]);
+        let path = write_temp_png(&png_bytes);
+
+        let (selected, chunks) =
+            extract_metadata_with_chunks(&path).expect("chunk extraction failed");
+        assert_eq!(selected.as_deref(), Some(primary));
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.get("parameters").map(String::as_str), Some(primary));
+        assert_eq!(
+            chunks.get("comment").map(String::as_str),
+            Some("sidecar ztxt")
+        );
+        assert_eq!(
+            chunks.get("description").map(String::as_str),
+            Some("sidecar itxt")
+        );
+
+        // Primary selection is unaffected: legacy helper returns the same string.
+        let legacy = extract_metadata(&path).expect("metadata extraction failed");
+        assert_eq!(legacy, selected);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn test_extracts_parameters_from_text_chunk() {
         let metadata = "Steps: 20, Sampler: Euler";
         let mut text_data = b"parameters\0".to_vec();
@@ -849,5 +924,79 @@ mod tests {
             parsed.is_none(),
             "zTXt bomb exceeding MAX_DECOMPRESSED_TEXT_BYTES must return None"
         );
+    }
+
+    #[test]
+    fn test_metadata_with_chunks_returns_primary_and_full_map() {
+        let primary = "a\nSteps: 1, Sampler: Euler, CFG scale: 1.0, Seed: 3";
+        let mut text_data = b"parameters\0".to_vec();
+        text_data.extend_from_slice(primary.as_bytes());
+
+        let ztxt_payload = "a much longer ztxt comment payload that must not win primary selection";
+        let mut ztxt_data = b"comment\0".to_vec();
+        ztxt_data.push(0);
+        let mut z_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        z_encoder.write_all(ztxt_payload.as_bytes()).unwrap();
+        ztxt_data.extend_from_slice(&z_encoder.finish().unwrap());
+
+        let itxt_payload = "itxt description payload, also longer than primary";
+        let mut itxt_data = b"description\0".to_vec();
+        itxt_data.extend(vec![0, 0, 0, 0]);
+        itxt_data.extend_from_slice(itxt_payload.as_bytes());
+
+        let png_bytes = build_test_png(vec![
+            (*b"tEXt", text_data),
+            (*b"zTXt", ztxt_data),
+            (*b"iTXt", itxt_data),
+        ]);
+        let path = write_temp_png(&png_bytes);
+
+        let (selected, chunks) = extract_metadata_with_chunks(&path).expect("helper must succeed");
+        assert_eq!(selected.as_deref(), Some(primary));
+        assert_eq!(chunks.get("parameters").map(String::as_str), Some(primary));
+        assert_eq!(
+            chunks.get("comment").map(String::as_str),
+            Some(ztxt_payload)
+        );
+        assert_eq!(
+            chunks.get("description").map(String::as_str),
+            Some(itxt_payload)
+        );
+
+        // Legacy entry points keep working: full map + primary selection.
+        let legacy_chunks = extract_text_chunks(&path).expect("legacy chunks");
+        assert_eq!(legacy_chunks, chunks);
+        let legacy_primary = extract_metadata(&path).expect("legacy primary");
+        assert_eq!(legacy_primary, selected);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_many_large_chunks_stay_bounded() {
+        // 100 chunks x ~200 KiB each would be ~20 MiB unbounded; the cumulative
+        // 16 MiB / 64-chunk caps must keep the persisted map bounded.
+        let big_value = "x".repeat(200 * 1024);
+        let mut chunks_in: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        for i in 0..100 {
+            let mut data = format!("k{:03}\0", i).into_bytes();
+            data.extend_from_slice(big_value.as_bytes());
+            chunks_in.push((*b"tEXt", data));
+        }
+        let png_bytes = build_test_png(chunks_in);
+        let path = write_temp_png(&png_bytes);
+        let chunks = extract_text_chunks(&path).expect("chunk extraction failed");
+        let total: usize = chunks.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert!(
+            chunks.len() <= super::MAX_TEXT_CHUNK_COUNT,
+            "chunk count must be capped, got {}",
+            chunks.len()
+        );
+        assert!(
+            total <= super::MAX_TOTAL_TEXT_CHUNKS_BYTES,
+            "total bytes must stay bounded, got {}",
+            total
+        );
+        let _ = fs::remove_file(path);
     }
 }

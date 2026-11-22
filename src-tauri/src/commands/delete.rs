@@ -246,7 +246,9 @@ fn resolve_move_destination_path(
 
 /// Deletes image files from disk and removes corresponding DB rows.
 ///
-/// Images that fail to delete on disk are left in the database.
+/// The DB cull runs first and its lock guard is authoritative: only ids it
+/// actually culled may have files removed. A culled row whose file deletion
+/// then fails leaves an orphan file on disk (recoverable).
 pub fn delete_images_sync(
     request: DeleteImagesRequest,
     db: &crate::database::Database,
@@ -308,33 +310,132 @@ pub fn delete_images_sync(
         }
     }
 
-    // Determine unshared stems: if no other indexed image in DB shares the stem, sidecars can be removed
-    let mut batch_stem_counts = std::collections::HashMap::<(String, String), usize>::new();
-    for record in &candidate_records {
-        if let Some(stem) = Path::new(&record.filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            let stem_key = if cfg!(windows) {
-                stem.to_lowercase()
-            } else {
-                stem.to_string()
-            };
-            *batch_stem_counts
-                .entry((record.directory.clone(), stem_key))
-                .or_insert(0) += 1;
+    // Re-resolve locks inside the same operation before touching the filesystem:
+    // a lock set after the first resolution must still block deletion so the
+    // file survives and the id is reported as protected, not deleted.
+    {
+        let candidate_ids: Vec<i64> = candidate_records.iter().map(|r| r.id).collect();
+        if !candidate_ids.is_empty() {
+            if let Ok(fresh) = db.get_images_by_ids(&candidate_ids) {
+                let locked_now: std::collections::HashSet<i64> = fresh
+                    .iter()
+                    .filter(|r| r.is_locked)
+                    .map(|r| r.id)
+                    .collect();
+                if !locked_now.is_empty() {
+                    candidate_records.retain(|r| !locked_now.contains(&r.id));
+                    for id in locked_now {
+                        if !blocked_protected_ids.contains(&id) {
+                            blocked_protected_ids.push(id);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    let mut stem_is_unshared = std::collections::HashMap::<(String, String), bool>::new();
-    for ((dir, stem_key), &batch_count) in &batch_stem_counts {
-        let total_db_count = db.count_images_with_stem(dir, stem_key).unwrap_or(usize::MAX);
-        stem_is_unshared.insert((dir.clone(), stem_key.clone()), total_db_count <= batch_count);
+    let cull_mode = match request.mode {
+        DeleteMode::Permanent => crate::database::CullMode::Permanent,
+        DeleteMode::Trash => crate::database::CullMode::Trash,
+    };
+
+    let candidate_ids: Vec<i64> = candidate_records.iter().map(|r| r.id).collect();
+    let candidate_filepaths: std::collections::HashMap<i64, String> = candidate_records
+        .iter()
+        .map(|r| (r.id, r.filepath.clone()))
+        .collect();
+
+    // Decide the DB cull BEFORE touching the filesystem: the final lock guard
+    // inside `cull_images_with_blocked` is authoritative. Only ids it actually
+    // culled may have files/sidecars/thumbnails removed. A lock that lands
+    // after the re-resolve above is reported as protected here and its file
+    // is never touched.
+    //
+    // Tradeoff accepted here: a culled row whose file deletion then fails
+    // leaves an orphan file on disk (recoverable by rescan) — this is
+    // preferable to destroying a protected image (unrecoverable). No attempt
+    // is made to restore from trash.
+    let (removed_from_db, cull_blocked, db_error): (usize, Vec<i64>, Option<String>) =
+        match db.cull_images_with_blocked(&candidate_ids, cull_mode) {
+            Ok((count, blocked)) => (count, blocked, None),
+            Err(error) => {
+                log::error!("Failed to cull deleted images in database: {}", error);
+                let err_msg = format!("Database error culling rows: {}", error);
+                let paths = vec![err_msg.clone()];
+                return Ok(DeleteImagesResult {
+                    requested,
+                    removed_from_db: 0,
+                    deleted_ids: Vec::new(),
+                    deleted_files: 0,
+                    missing_files: 0,
+                    failed_files: 0,
+                    deleted_sidecars: 0,
+                    deleted_thumbnails: 0,
+                    blocked_protected: blocked_protected_ids.len(),
+                    blocked_protected_ids,
+                    failed_paths: paths,
+                    db_error: Some(err_msg),
+                });
+            }
+        };
+
+    let mut failed_paths = Vec::<String>::new();
+    if !cull_blocked.is_empty() {
+        for id in &cull_blocked {
+            if !blocked_protected_ids.contains(id) {
+                blocked_protected_ids.push(*id);
+            }
+        }
+        for id in &cull_blocked {
+            let path = candidate_filepaths
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| format!("<id {}>", id));
+            failed_paths.push(format!("{} (protected: locked before cull)", path));
+        }
     }
 
-    // Collect eligible sidecars for unshared stems
+    let cull_blocked_set: std::collections::HashSet<i64> =
+        cull_blocked.iter().copied().collect();
+    let culled_ids: Vec<i64> = candidate_ids
+        .iter()
+        .copied()
+        .filter(|id| !cull_blocked_set.contains(id))
+        .collect();
+    let culled_set: std::collections::HashSet<i64> = culled_ids.iter().copied().collect();
+    let culled_records: Vec<_> = candidate_records
+        .into_iter()
+        .filter(|r| culled_set.contains(&r.id))
+        .collect();
+
+    // Determine unshared stems AFTER the cull: a sidecar is eligible only if no
+    // live image remains with the same stem. Computed from culled records only
+    // so a sidecar shared with a blocked image (still live) is never eligible.
+    let mut stem_is_unshared = std::collections::HashMap::<(String, String), bool>::new();
+    {
+        let mut stems = std::collections::HashSet::<(String, String)>::new();
+        for record in &culled_records {
+            if let Some(stem) = Path::new(&record.filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                let stem_key = if cfg!(windows) {
+                    stem.to_lowercase()
+                } else {
+                    stem.to_string()
+                };
+                stems.insert((record.directory.clone(), stem_key));
+            }
+        }
+        for (dir, stem_key) in stems {
+            let live_remaining = db.count_images_with_stem(&dir, &stem_key).unwrap_or(usize::MAX);
+            stem_is_unshared.insert((dir, stem_key), live_remaining == 0);
+        }
+    }
+
+    // Collect eligible sidecars for unshared stems (culled only: never touch a blocked image's sidecar)
     let mut eligible_sidecars = std::collections::HashSet::<PathBuf>::new();
-    for record in &candidate_records {
+    for record in &culled_records {
         if let Some(stem) = Path::new(&record.filename)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -360,7 +461,6 @@ pub fn delete_images_sync(
     let mut missing_files = 0usize;
     let mut failed_files = 0usize;
     let mut deleted_sidecars = 0usize;
-    let mut failed_paths = Vec::<String>::new();
     let mut failed_source_paths = std::collections::HashSet::<PathBuf>::new();
     let mut deletable = Vec::<(i64, String)>::new();
 
@@ -368,7 +468,7 @@ pub fn delete_images_sync(
         let mut paths_to_trash = Vec::new();
         let mut existing_candidates = Vec::new();
 
-        for record in candidate_records {
+        for record in culled_records {
             let source_path = PathBuf::from(&record.filepath);
             if source_path.exists() {
                 paths_to_trash.push(source_path);
@@ -432,7 +532,7 @@ pub fn delete_images_sync(
             }
         }
     } else {
-        for record in candidate_records {
+        for record in culled_records {
             let source_path = PathBuf::from(&record.filepath);
             if source_path.exists() {
                 match std::fs::remove_file(&source_path) {
@@ -465,10 +565,10 @@ pub fn delete_images_sync(
     }
 
     let mut deleted_thumbnails = 0usize;
-    let deleted_ids: Vec<i64> = deletable.iter().map(|(id, _)| *id).collect();
 
     // Trash keeps the cached thumbnail so the culled image can still be shown as a ghost
     // ancestor in trace-back; Permanent removes it (the user chose to destroy the image).
+    // Restricted to culled ids only: never touch a blocked image's thumbnail.
     if matches!(request.mode, DeleteMode::Permanent) {
         for (_, filepath) in &deletable {
             let source_path = Path::new(filepath);
@@ -483,25 +583,10 @@ pub fn delete_images_sync(
         }
     }
 
-    let cull_mode = match request.mode {
-        DeleteMode::Permanent => crate::database::CullMode::Permanent,
-        DeleteMode::Trash => crate::database::CullMode::Trash,
-    };
-    let (removed_from_db, failed_paths, db_error) = match db.cull_images(&deleted_ids, cull_mode) {
-        Ok(count) => (count, failed_paths, None),
-        Err(error) => {
-            log::error!("Failed to cull deleted images in database: {}", error);
-            let mut paths = failed_paths;
-            let err_msg = format!("Database error culling rows: {}", error);
-            paths.push(err_msg.clone());
-            (0, paths, Some(err_msg))
-        }
-    };
-
     Ok(DeleteImagesResult {
         requested,
         removed_from_db,
-        deleted_ids,
+        deleted_ids: culled_ids,
         deleted_files,
         missing_files,
         failed_files,
@@ -601,6 +686,12 @@ pub fn move_images_to_directory_sync(
     let mut failed_paths = Vec::<String>::new();
 
     for record in records {
+        // Deletion protection applies to moves as well: a locked image must
+        // never be moved (see grime-inv-mov).
+        if record.is_locked {
+            failed_paths.push(format!("{} (protected: locked)", record.filepath));
+            continue;
+        }
         let source_path = PathBuf::from(&record.filepath);
         if !source_path.exists() {
             skipped_missing += 1;
@@ -618,6 +709,20 @@ pub fn move_images_to_directory_sync(
         if destination_path == source_path {
             skipped_same_directory += 1;
             continue;
+        }
+
+        // Re-resolve the live lock immediately before touching the filesystem:
+        // a lock set after the initial resolution must still block the move,
+        // mirroring the delete path's re-resolve. NULL counts as unlocked; a
+        // query failure or missing row falls through to the
+        // update_image_location check below.
+        match db.is_image_locked_live(record.id) {
+            Ok(true) => {
+                failed_paths.push(format!("{} (protected: locked)", record.filepath));
+                continue;
+            }
+            Ok(false) => {}
+            Err(_) => {}
         }
 
         if let Err(error) = move_file_with_fallback(&source_path, &destination_path) {
@@ -665,11 +770,8 @@ pub fn move_images_to_directory_sync(
                 }
             }
             Ok(false) => {
-                failed_paths.push(format!(
-                    "{} (database record missing during location update)",
-                    record.filepath
-                ));
-                let _ = move_file_with_fallback(&destination_path, &source_path);
+                let restore_error =
+                    move_file_with_fallback(&destination_path, &source_path).err();
                 move_known_sidecars(&destination_path, &source_path);
                 move_thumbnail_cache_file(
                     &destination_path,
@@ -677,6 +779,13 @@ pub fn move_images_to_directory_sync(
                     cache_dir,
                     thumbnail_index,
                 );
+                failed_paths.push(format!("{} (protected: locked)", record.filepath));
+                if let Some(error) = restore_error {
+                    failed_paths.push(format!(
+                        "{} (failed to restore after blocked move: {})",
+                        record.filepath, error
+                    ));
+                }
             }
             Err(error) => {
                 failed_paths.push(format!(
@@ -1057,12 +1166,12 @@ mod delete_tests {
             "delete_images_sync must return Ok even if DB delete fails"
         );
         let result = res.unwrap();
-        assert_eq!(result.deleted_files, 1);
+        assert_eq!(result.deleted_files, 0);
         assert_eq!(result.removed_from_db, 0);
-        assert_eq!(result.deleted_ids, vec![id_a]);
+        assert!(result.deleted_ids.is_empty());
         assert!(result.db_error.is_some());
         assert!(result.db_error.as_ref().unwrap().contains("forced test abort"));
-        assert!(!a_png.exists());
+        assert!(a_png.exists());
         assert!(!result.failed_paths.is_empty());
         assert!(result.failed_paths[0].contains("forced test abort"));
 
@@ -1130,5 +1239,68 @@ mod delete_tests {
         if cfg!(windows) {
             assert!(is_sidecar_source_failed(Path::new("/dir/PHOTO.json"), &failed));
         }
+    }
+
+    #[test]
+    fn test_move_images_blocks_lock_set_after_initial_resolve() {
+        let root = std::env::temp_dir().join(format!(
+            "fml_move_lock_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src_dir = root.join("src");
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let src_file = src_dir.join("move_me.png");
+        std::fs::write(&src_file, b"png bytes").unwrap();
+
+        let db = crate::database::Database::new(&root.join("t.db"), crate::StorageProfile::Hdd)
+            .unwrap();
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let thumbnail_index =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let failed = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
+        let id = insert_db_image(&db, &src_file);
+
+        // Stale snapshot analogue: resolve while unlocked, then lock lands.
+        let stale = db.get_images_by_ids(&[id]).unwrap();
+        assert!(!stale[0].is_locked);
+        db.set_image_locked(id, true).unwrap();
+        assert!(db.is_image_locked_live(id).unwrap());
+
+        let result = move_images_to_directory_sync(
+            MoveImagesRequest {
+                ids: vec![id],
+                destination_directory: dest_dir.to_string_lossy().to_string(),
+            },
+            &dest_dir,
+            &db,
+            &cache_dir,
+            &thumbnail_index,
+            &failed,
+        )
+        .unwrap();
+
+        assert_eq!(result.moved_files, 0);
+        assert!(result.moved_ids.is_empty());
+        assert_eq!(result.failed, 1);
+        assert!(
+            result.failed_paths.iter().any(|p| p.contains("(protected: locked)")),
+            "locked move must use the protected failure path: {:?}",
+            result.failed_paths
+        );
+        assert!(src_file.exists(), "locked file must not be moved");
+        assert!(
+            !dest_dir.join("move_me.png").exists(),
+            "locked file must not appear at the destination"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

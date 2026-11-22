@@ -31,6 +31,7 @@ import type {
     ImportPromptsResult,
     PromptTagCount,
 } from "../types/metadata";
+import type { AssetReport } from "../types/assets";
 
 // ── Directory Scanning ──────────────────────────────────────────────────
 
@@ -661,4 +662,18 @@ export async function exportPromptLibrary(outputPath: string): Promise<number> {
 
 export async function importPromptLibrary(inputPath: string): Promise<ImportPromptsResult> {
     return invoke<ImportPromptsResult>("import_prompt_library", { inputPath });
+}
+
+// ── Missing asset detector (Phase 3) ────────────────────────────────────
+
+export async function detectMissingAssets(
+    dirs: string[],
+    modelsDir?: string | null,
+    lorasDir?: string | null
+): Promise<AssetReport> {
+    return invoke<AssetReport>("detect_missing_assets", {
+        dirs,
+        modelsDir: modelsDir ?? null,
+        lorasDir: lorasDir ?? null,
+    });
 }

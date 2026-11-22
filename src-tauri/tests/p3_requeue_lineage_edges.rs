@@ -41,6 +41,7 @@ fn sample_record(filepath: &str, filename: &str) -> BulkRecord {
             model_name: Some("v1-5-pruned".to_string()),
             generation_type: Some("txt2img".to_string()),
             extra_params: HashMap::new(),
+            text_chunks: HashMap::new(),
             raw_metadata: "prompt text".to_string(),
         },
         file_mtime: Some(1700000000),
@@ -227,4 +228,54 @@ fn test_bulk_upsert_failure_rolls_back_entire_chunk() {
         )
         .unwrap();
     assert!(!edge_exists, "lineage edge must NOT exist after rollback");
+}
+
+#[test]
+fn test_lineage_cursor_sees_forge_child_parent_immediately() {
+    let db = test_db();
+
+    let parent_rec = sample_record("C:/test/ing_parent.png", "ing_parent.png");
+    db.bulk_upsert_with_tags(&[parent_rec]).unwrap();
+    let parent_id = db
+        .get_image_id_by_filepath("C:/test/ing_parent.png")
+        .unwrap()
+        .expect("parent found");
+
+    // Same bulk path `ingest_children_blocking` uses: stamp the edge in the
+    // same transaction as the image row.
+    let child_rec = sample_record("C:/test/ing_child.png", "ing_child.png");
+    let items = vec![BulkRecordWithLineage {
+        record: child_rec,
+        edge: Some(LineageEdgeRecord {
+            parent_id,
+            ops_json: Some(r#"{"ops":[]}"#.to_string()),
+            source: "forge_requeue".to_string(),
+        }),
+    }];
+    let inserted = db.bulk_upsert_with_lineage(&items).unwrap();
+    assert_eq!(inserted.len(), 1);
+
+    // The filepath cursor must resolve the id-keyed edge immediately.
+    let cursor = db.get_lineage_cursor("C:/test/ing_child.png").unwrap();
+    assert!(
+        !cursor.ancestors.is_empty(),
+        "freshly ingested Forge child must have a parent in the cursor"
+    );
+    assert_eq!(
+        cursor.ancestors[0].parent_filepath, "C:/test/ing_parent.png",
+        "edge must resolve parent filepath, got {:?}",
+        cursor.ancestors
+    );
+
+    // The "N edges" count must include lineage_edges stamps.
+    let total = db.get_total_lineage_edges().unwrap();
+    assert!(
+        total >= 1,
+        "edge count must include lineage_edges, got {total}"
+    );
+
+    // Trace uses the same edges-first reader.
+    let trace = db.get_lineage_trace(inserted[0]).unwrap();
+    assert_eq!(trace.nodes.len(), 2);
+    assert_eq!(trace.nodes[0].parent_id, Some(parent_id));
 }

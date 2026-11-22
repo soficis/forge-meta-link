@@ -5,6 +5,9 @@ use super::{
 use rusqlite::{params, params_from_iter, types::Value, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 
+/// `(parent_or_child_id, ops_json, source, created_at)` from `lineage_edges`.
+type LineageEdgeRow = (i64, Option<String>, String, i64);
+
 struct ChildRow {
     id: i64,
     filepath: String,
@@ -127,6 +130,95 @@ fn lineage_edge_from_row(row: &rusqlite::Row<'_>) -> SqlResult<LineageEdge> {
     })
 }
 
+/// Single `lineage_edges`-first reader shared by the trace walk and the
+/// filepath cursor. Returns `(parent_id, ops_json, source, created_at)` newest
+/// first. Resolving through ids (rather than filepaths) keeps freshly ingested
+/// Forge children linked even before any legacy heuristic row exists.
+fn lineage_edge_parents_for_child(
+    conn: &rusqlite::Connection,
+    child_id: i64,
+    limit: i64,
+) -> SqlResult<Vec<LineageEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT parent_id, ops_json, source, created_at
+         FROM lineage_edges
+         WHERE child_id = ?1
+         ORDER BY id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![child_id, limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn lineage_edge_children_for_parent(
+    conn: &rusqlite::Connection,
+    parent_id: i64,
+    limit: i64,
+) -> SqlResult<Vec<LineageEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT child_id, ops_json, source, created_at
+         FROM lineage_edges
+         WHERE parent_id = ?1
+         ORDER BY id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![parent_id, limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn filepath_for_image_id(conn: &rusqlite::Connection, id: i64) -> SqlResult<Option<String>> {
+    let mut stmt = conn.prepare("SELECT filepath FROM images WHERE id = ?1 LIMIT 1")?;
+    match stmt.query_row(params![id], |row| row.get::<_, String>(0)) {
+        Ok(fp) => Ok(Some(fp)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn image_id_for_filepath(conn: &rusqlite::Connection, filepath: &str) -> SqlResult<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM images WHERE filepath = ?1 LIMIT 1")?;
+    match stmt.query_row(params![filepath], |row| row.get::<_, i64>(0)) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_unlinked_override(
+    conn: &rusqlite::Connection,
+    child_filepath: &str,
+    parent_filepath: &str,
+) -> SqlResult<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lineage_overrides WHERE child_filepath = ?1 AND parent_filepath = ?2 AND action = 'unlink')",
+        params![child_filepath, parent_filepath],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 impl Database {
     /// Walks lineage ancestry from `image_id` upwards through `images` (including culled/ghost rows).
     /// Returns nodes with ghost status, ghost recipe, ops_json, and parameters.
@@ -143,14 +235,6 @@ impl Database {
             "SELECT id, filepath, filename, culled_at, ghost_recipe, seed, cfg_scale, steps, sampler, schedule_type, model_name, prompt
              FROM images
              WHERE id = ?1",
-        )?;
-
-        let mut edge_stmt = conn.prepare(
-            "SELECT parent_id, ops_json, source
-             FROM lineage_edges
-             WHERE child_id = ?1
-             ORDER BY id DESC
-             LIMIT 1",
         )?;
 
         let mut legacy_edge_stmt = conn.prepare(
@@ -257,18 +341,13 @@ impl Database {
                 }
             }
 
-            // Look for parent in lineage_edges
-            let edge_res = edge_stmt.query_row(params![curr_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            });
+            // Look for parent via the shared lineage_edges-first reader.
+            let edge_rows = lineage_edge_parents_for_child(&conn, curr_id, 1).unwrap_or_default();
+            let edge_res = edge_rows.into_iter().next();
 
             let (next_parent_id, ops_json, source) = match edge_res {
-                Ok((p_id, ops, src)) => (Some(p_id), ops, src),
-                Err(_) => {
+                Some((p_id, ops, src, _)) => (Some(p_id), ops, src),
+                None => {
                     // Fall back to legacy heuristic lineage by filepath
                     let legacy_res = legacy_edge_stmt
                         .query_row(params![&filepath], |row| row.get::<_, String>(0));
@@ -330,13 +409,35 @@ impl Database {
 
     /// Returns lineage cursor for a filepath: up to 3 ancestors and 2 children
     /// ordered by confidence DESC, created_at DESC. Overrides win: unlink hides,
-    /// link injects.
+    /// link injects. `lineage_edges` are read first (id-keyed Forge stamps);
+    /// legacy filepath rows fill any remaining slots so freshly ingested
+    /// children have a parent immediately.
     pub fn get_lineage_cursor(&self, filepath: &str) -> SqlResult<LineageCursor> {
         let conn = self.pool.get().map_err(pool_error)?;
 
-        // Ancestors: where child = filepath, exclude unlink overrides, include link overrides
-        // Use UNION to merge lineage (filtered) + overrides link
+        // Ancestors: lineage_edges-first, then legacy filepath rows.
         let mut ancestors: Vec<LineageEdge> = Vec::new();
+        if let Ok(Some(child_id)) = image_id_for_filepath(&conn, filepath) {
+            for (parent_id, _ops, source, created_at) in
+                lineage_edge_parents_for_child(&conn, child_id, 3).unwrap_or_default()
+            {
+                if let Ok(Some(parent_fp)) = filepath_for_image_id(&conn, parent_id) {
+                    if is_unlinked_override(&conn, filepath, &parent_fp).unwrap_or(false) {
+                        continue;
+                    }
+                    ancestors.push(LineageEdge {
+                        child_filepath: filepath.to_string(),
+                        parent_filepath: parent_fp,
+                        relation: source,
+                        confidence: 1.0,
+                        created_at,
+                    });
+                    if ancestors.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
         {
             let sql = "
                 SELECT child_filepath, parent_filepath, relation, confidence, created_at FROM (
@@ -355,11 +456,42 @@ impl Database {
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![filepath], lineage_edge_from_row)?;
             for row in rows {
-                ancestors.push(row?);
+                if ancestors.len() >= 3 {
+                    break;
+                }
+                let edge = row?;
+                if ancestors
+                    .iter()
+                    .any(|e| e.parent_filepath == edge.parent_filepath)
+                {
+                    continue;
+                }
+                ancestors.push(edge);
             }
         }
 
         let mut children: Vec<LineageEdge> = Vec::new();
+        if let Ok(Some(parent_id)) = image_id_for_filepath(&conn, filepath) {
+            for (child_id, _ops, source, created_at) in
+                lineage_edge_children_for_parent(&conn, parent_id, 2).unwrap_or_default()
+            {
+                if let Ok(Some(child_fp)) = filepath_for_image_id(&conn, child_id) {
+                    if is_unlinked_override(&conn, &child_fp, filepath).unwrap_or(false) {
+                        continue;
+                    }
+                    children.push(LineageEdge {
+                        child_filepath: child_fp,
+                        parent_filepath: filepath.to_string(),
+                        relation: source,
+                        confidence: 1.0,
+                        created_at,
+                    });
+                    if children.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
         {
             let sql = "
                 SELECT child_filepath, parent_filepath, relation, confidence, created_at FROM (
@@ -378,7 +510,17 @@ impl Database {
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![filepath], lineage_edge_from_row)?;
             for row in rows {
-                children.push(row?);
+                if children.len() >= 2 {
+                    break;
+                }
+                let edge = row?;
+                if children
+                    .iter()
+                    .any(|e| e.child_filepath == edge.child_filepath)
+                {
+                    continue;
+                }
+                children.push(edge);
             }
         }
 
@@ -642,9 +784,15 @@ impl Database {
     }
 
     /// Returns the total number of lineage edges in the database.
+    /// Counts both the legacy filepath `lineage` rows and the id-keyed
+    /// `lineage_edges` stamps so the "N edges" display stays honest.
     pub fn get_total_lineage_edges(&self) -> SqlResult<usize> {
         let conn = self.pool.get().map_err(pool_error)?;
-        conn.query_row("SELECT COUNT(*) FROM lineage", [], |row| row.get(0))
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM lineage) + (SELECT COUNT(*) FROM lineage_edges)",
+            [],
+            |row| row.get(0),
+        )
     }
 
     /// Deletes all inferred seed_walk edges (keeping manual link overrides)

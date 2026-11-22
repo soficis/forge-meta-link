@@ -165,8 +165,9 @@ pub async fn scan_directory(
                             );
                         }
 
-                        let raw_metadata = extract_parameters_metadata(&pending.path, Some(&error_counter));
-                        let params = if raw_metadata.trim().is_empty() {
+                        let (raw_metadata, text_chunks) =
+                            extract_parameters_with_chunks(&pending.path, Some(&error_counter));
+                        let mut params = if raw_metadata.trim().is_empty() {
                             parser::GenerationParams {
                                 raw_metadata: String::new(),
                                 ..Default::default()
@@ -174,6 +175,7 @@ pub async fn scan_directory(
                         } else {
                             parser::parse_generation_metadata(&raw_metadata)
                         };
+                        params.text_chunks = text_chunks;
                         let mut tags = parser::extract_tags(&params.prompt);
 
                         if let Some(sidecar_data) = sidecar::read_sidecar(&pending.path) {
@@ -431,16 +433,19 @@ pub async fn scan_directory(
     Ok(())
 }
 
-fn extract_parameters_metadata(path: &Path, error_counter: Option<&AtomicUsize>) -> String {
-    match scanner::extract_metadata(path) {
-        Ok(Some(parameters)) => parameters,
-        Ok(None) => read_sidecar_txt(path),
+fn extract_parameters_with_chunks(
+    path: &Path,
+    error_counter: Option<&AtomicUsize>,
+) -> (String, HashMap<String, String>) {
+    match scanner::extract_metadata_with_chunks(path) {
+        Ok((Some(parameters), chunks)) => (parameters, chunks),
+        Ok((None, chunks)) => (read_sidecar_txt(path), chunks),
         Err(err) => {
             if let Some(counter) = error_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             log::warn!("PNG metadata read failed for {}: {}", path.display(), err);
-            read_sidecar_txt(path)
+            (read_sidecar_txt(path), HashMap::new())
         }
     }
 }

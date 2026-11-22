@@ -112,6 +112,12 @@ pub struct ImageRecord {
     pub raw_metadata: String,
     pub is_favorite: bool,
     pub is_locked: bool,
+    #[serde(default)]
+    pub schedule_type: Option<String>,
+    #[serde(default)]
+    pub extra_params: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub text_chunks: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,6 +579,7 @@ impl Database {
             ("seed_int", "INTEGER"),
             ("culled_at", "INTEGER"),
             ("ghost_recipe", "TEXT"),
+            ("text_chunks", "TEXT"),
         ] {
             if existing_columns.contains(name) {
                 continue;
@@ -707,12 +714,19 @@ impl SortConfig {
         }
     }
 
-    fn order_clause(&self) -> String {
+    fn order_clause(&self, prefix: Option<&str>) -> String {
         let dir = if self.descending { "DESC" } else { "ASC" };
         if self.field == "id" {
-            format!("id {}", dir)
+            match prefix {
+                Some(p) => format!("{p}.id {dir}"),
+                None => format!("id {dir}"),
+            }
         } else {
-            format!("{} {}, id {}", self.sort_expr(), dir, dir)
+            let id_col = match prefix {
+                Some(p) => format!("{p}.id"),
+                None => "id".to_string(),
+            };
+            format!("{} {dir}, {id_col} {dir}", self.sort_expr(prefix))
         }
     }
 
@@ -724,13 +738,17 @@ impl SortConfig {
         }
     }
 
-    fn sort_expr(&self) -> String {
+    fn sort_expr(&self, prefix: Option<&str>) -> String {
         if self.field == "id" {
             return "id".to_string();
         }
 
         let null_sentinel = if self.descending { "" } else { "~" };
-        format!("COALESCE({}, '{}')", self.field, null_sentinel)
+        let column = match prefix {
+            Some(p) => format!("{p}.{}", self.field),
+            None => self.field.to_string(),
+        };
+        format!("COALESCE({column}, '{null_sentinel}')")
     }
 }
 
@@ -753,7 +771,32 @@ pub(crate) fn image_record_from_row(row: &Row<'_>) -> SqlResult<ImageRecord> {
         raw_metadata: row.get(14)?,
         is_favorite: row.get(15)?,
         is_locked: row.get(16)?,
+        schedule_type: row.get(17)?,
+        extra_params: parse_extra_params_column(row)?,
+        text_chunks: parse_text_chunks_column(row)?,
     })
+}
+
+fn parse_text_chunks_column(row: &Row<'_>) -> SqlResult<Option<HashMap<String, String>>> {
+    let raw: Option<String> = row.get(19)?;
+    Ok(raw.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<HashMap<String, String>>(trimmed).ok()
+    }))
+}
+
+fn parse_extra_params_column(row: &Row<'_>) -> SqlResult<Option<HashMap<String, String>>> {
+    let raw: Option<String> = row.get(18)?;
+    Ok(raw.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<HashMap<String, String>>(trimmed).ok()
+    }))
 }
 
 pub(crate) fn gallery_image_record_from_row(row: &Row<'_>) -> SqlResult<GalleryImageRecord> {
@@ -877,6 +920,18 @@ fn append_model_filter(
     params.push(Value::Text(normalized.to_string()));
 }
 
+// Mirror of `src/constants/model_families.json` (`like_patterns` per family).
+// Specific variants are declared before their base family so edit/2.x/HD rows
+// resolve to their own family first (Qwen-Edit before Qwen, Flux.2 before
+// Flux, Krea Identity before Krea 2 Turbo, Chroma1-HD before Chroma),
+// matching the order of the TS `DETECTION_RULES` in `modelFamilies.ts`.
+const FAMILY_PATTERNS_QWEN_IMAGE_EDIT: &[&str] = &[
+    "%qwen-image-edit%",
+    "%qwen_image_edit%",
+    "%qwenimageedit%",
+    "%qwen%edit%",
+    "%qwen2.1%",
+];
 const FAMILY_PATTERNS_QWEN_IMAGE: &[&str] = &[
     "%qwen2512%",
     "%qwen_2512%",
@@ -886,15 +941,26 @@ const FAMILY_PATTERNS_QWEN_IMAGE: &[&str] = &[
     "%qwen2.5%",
     "%qwen%",
 ];
+const FAMILY_PATTERNS_FLUX2_KLEIN: &[&str] = &[
+    "%flux2%",
+    "%flux.2%",
+    "%flux_2%",
+    "%flux2-klein%",
+    "%flux.2-klein%",
+    "%flux2-small%",
+];
 const FAMILY_PATTERNS_PONYXL: &[&str] = &["%ponyxl%", "%pony xl%", "%pony diffusion%", "%pony%"];
 const FAMILY_PATTERNS_SDXL: &[&str] = &["%sdxl%", "%stable diffusion xl%", "%sd_xl%", "%sd-xl%"];
 const FAMILY_PATTERNS_FLUX: &[&str] = &["%flux%"];
 const FAMILY_PATTERNS_ZIMAGE_TURBO: &[&str] =
     &["%z-image turbo%", "%zimage turbo%", "%z-image%", "%zimage%"];
+const FAMILY_PATTERNS_KREA_IDENTITY_EDIT: &[&str] =
+    &["%krea%identity%", "%krea2%identity%", "%krea identity%"];
 // "_" is a single-character LIKE wildcard, so "%krea_2%" covers "krea 2", "krea-2" and "krea_2".
 const FAMILY_PATTERNS_KREA2_TURBO: &[&str] = &["%krea2%", "%krea_2%"];
-const FAMILY_PATTERNS_SD35: &[&str] = &["%sd3.5%", "%sd35%", "%sd_3.5%", "%sd-3.5%"];
-const FAMILY_PATTERNS_SD3: &[&str] = &["%sd3%", "%sd_3%", "%sd-3%", "%stable diffusion 3%"];
+const FAMILY_PATTERNS_ANIMA: &[&str] = &["%anima%"];
+const FAMILY_PATTERNS_MOSS_IMAGE: &[&str] = &["%moss%", "%moss-image%", "%moss_image%"];
+const FAMILY_PATTERNS_ERNIE_IMAGE: &[&str] = &["%ernie%"];
 const FAMILY_PATTERNS_SD15: &[&str] = &[
     "%sd1.5%",
     "%sd15%",
@@ -902,14 +968,6 @@ const FAMILY_PATTERNS_SD15: &[&str] = &[
     "%sd-1.5%",
     "%stable diffusion 1.5%",
     "%v1-5%",
-];
-const FAMILY_PATTERNS_SD21: &[&str] = &[
-    "%sd2.1%",
-    "%sd21%",
-    "%sd_2.1%",
-    "%sd-2.1%",
-    "%stable diffusion 2.1%",
-    "%v2-1%",
 ];
 const FAMILY_PATTERNS_LUMINA: &[&str] = &["%lumina%"];
 const FAMILY_PATTERNS_PIXART: &[&str] = &["%pixart%"];
@@ -924,8 +982,12 @@ const FAMILY_PATTERNS_SANA: &[&str] = &[
     "%sana.safetensors%",
 ];
 const FAMILY_PATTERNS_WAN: &[&str] = &["%wan2%", "%wan_2%", "%wan-2%", "%wanvideo%", "%_wan_%"];
+const FAMILY_PATTERNS_CHROMA_HD: &[&str] =
+    &["%chroma1-hd%", "%chroma_hd%", "%chromahd%", "%chroma hd%"];
 const FAMILY_PATTERNS_CHROMA: &[&str] = &["%chroma%"];
 const FAMILY_PATTERNS_VACE: &[&str] = &["%vace%"];
+const FAMILY_PATTERNS_PID: &[&str] = &["%pid%", "%pid1.5%", "%pid 1.5%"];
+const FAMILY_PATTERNS_MUGEN: &[&str] = &["%mugen%"];
 
 fn normalize_model_family(value: &str) -> Option<&'static str> {
     let compact: String = value
@@ -935,19 +997,30 @@ fn normalize_model_family(value: &str) -> Option<&'static str> {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect();
 
+    // Compact names mirror `compact_names` in `src/constants/model_families.json`.
+    // Specific variants are listed before their base family so an edit/2.x/HD
+    // value resolves to its own family, never the generic one.
     match compact.as_str() {
+        "qwenimageedit" | "qwenimageedit2509" | "qwenedit" | "qwenimage21edit" | "qwen21edit"
+        | "qwen21" => Some("qwen_image_edit"),
         "qwen" | "qwenimage" | "qwen2512" | "qwen25" | "qwen25image" | "qwen2512b" => {
             Some("qwen_image")
         }
+        "flux2klein" | "flux2" | "fluxklein" | "flux2small" | "flux2smalldecoder" => {
+            Some("flux2_klein")
+        }
+        "flux" | "flux1" | "fluxdev" | "fluxschnell" | "fluxkontext" => Some("flux"),
+        "kreaidentity" | "kreaidentityedit" | "krea2identity" | "krea2identityedit" => {
+            Some("krea_identity_edit")
+        }
+        "krea2" | "krea2turbo" => Some("krea2_turbo"),
+        "zimage" | "zimageturbo" => Some("zimage_turbo"),
+        "anima" | "anima2b" | "anima29b" | "anima38b" | "animaedit" | "animargba" => Some("anima"),
+        "moss" | "mossimage" | "mossimageedit" | "mossedit" => Some("moss_image"),
+        "ernie" | "ernieimage" => Some("ernie_image"),
         "pony" | "ponyxl" | "ponydiffusion" => Some("ponyxl"),
         "sdxl" | "stablediffusionxl" => Some("sdxl"),
-        "flux" | "flux1" | "fluxdev" | "fluxschnell" | "fluxkontext" => Some("flux"),
-        "zimage" | "zimageturbo" => Some("zimage_turbo"),
-        "krea2" | "krea2turbo" => Some("krea2_turbo"),
-        "sd35" | "sd35large" | "sd35medium" => Some("sd35"),
-        "sd3" | "sd3medium" | "stablediffusion3" => Some("sd3"),
         "sd15" | "stablediffusion15" | "sdv15" | "sd1" => Some("sd15"),
-        "sd21" | "stablediffusion21" | "sdv21" | "sd2" => Some("sd21"),
         "lumina" | "luminanext" | "lumina2" => Some("lumina"),
         "pixart" | "pixartalpha" | "pixartsigma" => Some("pixart"),
         "kolors" => Some("kolors"),
@@ -955,8 +1028,11 @@ fn normalize_model_family(value: &str) -> Option<&'static str> {
         "hunyuan" | "hunyuandit" | "hunyuanvideo" => Some("hunyuan"),
         "sana" => Some("sana"),
         "wan" | "wan2" | "wan21" | "wan22" | "wanvideo" => Some("wan"),
+        "chromahd" | "chroma1hd" => Some("chroma_hd"),
         "chroma" => Some("chroma"),
         "vace" => Some("vace"),
+        "pid" | "pid15" | "pidsdxl" | "pidqwen" | "pidflux" => Some("pid"),
+        "mugen" => Some("mugen"),
         _ => None,
     }
 }
@@ -981,17 +1057,21 @@ fn normalize_model_family_filters(model_family_filters: Option<&[String]>) -> Ve
 }
 
 fn family_patterns(family: &str) -> &'static [&'static str] {
+    // Specific variants first, mirroring the TS `DETECTION_RULES` order.
     match family {
+        "qwen_image_edit" => FAMILY_PATTERNS_QWEN_IMAGE_EDIT,
         "qwen_image" | "qwen" => FAMILY_PATTERNS_QWEN_IMAGE,
+        "flux2_klein" => FAMILY_PATTERNS_FLUX2_KLEIN,
+        "flux" => FAMILY_PATTERNS_FLUX,
+        "krea_identity_edit" => FAMILY_PATTERNS_KREA_IDENTITY_EDIT,
+        "krea2_turbo" => FAMILY_PATTERNS_KREA2_TURBO,
+        "zimage_turbo" => FAMILY_PATTERNS_ZIMAGE_TURBO,
+        "anima" => FAMILY_PATTERNS_ANIMA,
+        "moss_image" => FAMILY_PATTERNS_MOSS_IMAGE,
+        "ernie_image" => FAMILY_PATTERNS_ERNIE_IMAGE,
         "ponyxl" => FAMILY_PATTERNS_PONYXL,
         "sdxl" => FAMILY_PATTERNS_SDXL,
-        "flux" => FAMILY_PATTERNS_FLUX,
-        "zimage_turbo" => FAMILY_PATTERNS_ZIMAGE_TURBO,
-        "krea2_turbo" => FAMILY_PATTERNS_KREA2_TURBO,
-        "sd35" => FAMILY_PATTERNS_SD35,
-        "sd3" => FAMILY_PATTERNS_SD3,
         "sd15" => FAMILY_PATTERNS_SD15,
-        "sd21" => FAMILY_PATTERNS_SD21,
         "lumina" => FAMILY_PATTERNS_LUMINA,
         "pixart" => FAMILY_PATTERNS_PIXART,
         "kolors" => FAMILY_PATTERNS_KOLORS,
@@ -999,8 +1079,11 @@ fn family_patterns(family: &str) -> &'static [&'static str] {
         "hunyuan" => FAMILY_PATTERNS_HUNYUAN,
         "sana" => FAMILY_PATTERNS_SANA,
         "wan" => FAMILY_PATTERNS_WAN,
+        "chroma_hd" => FAMILY_PATTERNS_CHROMA_HD,
         "chroma" => FAMILY_PATTERNS_CHROMA,
         "vace" => FAMILY_PATTERNS_VACE,
+        "pid" => FAMILY_PATTERNS_PID,
+        "mugen" => FAMILY_PATTERNS_MUGEN,
         _ => &[],
     }
 }
@@ -1178,34 +1261,263 @@ mod tests {
             assert_eq!(normalize_model_family(raw), Some("krea2_turbo"), "{raw}");
         }
         assert_eq!(family_patterns("krea2_turbo"), FAMILY_PATTERNS_KREA2_TURBO);
+        // Krea Identity Edit is its own family, not Krea 2 Turbo.
+        for raw in [
+            "krea_identity_edit",
+            "Krea 2 Identity Edit",
+            "krea-identity",
+            "krea2identity",
+        ] {
+            assert_eq!(
+                normalize_model_family(raw),
+                Some("krea_identity_edit"),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            family_patterns("krea_identity_edit"),
+            FAMILY_PATTERNS_KREA_IDENTITY_EDIT
+        );
         // Plain FLUX.1 Krea [dev] is not Krea 2.
         assert_eq!(normalize_model_family("flux1-krea-dev"), None);
     }
 
     #[test]
-    fn qwen_and_all_model_families_normalize_and_have_patterns() {
-        for raw in ["qwen2512", "qwen-image", "Qwen 2.5", "qwen25", "qwen"] {
-            assert_eq!(normalize_model_family(raw), Some("qwen_image"), "{raw}");
+    fn model_family_registry_matches_json() {
+        // (canonical id, sample inputs incl. the id itself, expected LIKE patterns)
+        // Mirrors every non-unknown entry of `src/constants/model_families.json`.
+        let table: &[(&str, &[&str], &[&str])] = &[
+            (
+                "qwen_image_edit",
+                &[
+                    "qwen_image_edit",
+                    "qwenimageedit2509",
+                    "Qwen-Image-Edit",
+                    "qwen2.1-edit",
+                    "qwen2.1",
+                ],
+                FAMILY_PATTERNS_QWEN_IMAGE_EDIT,
+            ),
+            (
+                "qwen_image",
+                &["qwen_image", "qwen2512", "Qwen 2.5", "qwen25image"],
+                FAMILY_PATTERNS_QWEN_IMAGE,
+            ),
+            (
+                "flux2_klein",
+                &["flux2_klein", "flux2klein", "flux.2", "Flux2-Small-Decoder"],
+                FAMILY_PATTERNS_FLUX2_KLEIN,
+            ),
+            (
+                "flux",
+                &["flux", "flux1", "flux-dev", "Flux Kontext"],
+                FAMILY_PATTERNS_FLUX,
+            ),
+            (
+                "krea_identity_edit",
+                &["krea_identity_edit", "krea2-identity-edit", "Krea Identity"],
+                FAMILY_PATTERNS_KREA_IDENTITY_EDIT,
+            ),
+            (
+                "krea2_turbo",
+                &["krea2_turbo", "krea2", "Krea 2 Turbo"],
+                FAMILY_PATTERNS_KREA2_TURBO,
+            ),
+            (
+                "zimage_turbo",
+                &["zimage_turbo", "Z-Image Turbo", "zimage"],
+                FAMILY_PATTERNS_ZIMAGE_TURBO,
+            ),
+            (
+                "anima",
+                &["anima", "anima-3.8b", "ANIMA Edit", "anima-rgba"],
+                FAMILY_PATTERNS_ANIMA,
+            ),
+            (
+                "moss_image",
+                &["moss_image", "MOSS-Image-Edit", "moss", "mossedit"],
+                FAMILY_PATTERNS_MOSS_IMAGE,
+            ),
+            (
+                "ernie_image",
+                &["ernie_image", "Ernie-Image", "ernie"],
+                FAMILY_PATTERNS_ERNIE_IMAGE,
+            ),
+            (
+                "ponyxl",
+                &["ponyxl", "Pony Diffusion", "pony"],
+                FAMILY_PATTERNS_PONYXL,
+            ),
+            (
+                "sdxl",
+                &["sdxl", "Stable Diffusion XL"],
+                FAMILY_PATTERNS_SDXL,
+            ),
+            ("sd15", &["sd15", "SD 1.5", "sdv15"], FAMILY_PATTERNS_SD15),
+            (
+                "lumina",
+                &["lumina", "Lumina Next", "lumina2"],
+                FAMILY_PATTERNS_LUMINA,
+            ),
+            (
+                "pixart",
+                &["pixart", "PixArt-Sigma"],
+                FAMILY_PATTERNS_PIXART,
+            ),
+            ("kolors", &["kolors", "Kolors"], FAMILY_PATTERNS_KOLORS),
+            (
+                "auraflow",
+                &["auraflow", "AuraFlow"],
+                FAMILY_PATTERNS_AURAFLOW,
+            ),
+            (
+                "hunyuan",
+                &["hunyuan", "HunyuanVideo"],
+                FAMILY_PATTERNS_HUNYUAN,
+            ),
+            ("sana", &["sana", "Sana"], FAMILY_PATTERNS_SANA),
+            ("wan", &["wan", "wan2.1", "WAN Video"], FAMILY_PATTERNS_WAN),
+            (
+                "chroma_hd",
+                &["chroma_hd", "Chroma1-HD", "chroma hd"],
+                FAMILY_PATTERNS_CHROMA_HD,
+            ),
+            ("chroma", &["chroma", "Chroma"], FAMILY_PATTERNS_CHROMA),
+            ("vace", &["vace", "Vace"], FAMILY_PATTERNS_VACE),
+            (
+                "pid",
+                &["pid", "PiD 1.5", "pidsdxl", "pidflux"],
+                FAMILY_PATTERNS_PID,
+            ),
+            ("mugen", &["mugen", "Mugen"], FAMILY_PATTERNS_MUGEN),
+        ];
+        assert_eq!(table.len(), 25, "one row per non-unknown JSON family");
+        for (family, inputs, patterns) in table {
+            for raw in *inputs {
+                assert_eq!(normalize_model_family(raw), Some(*family), "{raw}");
+            }
+            assert_eq!(
+                family,
+                &normalize_model_family_filters(Some(&[family.to_string()]))[0]
+            );
+            assert_eq!(
+                family_patterns(family),
+                *patterns,
+                "LIKE patterns for {family}"
+            );
+            assert!(
+                !patterns.is_empty(),
+                "family {family} must have LIKE patterns"
+            );
         }
-        assert_eq!(family_patterns("qwen_image"), FAMILY_PATTERNS_QWEN_IMAGE);
+        // `unknown` stays the fallback: no normalization, no patterns.
+        assert_eq!(normalize_model_family("unknown"), None);
+        assert!(family_patterns("unknown").is_empty());
+        assert!(normalize_model_family_filters(Some(&["unknown".to_string()])).is_empty());
+    }
 
-        assert_eq!(normalize_model_family("sd35"), Some("sd35"));
-        assert_eq!(normalize_model_family("sd3.5"), Some("sd35"));
-        assert_eq!(normalize_model_family("sd3"), Some("sd3"));
+    #[test]
+    fn specific_variants_are_not_swallowed_by_base_family() {
+        assert_eq!(
+            normalize_model_family("qwenimageedit"),
+            Some("qwen_image_edit")
+        );
+        assert_eq!(
+            normalize_model_family("qwen-image-edit"),
+            Some("qwen_image_edit")
+        );
+        assert_eq!(normalize_model_family("flux2klein"), Some("flux2_klein"));
+        assert_eq!(normalize_model_family("flux.2 klein"), Some("flux2_klein"));
+        assert_eq!(
+            normalize_model_family("krea2identityedit"),
+            Some("krea_identity_edit")
+        );
+        assert_eq!(normalize_model_family("chroma1hd"), Some("chroma_hd"));
+        assert_eq!(normalize_model_family("chroma hd"), Some("chroma_hd"));
+    }
 
-        assert_eq!(normalize_model_family("sd15"), Some("sd15"));
-        assert_eq!(normalize_model_family("sd21"), Some("sd21"));
-        assert_eq!(normalize_model_family("lumina"), Some("lumina"));
-        assert_eq!(normalize_model_family("pixart"), Some("pixart"));
-        assert_eq!(normalize_model_family("kolors"), Some("kolors"));
-        assert_eq!(normalize_model_family("auraflow"), Some("auraflow"));
-        assert_eq!(normalize_model_family("hunyuan"), Some("hunyuan"));
-        assert_eq!(normalize_model_family("sana"), Some("sana"));
-        assert_eq!(normalize_model_family("wan2"), Some("wan"));
-
+    #[test]
+    fn removed_families_fall_back_to_unknown() {
+        // Neo removed sd3/sd35/sd21: they must not normalize and must contribute
+        // no LIKE patterns, so the filter is a no-op (unknown/fallback branch).
+        for raw in [
+            "sd3",
+            "sd35",
+            "sd21",
+            "SD 3.5",
+            "sd2.1",
+            "stablediffusion3",
+            "sd35medium",
+        ] {
+            assert_eq!(normalize_model_family(raw), None, "{raw}");
+            assert!(family_patterns(raw).is_empty(), "{raw}");
+        }
+        let filters = vec!["sd3".to_string(), "sd35".to_string(), "sd21".to_string()];
+        assert!(normalize_model_family_filters(Some(&filters)).is_empty());
+        assert!(normalize_model_family_filters(None).is_empty());
         // Unknown models must return None
         assert_eq!(normalize_model_family("custom_random_model_v1"), None);
         assert_eq!(normalize_model_family("unknown"), None);
+    }
+
+    fn insert_with_model_name(db: &Database, filepath: &str, model_name: &str) {
+        let params = GenerationParams {
+            prompt: format!("prompt for {filepath}"),
+            raw_metadata: format!("raw {filepath}"),
+            model_name: Some(model_name.to_string()),
+            ..Default::default()
+        };
+        db.upsert_image(filepath, filepath, "c:\\images", &params, Some(1))
+            .expect("failed to insert image");
+    }
+
+    fn family_filter_paths(db: &Database, families: &[String]) -> Vec<String> {
+        let page = db
+            .get_images_cursor(None, 50, None, None, None, Some(families))
+            .expect("family cursor query failed");
+        let mut v: Vec<String> = page.items.iter().map(|i| i.filepath.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn model_family_sql_filter_finds_current_registry_models() {
+        let db = Database::new(Path::new(":memory:"), StorageProfile::Hdd)
+            .expect("failed to create in-memory db");
+        insert_with_model_name(&db, "anima.png", "anima-2b.safetensors");
+        insert_with_model_name(&db, "moss.png", "moss-image-edit.safetensors");
+        insert_with_model_name(&db, "flux2.png", "flux2-klein-4b.safetensors");
+        insert_with_model_name(&db, "pid.png", "pid-1.5.safetensors");
+        insert_with_model_name(&db, "flux1.png", "flux1-dev.safetensors");
+        insert_with_model_name(&db, "chroma.png", "chroma1-hd.safetensors");
+
+        assert_eq!(
+            family_filter_paths(&db, &["anima".to_string()]),
+            vec!["anima.png"]
+        );
+        assert_eq!(
+            family_filter_paths(&db, &["moss_image".to_string()]),
+            vec!["moss.png"]
+        );
+        assert_eq!(
+            family_filter_paths(&db, &["flux2_klein".to_string()]),
+            vec!["flux2.png"]
+        );
+        assert_eq!(
+            family_filter_paths(&db, &["pid".to_string()]),
+            vec!["pid.png"]
+        );
+        // Specific-before-generic at the SQL layer: the HD row is found by chroma_hd.
+        assert_eq!(
+            family_filter_paths(&db, &["chroma_hd".to_string()]),
+            vec!["chroma.png"]
+        );
+        // Removed families normalize to nothing, so the filter is a no-op.
+        let unfiltered = family_filter_paths(
+            &db,
+            &["sd3".to_string(), "sd35".to_string(), "sd21".to_string()],
+        );
+        assert_eq!(unfiltered.len(), 6, "{unfiltered:?}");
     }
 
     fn insert_with_prompt(db: &Database, filepath: &str, prompt: &str, tags: &[&str]) {
@@ -1769,16 +2081,9 @@ mod tests {
             "expected model_name query to use idx_images_model_name_nocase_id, got {model_plan:?}"
         );
 
-        let top_tags_plan = explain_details(
-            &conn,
-            "SELECT tags.tag, COUNT(*) as usage_count
-             FROM tags
-             JOIN image_tags ON image_tags.tag_id = tags.id
-             GROUP BY tags.id, tags.tag
-             ORDER BY usage_count DESC, tags.tag ASC
-             LIMIT 50",
-            &[],
-        );
+        let top_limit = 50u32;
+        let top_tags_plan =
+            explain_details(&conn, super::read_queries::TOP_TAGS_SQL, &[&top_limit]);
         println!("top_tags_plan={top_tags_plan:?}");
         assert!(
             top_tags_plan
@@ -1983,6 +2288,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bench"]
     fn bench_50k_mtime_bulk_under_1s() {
         let db =
             Database::new(Path::new(":memory:"), StorageProfile::Hdd).expect("failed to create db");
@@ -2043,6 +2349,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bench"]
     fn bench_50k_hdd_incremental_scan_under_180s() {
         use std::time::Instant;
         let wall_start = Instant::now();

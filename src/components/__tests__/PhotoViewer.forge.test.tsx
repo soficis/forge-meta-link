@@ -26,6 +26,9 @@ const detail = (id: number, name: string, prompt: string): ImageRecord => ({
     steps: "4",
     sampler: id === 1 ? "Euler a" : "DPM++ 2M",
     cfg_scale: id === 1 ? "5.5" : "7.0",
+    schedule_type: "Karras",
+    extra_params: {},
+    text_chunks: null,
     model_hash: "abc",
     raw_metadata: `${prompt}\nSteps: 4, Sampler: Euler a, Schedule type: Karras, CFG scale: 5.5, Seed: ${id * 111}`,
 });
@@ -772,6 +775,40 @@ describe("PhotoViewer Forge send options", () => {
             upscaler: "R-ESRGAN 4x+",
             scale: 4,
         });
+    });
+});
+
+describe("PhotoViewer Info tab vocabulary", () => {
+    it("shows Scheduler from a PNG's 'Schedule type: Karras' parameters and labels the checkpoint canonically", async () => {
+        const pngDetail: ImageRecord = {
+            ...detail(1, "karras-png", "a lighthouse at dusk"),
+            model_name: "pony-v7.safetensors",
+            model_hash: "hash-abc",
+            raw_metadata:
+                "a lighthouse at dusk\nSteps: 20, Sampler: Euler a, Schedule type: Karras, CFG scale: 5.5, Seed: 111",
+        };
+        mock = installTauriMock(baseHandlers({ get_image_detail: () => pngDetail }));
+        render(viewer(0)); // Info tab is the default tab
+
+        const schedulerValue = await screen.findByText("Karras");
+        const schedulerRow = schedulerValue.closest(".viewer-key-value-row");
+        expect(schedulerRow).toBeTruthy();
+        expect(within(schedulerRow as HTMLElement).getByText("Scheduler")).toBeTruthy();
+        expect(screen.getByText("Checkpoint")).toBeTruthy();
+        expect(screen.getByText("Checkpoint Hash")).toBeTruthy();
+        expect(screen.queryByText("Model")).toBeNull();
+    });
+
+    it("prefers a structured schedule_type over the raw metadata value", async () => {
+        const structuredDetail = {
+            ...detail(1, "structured-schedule", "a lighthouse at dusk"),
+            schedule_type: "Exponential",
+        } as ImageRecord;
+        mock = installTauriMock(baseHandlers({ get_image_detail: () => structuredDetail }));
+        render(viewer(0));
+
+        expect(await screen.findByText("Exponential")).toBeTruthy();
+        expect(screen.queryByText("Karras")).toBeNull();
     });
 });
 
