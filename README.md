@@ -10,6 +10,7 @@ The recipe sits inside each PNG, but nothing reads it for you. ForgeMetaLink doe
 ## What it does
 
 - **Searches your library in an instant.** Type a prompt word, model, LoRA, sampler, seed, or tag. Put `-` before a tag to exclude it. Filter by checkpoint family.
+- **Copies recipes between machines.** Copy one recipe. Paste it on another computer. Every field survives, including LoRA timings and unknown extras. Nothing leaves your machine.
 - **Compares up to four images side by side.** It highlights every setting that differs.
 - **Makes variations of your winner.** Pick the image. Tick the changes: seed +1 to +4, higher or lower CFG or steps, another sampler or scheduler. It queues them all in Forge Neo. One sweep holds 16 images at most. Past 8, it asks first.
 - **Sends any image back to Forge Neo.** Sampler, scheduler, CFG, seed, size, model, and LoRAs arrive unchanged. No PNG Info copy-paste. Resolution presets match your model family.
@@ -18,6 +19,10 @@ The recipe sits inside each PNG, but nothing reads it for you. ForgeMetaLink doe
 - **Deletes safely.** Images go to the Recycle Bin with a 6-second undo. Locked images never get deleted.
 - **Stores your prompts.** Save the ones you reuse. Search them. Apply one to a new request.
 - **Handles the chores.** Favorite, lock, move, tag, export to CSV or JSON, find duplicates.
+- **Culls fast.** The triage board shows one image at a time. Keep or trash with a key. Locked images never get touched.
+- **Rebuilds an experiment grid.** Choose three recorded settings. The app groups your images into an X/Y/Z grid. It reads metadata, not filenames.
+- **Checks a batch before it sends.** Each image shows the settings it will use. Change one without touching the rest.
+- **Finds missing assets.** The app compares each image against Forge's model and LoRA folders. It lists what you lack. It downloads nothing.
 
 ## Get started
 
@@ -30,7 +35,7 @@ To compare, press `1`–`4` on an image to pin it.
 
 ### Connect Forge Neo
 
-1. Start Forge Neo with `--api`.
+1. Start Forge Neo with `--api`. A local Forge needs no API key.
 2. Open **Settings → Forge connection**. Enter the address (usually `http://127.0.0.1:7860`). Click **Test connection**.
 3. Open an image. Go to the **Forge** tab. Change what you like. Press **Send to Forge**.
 

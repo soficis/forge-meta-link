@@ -1,0 +1,267 @@
+/* ── Toolbar toggle (App.tsx) ─────────────────────────────────────────── */
+.rapid-cull-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 5px 10px 0;
+}
+
+.rapid-cull-toggle {
+    appearance: none;
+    border: 1px solid var(--border-highlight, rgba(124, 77, 255, 0.3));
+    border-radius: var(--radius-sm, 4px);
+    background: var(--bg-tertiary, #1a1d2b);
+    color: var(--text-primary, #e8eaed);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+
+.rapid-cull-toggle:hover {
+    background: var(--bg-hover, #222538);
+}
+
+.rapid-cull-toggle[aria-pressed="true"] {
+    background: var(--accent-primary, #7c4dff);
+    border-color: var(--accent-primary, #7c4dff);
+}
+
+/* ── Overlay / dialog ─────────────────────────────────────────────────── */
+.rapid-cull-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 300;
+    display: flex;
+    padding: clamp(8px, 2vh, 24px);
+    background: rgba(4, 5, 9, 0.94);
+}
+
+.rapid-cull-board {
+    width: min(1600px, 100%);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    outline: none;
+    background: var(--bg-secondary, #12141c);
+    border: 1px solid var(--border-highlight, rgba(124, 77, 255, 0.3));
+    border-radius: var(--radius-lg, 10px);
+    box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.5));
+}
+
+.rapid-cull-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+}
+
+.rapid-cull-header h2 {
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.rapid-cull-help {
+    margin-top: 3px;
+    color: var(--text-secondary, #9aa0b4);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.rapid-cull-close {
+    flex: none;
+    appearance: none;
+    border: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+    border-radius: var(--radius-sm, 4px);
+    background: var(--bg-tertiary, #1a1d2b);
+    color: var(--text-primary, #e8eaed);
+    font: inherit;
+    font-size: 12px;
+    padding: 5px 10px;
+    cursor: pointer;
+}
+
+.rapid-cull-close:hover {
+    background: var(--bg-hover, #222538);
+}
+
+.rapid-cull-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px 18px;
+    padding: 8px 14px;
+    background: var(--bg-tertiary, #1a1d2b);
+    border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+    font-variant-numeric: tabular-nums;
+}
+
+.rapid-cull-status [data-testid="rapid-cull-progress"] {
+    color: var(--text-accent, #64b5f6);
+    font-weight: 700;
+}
+
+.rapid-cull-status [data-testid="rapid-cull-current"] {
+    color: var(--text-secondary, #9aa0b4);
+    font-size: 12px;
+}
+
+.rapid-cull-notice {
+    padding: 6px 14px;
+    color: var(--warning, #ffa726);
+    background: rgba(255, 167, 38, 0.08);
+    border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+    font-size: 12px;
+}
+
+/* ── Dense thumbnail grid ─────────────────────────────────────────────── */
+.rapid-cull-grid-wrap {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 14px 14px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb, rgba(124, 77, 255, 0.3))
+        var(--scrollbar-track, rgba(255, 255, 255, 0.03));
+}
+
+.rapid-cull-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 8px;
+    align-content: start;
+}
+
+.rapid-cull-row {
+    display: contents;
+}
+
+.rapid-cull-cell {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    padding: 5px;
+    border: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+    border-radius: var(--radius-md, 6px);
+    background: var(--bg-card, #161823);
+    cursor: pointer;
+    outline: 2px solid transparent;
+    outline-offset: 1px;
+}
+
+.rapid-cull-cell:hover {
+    background: var(--bg-hover, #222538);
+}
+
+.rapid-cull-cell.is-current {
+    border-color: var(--accent-secondary, #448aff);
+    outline: 3px solid var(--accent-secondary, #448aff);
+    box-shadow: var(--shadow-glow, 0 0 20px rgba(124, 77, 255, 0.1));
+}
+
+.rapid-cull-cell.is-locked {
+    opacity: 0.78;
+}
+
+.rapid-cull-cell-index {
+    position: absolute;
+    top: 7px;
+    left: 7px;
+    z-index: 1;
+    padding: 1px 5px;
+    border-radius: var(--radius-sm, 4px);
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+.rapid-cull-thumb {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: var(--radius-sm, 4px);
+    background: var(--bg-primary, #0a0b0f);
+}
+
+.rapid-cull-cell-name {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 12px;
+}
+
+.rapid-cull-cell-meta {
+    color: var(--text-tertiary, #8389a0);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+.rapid-cull-lock-badge,
+.rapid-cull-culled-badge,
+.rapid-cull-cell-busy {
+    align-self: flex-start;
+    padding: 1px 5px;
+    border-radius: var(--radius-sm, 4px);
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.rapid-cull-lock-badge {
+    color: var(--warning, #ffa726);
+    background: rgba(255, 167, 38, 0.16);
+}
+
+.rapid-cull-cell-busy {
+    color: var(--text-accent, #64b5f6);
+    background: rgba(100, 181, 246, 0.16);
+}
+
+.rapid-cull-cell-error {
+    color: #ffb4b4;
+    font-size: 11px;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+
+.rapid-cull-empty {
+    padding: 24px;
+    color: var(--text-secondary, #9aa0b4);
+    text-align: center;
+}
+
+/* ── Session cull log ─────────────────────────────────────────────────── */
+.rapid-cull-history {
+    max-height: 110px;
+    overflow-y: auto;
+    padding: 8px 14px;
+    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.06));
+}
+
+.rapid-cull-history h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary, #8389a0);
+}
+
+.rapid-cull-history ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-top: 4px;
+    list-style: none;
+    font-size: 11px;
+    color: var(--text-secondary, #9aa0b4);
+}
+
+.rapid-cull-culled-badge {
+    color: #ffb4b4;
+    background: rgba(239, 83, 80, 0.16);
+}

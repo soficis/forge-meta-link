@@ -4,8 +4,15 @@ import {
     toCompareMetadata,
     computeDelta,
     type CompareMetadata,
+    type DeltaKey,
 } from "../utils/metadata";
 import { CrownIcon } from "./icons";
+
+/** Visible vocabulary; the underlying delta keys stay unchanged. */
+const VISIBLE_LABELS: Partial<Record<DeltaKey, string>> = {
+    schedule: "Scheduler",
+    model: "Checkpoint",
+};
 
 export interface MetadataDeltaTableProps {
     pins: GalleryImageRecord[];
@@ -95,9 +102,10 @@ export function MetadataDeltaTable({
                                                 type="button"
                                                 className="compare-lab-btn pick-winner-btn metadata-delta-action-btn"
                                                 data-testid={`pick-winner-col-${m.id}`}
+                                                title="Set as winner"
                                                 onClick={() => onPickWinner(m.id)}
                                             >
-                                                Pick Winner
+                                                Winner
                                             </button>
                                         )
                                     )}
@@ -107,42 +115,45 @@ export function MetadataDeltaTable({
                     </tr>
                 </thead>
                 <tbody>
-                    {delta.rows.map((row) => (
-                        <tr
-                            key={row.key}
-                            className={row.isChanged ? "delta-changed" : "delta-unchanged"}
-                            data-delta-key={row.key}
-                            data-changed={row.isChanged ? "true" : "false"}
-                            aria-label={`${row.label} ${row.isChanged ? "changed" : "unchanged"}`}
-                        >
-                            <th
-                                scope="row"
-                                className="metadata-delta-row-label"
-                                data-testid={`delta-label-${row.key}`}
+                    {delta.rows.map((row) => {
+                        const displayedLabel = VISIBLE_LABELS[row.key] ?? row.label;
+                        return (
+                            <tr
+                                key={row.key}
+                                className={row.isChanged ? "delta-changed" : "delta-unchanged"}
+                                data-delta-key={row.key}
+                                data-changed={row.isChanged ? "true" : "false"}
+                                aria-label={`${displayedLabel} ${row.isChanged ? "changed" : "unchanged"}`}
                             >
-                                <span className="delta-label-text">{row.label}</span>
-                                {row.isChanged && (
-                                    <span
-                                        className="delta-changed-badge"
-                                        aria-label="changed"
-                                        data-testid={`delta-badge-${row.key}`}
-                                    >
-                                        •
-                                    </span>
-                                )}
-                            </th>
-                            {row.values.map((val, idx) => (
-                                <td
-                                    key={`${row.key}-${metas[idx].id}`}
-                                    className={`metadata-delta-cell ${row.isChanged ? "delta-cell-changed" : ""}`.trim()}
-                                    data-testid={`delta-cell-${row.key}-${idx}`}
-                                    title={val}
+                                <th
+                                    scope="row"
+                                    className="metadata-delta-row-label"
+                                    data-testid={`delta-label-${row.key}`}
                                 >
-                                    <span className="delta-cell-value">{val}</span>
-                                </td>
-                            ))}
-                        </tr>
-                    ))}
+                                    <span className="delta-label-text">{displayedLabel}</span>
+                                    {row.isChanged && (
+                                        <span
+                                            className="delta-changed-badge"
+                                            aria-label="changed"
+                                            data-testid={`delta-badge-${row.key}`}
+                                        >
+                                            •
+                                        </span>
+                                    )}
+                                </th>
+                                {row.values.map((val, idx) => (
+                                    <td
+                                        key={`${row.key}-${metas[idx].id}`}
+                                        className={`metadata-delta-cell ${row.isChanged ? "delta-cell-changed" : ""}`.trim()}
+                                        data-testid={`delta-cell-${row.key}-${idx}`}
+                                        title={val}
+                                    >
+                                        <span className="delta-cell-value">{val}</span>
+                                    </td>
+                                ))}
+                            </tr>
+                        );
+                    })}
                 </tbody>
             </table>
 

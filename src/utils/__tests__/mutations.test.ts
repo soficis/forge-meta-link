@@ -25,6 +25,7 @@ const baseParams: GenerationParams = {
     model_name: "v1-5-pruned",
     generation_type: "txt2img",
     extra_params: {},
+    text_chunks: {},
     raw_metadata: "",
 };
 

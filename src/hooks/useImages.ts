@@ -167,11 +167,15 @@ export function useScanProgress() {
                 setProgress(null);
                 setScanResult(result);
 
-                // Refresh all data when scan completes
+                // Refresh all data when scan completes. refetchOnWindowFocus is
+                // disabled app-wide, so every cached query key must be listed here.
                 queryClient.invalidateQueries({ queryKey: ["images"] });
                 queryClient.invalidateQueries({ queryKey: ["totalCount"] });
                 queryClient.invalidateQueries({ queryKey: ["topTags"] });
                 queryClient.invalidateQueries({ queryKey: ["models"] });
+                queryClient.invalidateQueries({ queryKey: ["loraTags"] });
+                queryClient.invalidateQueries({ queryKey: ["fileMtimes"] });
+                queryClient.invalidateQueries({ queryKey: ["directories"] });
             });
         };
 

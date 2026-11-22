@@ -418,4 +418,38 @@ describe("App wiring: first scan into empty library", () => {
     });
 });
 
+describe("App wiring: images query error state", () => {
+    it("renders a dedicated error panel with Retry, not the rescan empty state", async () => {
+        let failImages = true;
+        installTauriMock(
+            backend({
+                get_images_cursor: () => {
+                    if (failImages) throw new Error("db offline");
+                    return { items: [...library], next_cursor: null };
+                },
+            })
+        );
+        const { default: App } = await import("../../App");
+        render(<App />);
+
+        const errorPanel = await screen.findByTestId(
+            "images-error-state",
+            {},
+            { timeout: 3000 }
+        );
+        expect(within(errorPanel).getByText(/Couldn't load images/)).toBeTruthy();
+        expect(within(errorPanel).getByRole("button", { name: "Retry" })).toBeTruthy();
+        expect(screen.queryByText("No images available")).toBeNull();
+        expect(screen.queryByText(/Rescan your folder/)).toBeNull();
+
+        fireEvent.click(within(errorPanel).getByText("Show error details"));
+        expect(within(errorPanel).getByText("db offline")).toBeTruthy();
+
+        // Retry invalidates the images query and recovers once the backend does.
+        failImages = false;
+        fireEvent.click(within(errorPanel).getByRole("button", { name: "Retry" }));
+        expect(await screen.findByText("a.png", {}, { timeout: 3000 })).toBeTruthy();
+    });
+});
+
 

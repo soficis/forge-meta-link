@@ -1,5 +1,8 @@
 use super::*;
 
+/// `(model_name, prompt, extra_params_raw)` for one indexed image.
+type AssetReferenceRow = (Option<String>, String, Option<String>);
+
 /// A group of images sharing the same quick_hash (exact duplicates).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DuplicateGroup {
@@ -8,7 +11,60 @@ pub struct DuplicateGroup {
     pub sample_filepaths: Vec<String>,
 }
 
+/// Exact production SQL for the top-tags hot query. The EXPLAIN test in
+/// `database.rs` reuses this const so the plan it asserts is the plan we ship.
+pub(crate) const TOP_TAGS_SQL: &str = "SELECT tags.tag, COUNT(*) as usage_count
+             FROM tags
+             JOIN image_tags INDEXED BY idx_image_tags_tag_id_image_id ON image_tags.tag_id = tags.id
+             JOIN images_live ON images_live.id = image_tags.image_id
+             GROUP BY tags.id, tags.tag
+             ORDER BY usage_count DESC, tags.tag ASC
+             LIMIT ?1";
+
 impl Database {
+    /// Returns (model_name, prompt, extra_params_raw) for images in the given directories.
+    /// An empty `dirs` list returns rows for every indexed image.
+    /// Bad rows are skipped, never panicked on.
+    pub fn get_asset_reference_rows(&self, dirs: &[String]) -> SqlResult<Vec<AssetReferenceRow>> {
+        let conn = self.pool.get().map_err(pool_error)?;
+        let cleaned: Vec<String> = dirs
+            .iter()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect();
+
+        let sql = if cleaned.is_empty() {
+            "SELECT model_name, prompt, extra_params FROM images_live".to_string()
+        } else {
+            let placeholders = vec!["?"; cleaned.len()].join(", ");
+            format!(
+                "SELECT model_name, prompt, extra_params FROM images_live WHERE directory IN ({})",
+                placeholders
+            )
+        };
+        let params: Vec<Value> = cleaned.iter().map(|d| Value::Text(d.clone())).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            let model_name: Option<String> = row.get::<_, Option<String>>(0).unwrap_or(None);
+            let prompt: String = row
+                .get::<_, Option<String>>(1)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let extra_params: Option<String> = row.get::<_, Option<String>>(2).unwrap_or(None);
+            Ok((model_name, prompt, extra_params))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => out.push(r),
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
     // ────────────────────────── Tag queries ──────────────────────────
 
     /// Lists tags for autocomplete.
@@ -48,15 +104,7 @@ impl Database {
     /// Returns most common tags for quick filtering.
     pub fn get_top_tags(&self, limit: u32) -> SqlResult<Vec<TagCount>> {
         let conn = self.pool.get().map_err(pool_error)?;
-        let mut stmt = conn.prepare(
-            "SELECT tags.tag, COUNT(*) as usage_count
-             FROM tags
-             JOIN image_tags ON image_tags.tag_id = tags.id
-             JOIN images_live ON images_live.id = image_tags.image_id
-             GROUP BY tags.id, tags.tag
-             ORDER BY usage_count DESC, tags.tag ASC
-             LIMIT ?1",
-        )?;
+        let mut stmt = conn.prepare(TOP_TAGS_SQL)?;
 
         let rows = stmt.query_map(params![limit], |row| {
             Ok(TagCount {
@@ -204,7 +252,8 @@ impl Database {
         let sql = format!(
             "SELECT id, filepath, filename, directory, prompt, negative_prompt,
                     steps, sampler, cfg_scale, seed, width, height,
-                    model_hash, model_name, raw_metadata, is_favorite, is_locked
+                    model_hash, model_name, raw_metadata, is_favorite, is_locked,
+                    schedule_type, extra_params, text_chunks
              FROM images_live
              WHERE id IN ({})
              ORDER BY id DESC",
@@ -275,7 +324,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, filepath, filename, directory, prompt, negative_prompt,
                     steps, sampler, cfg_scale, seed, width, height,
-                    model_hash, model_name, raw_metadata, is_favorite, is_locked
+                    model_hash, model_name, raw_metadata, is_favorite, is_locked,
+                    schedule_type, extra_params, text_chunks
              FROM images_live
              WHERE id = ?1
              LIMIT 1",
@@ -286,6 +336,19 @@ impl Database {
             Some(Ok(record)) => Ok(Some(record)),
             _ => Ok(None),
         }
+    }
+
+    /// Live deletion-protection probe for TOCTOU re-checks.
+    /// Reads the current `is_locked` value straight from `images` (not the
+    /// `images_live` view); `NULL` counts as unlocked.
+    pub fn is_image_locked_live(&self, id: i64) -> SqlResult<bool> {
+        let conn = self.pool.get().map_err(pool_error)?;
+        let locked: i64 = conn.query_row(
+            "SELECT COALESCE(is_locked, 0) FROM images WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(locked != 0)
     }
 
     /// Counts indexed images sharing the same file stem in the given directory.
@@ -456,5 +519,293 @@ mod duplicate_groups {
             assert_eq!(count_upper, 1);
             assert_eq!(count_lower, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod schedule_extra_parity {
+    use super::*;
+    use crate::parser::GenerationParams;
+    use crate::StorageProfile;
+    use std::collections::HashMap;
+
+    fn temp_db(tag: &str) -> Database {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "forge_parity_{tag}_{}_{nanos}.db",
+            std::process::id()
+        ));
+        Database::new(&path, StorageProfile::Hdd).expect("temp db")
+    }
+
+    fn parity_params() -> GenerationParams {
+        let mut extra = HashMap::new();
+        extra.insert("distilled_cfg_scale".to_string(), "6.5".to_string());
+        extra.insert(
+            "img2img_background_color".to_string(),
+            "(255,255,255)".to_string(),
+        );
+        GenerationParams {
+            prompt: "parity probe".to_string(),
+            raw_metadata: "parity probe".to_string(),
+            schedule_type: Some("karras".to_string()),
+            extra_params: extra,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn by_id_readers_return_schedule_type_and_extra_params() {
+        let db = temp_db("ok");
+        let id = db
+            .upsert_image(
+                "/parity/a.png",
+                "a.png",
+                "/parity",
+                &parity_params(),
+                Some(1),
+            )
+            .expect("upsert");
+
+        let by_id = db
+            .get_image_by_id(id)
+            .expect("get_image_by_id")
+            .expect("row missing");
+        assert_eq!(by_id.schedule_type.as_deref(), Some("karras"));
+        let extra = by_id.extra_params.as_ref().expect("extra_params missing");
+        assert_eq!(
+            extra.get("distilled_cfg_scale").map(String::as_str),
+            Some("6.5")
+        );
+        assert_eq!(
+            extra.get("img2img_background_color").map(String::as_str),
+            Some("(255,255,255)")
+        );
+
+        let by_ids = db.get_images_by_ids(&[id]).expect("get_images_by_ids");
+        assert_eq!(by_ids.len(), 1);
+        assert_eq!(by_ids[0].schedule_type.as_deref(), Some("karras"));
+        assert_eq!(by_ids[0].extra_params, by_id.extra_params);
+    }
+
+    #[test]
+    fn corrupt_or_absent_extra_params_json_reads_as_none() {
+        let db = temp_db("corrupt");
+        let id = db
+            .upsert_image(
+                "/parity/b.png",
+                "b.png",
+                "/parity",
+                &parity_params(),
+                Some(1),
+            )
+            .expect("upsert");
+
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.execute(
+            "UPDATE images SET extra_params = 'not-json{{{' WHERE id = ?1",
+            params![id],
+        )
+        .expect("corrupt extra_params");
+
+        let corrupt = db
+            .get_image_by_id(id)
+            .expect("get_image_by_id")
+            .expect("row missing");
+        assert_eq!(corrupt.extra_params, None);
+        assert_eq!(
+            corrupt.schedule_type.as_deref(),
+            Some("karras"),
+            "a bad extra_params cell must not fail the row read"
+        );
+        let corrupt_batch = db.get_images_by_ids(&[id]).expect("get_images_by_ids");
+        assert_eq!(corrupt_batch.len(), 1);
+        assert_eq!(corrupt_batch[0].extra_params, None);
+
+        conn.execute(
+            "UPDATE images SET extra_params = NULL WHERE id = ?1",
+            params![id],
+        )
+        .expect("null extra_params");
+        let nulled = db
+            .get_image_by_id(id)
+            .expect("get_image_by_id")
+            .expect("row missing");
+        assert_eq!(nulled.extra_params, None);
+    }
+
+    #[test]
+    fn text_chunks_round_trip_through_both_by_id_readers() {
+        let db = temp_db("chunks");
+        let mut params = parity_params();
+        params.text_chunks.insert(
+            "parameters".to_string(),
+            "a\nSteps: 1, Sampler: Euler".to_string(),
+        );
+        params
+            .text_chunks
+            .insert("comment".to_string(), "from ztxt".to_string());
+        params
+            .text_chunks
+            .insert("description".to_string(), "from itxt".to_string());
+        let id = db
+            .upsert_image("/parity/c.png", "c.png", "/parity", &params, Some(1))
+            .expect("upsert");
+
+        for record in [
+            db.get_image_by_id(id)
+                .expect("get_image_by_id")
+                .expect("row missing"),
+            db.get_images_by_ids(&[id])
+                .expect("get_images_by_ids")
+                .into_iter()
+                .next()
+                .expect("row missing"),
+        ] {
+            let chunks = record.text_chunks.as_ref().expect("text_chunks missing");
+            assert_eq!(
+                chunks.get("parameters").map(String::as_str),
+                Some("a\nSteps: 1, Sampler: Euler")
+            );
+            assert_eq!(chunks.get("comment").map(String::as_str), Some("from ztxt"));
+            assert_eq!(
+                chunks.get("description").map(String::as_str),
+                Some("from itxt")
+            );
+        }
+
+        // Bulk path persists text_chunks too.
+        let mut bulk_params = parity_params();
+        bulk_params
+            .text_chunks
+            .insert("parameters".to_string(), "bulk".to_string());
+        let bulk_record = crate::database::BulkRecord {
+            filepath: "/parity/bulk.png".to_string(),
+            filename: "bulk.png".to_string(),
+            directory: "/parity".to_string(),
+            params: bulk_params,
+            file_mtime: Some(2),
+            file_size: None,
+            quick_hash: None,
+            tags: Vec::new(),
+        };
+        let inserted = db
+            .bulk_upsert_with_tags(std::slice::from_ref(&bulk_record))
+            .expect("bulk upsert");
+        assert_eq!(inserted, 1);
+        let bulk_id = db
+            .get_image_id_by_filepath("/parity/bulk.png")
+            .expect("lookup")
+            .expect("row missing");
+        let bulk_row = db
+            .get_image_by_id(bulk_id)
+            .expect("get_image_by_id")
+            .expect("row missing");
+        assert_eq!(
+            bulk_row
+                .text_chunks
+                .as_ref()
+                .and_then(|m| m.get("parameters"))
+                .map(String::as_str),
+            Some("bulk")
+        );
+    }
+
+    #[test]
+    fn corrupt_or_absent_text_chunks_json_reads_as_none() {
+        let db = temp_db("chunks-corrupt");
+        let mut params = parity_params();
+        params
+            .text_chunks
+            .insert("parameters".to_string(), "x".to_string());
+        let id = db
+            .upsert_image("/parity/d.png", "d.png", "/parity", &params, Some(1))
+            .expect("upsert");
+
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.execute(
+            "UPDATE images SET text_chunks = 'not-json{{{' WHERE id = ?1",
+            params![id],
+        )
+        .expect("corrupt text_chunks");
+
+        for record in [
+            db.get_image_by_id(id)
+                .expect("get_image_by_id")
+                .expect("row missing"),
+            db.get_images_by_ids(&[id])
+                .expect("get_images_by_ids")
+                .into_iter()
+                .next()
+                .expect("row missing"),
+        ] {
+            assert_eq!(record.text_chunks, None);
+            assert_eq!(
+                record.schedule_type.as_deref(),
+                Some("karras"),
+                "a bad text_chunks cell must not fail the row read"
+            );
+        }
+
+        conn.execute(
+            "UPDATE images SET text_chunks = NULL WHERE id = ?1",
+            params![id],
+        )
+        .expect("null text_chunks");
+        let nulled = db
+            .get_image_by_id(id)
+            .expect("get_image_by_id")
+            .expect("row missing");
+        assert_eq!(nulled.text_chunks, None);
+    }
+}
+
+#[cfg(test)]
+mod live_lock_probe {
+    use super::*;
+    use crate::StorageProfile;
+
+    fn temp_db(tag: &str) -> Database {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "forge_livelock_{tag}_{}_{nanos}.db",
+            std::process::id()
+        ));
+        Database::new(&path, StorageProfile::Hdd).expect("temp db")
+    }
+
+    #[test]
+    fn is_image_locked_live_tracks_locks_set_after_initial_resolve() {
+        let db = temp_db("probe");
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.execute(
+            "INSERT INTO images(filepath, filename, directory, prompt, quick_hash, file_mtime)
+             VALUES ('/live/a.png', 'a.png', '/live', 'p', NULL, 100)",
+            [],
+        )
+        .expect("insert");
+        let id: i64 = conn.last_insert_rowid();
+        drop(conn);
+
+        // Initial resolve sees the row unlocked (stale snapshot analogue).
+        let stale = db.get_images_by_ids(&[id]).expect("resolve");
+        assert_eq!(stale.len(), 1);
+        assert!(!stale[0].is_locked);
+        assert!(!db.is_image_locked_live(id).expect("probe"));
+
+        // Lock lands after the initial resolve: the live probe must see it.
+        db.set_image_locked(id, true).expect("lock");
+        assert!(db.is_image_locked_live(id).expect("probe locked"));
+
+        // Unlock is visible too; a missing row surfaces an error.
+        db.set_image_locked(id, false).expect("unlock");
+        assert!(!db.is_image_locked_live(id).expect("probe unlocked"));
+        assert!(db.is_image_locked_live(id + 10_000).is_err());
     }
 }

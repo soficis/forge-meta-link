@@ -18,16 +18,19 @@ export interface ModelFamilyDefinition {
 export const MODEL_FAMILIES: ModelFamilyDefinition[] = modelFamiliesData as ModelFamilyDefinition[];
 
 export type ModelFamilyId =
+    | "qwen_image_edit"
     | "qwen_image"
+    | "flux2_klein"
     | "flux"
+    | "krea_identity_edit"
     | "krea2_turbo"
     | "zimage_turbo"
+    | "anima"
+    | "moss_image"
+    | "ernie_image"
     | "ponyxl"
     | "sdxl"
-    | "sd35"
-    | "sd3"
     | "sd15"
-    | "sd21"
     | "lumina"
     | "pixart"
     | "kolors"
@@ -35,8 +38,11 @@ export type ModelFamilyId =
     | "hunyuan"
     | "sana"
     | "wan"
+    | "chroma_hd"
     | "chroma"
     | "vace"
+    | "pid"
+    | "mugen"
     | "unknown";
 
 export const RESOLUTION_PRESETS: Record<string, ResolutionPreset[]> = MODEL_FAMILIES.reduce(
@@ -48,15 +54,28 @@ export const RESOLUTION_PRESETS: Record<string, ResolutionPreset[]> = MODEL_FAMI
 );
 
 // Pre-compiled regexes for family detection ordered specific before generic.
-// Specific ordering guarantees e.g. SD3.5 is checked before SD3, WAN2 before WAN, Krea 2 before Turbo, etc.
+// Specific ordering guarantees the edit/2.x variants win over their base families
+// (Qwen-Edit before Qwen, Flux.2 before Flux, Krea Identity before Krea 2 Turbo,
+// Chroma1-HD before Chroma), while PiD comes last so its SDXL/Qwen/Flux variants
+// keep their more specific family.
 const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boolean }> = [
+    {
+        id: "qwen_image_edit",
+        test: (s) =>
+            s.includes("qwen") &&
+            (s.includes("edit") || /qwen[\s_-]*2[._-]?1/.test(s)),
+    },
     {
         id: "qwen_image",
         test: (s) =>
             s.includes("qwen") ||
             s.includes("2512") ||
-            /qwen[\\s_-]*image/.test(s) ||
-            /qwen[\\s_-]*2[\\._-]?5/.test(s),
+            /qwen[\s_-]*image/.test(s) ||
+            /qwen[\s_-]*2[._-]?5/.test(s),
+    },
+    {
+        id: "krea_identity_edit",
+        test: (s) => s.includes("krea") && s.includes("identity"),
     },
     {
         id: "krea2_turbo",
@@ -67,17 +86,23 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
         test: (s) => s.includes("z-image") || s.includes("zimage"),
     },
     {
+        id: "flux2_klein",
+        test: (s) =>
+            s.includes("flux") &&
+            (s.includes("klein") || s.includes("flux2") || s.includes("flux.2")),
+    },
+    {
         id: "flux",
         test: (s) => s.includes("flux"),
     },
     {
-        id: "sd35",
-        test: (s) => /sd[\s_-]*3[._-]?5/.test(s),
+        id: "chroma_hd",
+        test: (s) => s.includes("chroma") && s.includes("hd"),
     },
-    {
-        id: "sd3",
-        test: (s) => /sd[\s_-]*3(?:[^0-9.]|$)/.test(s) || s.includes("stable diffusion 3"),
-    },
+    { id: "anima", test: (s) => s.includes("anima") },
+    { id: "moss_image", test: (s) => s.includes("moss") },
+    { id: "ernie_image", test: (s) => s.includes("ernie") },
+    { id: "mugen", test: (s) => s.includes("mugen") },
     {
         id: "ponyxl",
         test: (s) => s.includes("pony"),
@@ -94,34 +119,11 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
             s.includes("stable diffusion 1.5") ||
             s.includes("v1-5"),
     },
-    {
-        id: "sd21",
-        test: (s) =>
-            /sd[\s_-]*2[._-]?1/.test(s) ||
-            s.includes("sd21") ||
-            s.includes("stable diffusion 2.1") ||
-            s.includes("v2-1"),
-    },
-    {
-        id: "lumina",
-        test: (s) => s.includes("lumina"),
-    },
-    {
-        id: "pixart",
-        test: (s) => s.includes("pixart"),
-    },
-    {
-        id: "kolors",
-        test: (s) => s.includes("kolors"),
-    },
-    {
-        id: "auraflow",
-        test: (s) => s.includes("auraflow"),
-    },
-    {
-        id: "hunyuan",
-        test: (s) => s.includes("hunyuan"),
-    },
+    { id: "lumina", test: (s) => s.includes("lumina") },
+    { id: "pixart", test: (s) => s.includes("pixart") },
+    { id: "kolors", test: (s) => s.includes("kolors") },
+    { id: "auraflow", test: (s) => s.includes("auraflow") },
+    { id: "hunyuan", test: (s) => s.includes("hunyuan") },
     {
         id: "wan",
         test: (s) =>
@@ -129,17 +131,17 @@ const DETECTION_RULES: Array<{ id: ModelFamilyId; test: (lowered: string) => boo
             s.includes("wanvideo") ||
             /(?:^|[\s_-])wan(?:[\s_.-]|$)/.test(s),
     },
-    {
-        id: "sana",
-        test: (s) => /(?:^|[\s_-])sana(?:[\s_.-]|$)/.test(s),
-    },
+    { id: "sana", test: (s) => /(?:^|[\s_-])sana(?:[\s_.-]|$)/.test(s) },
     {
         id: "chroma",
         test: (s) => s.includes("chroma"),
     },
+    { id: "vace", test: (s) => s.includes("vace") },
     {
-        id: "vace",
-        test: (s) => s.includes("vace"),
+        // Word boundary keeps "pixel" / "rapid" out; placed last so PiD variants
+        // of SDXL/Qwen/Flux keep their more specific detection.
+        id: "pid",
+        test: (s) => /(?:^|[^a-z])pid(?![a-z])/.test(s),
     },
 ];
 

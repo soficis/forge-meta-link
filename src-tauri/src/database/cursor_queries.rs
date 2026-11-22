@@ -40,7 +40,7 @@ impl Database {
                 "SELECT id, filepath, filename, directory, seed, width, height, model_name, is_favorite, is_locked, file_mtime, {} AS sort_value
                  FROM images_live AS images
                  WHERE 1=1",
-                sort.sort_expr()
+                sort.sort_expr(Some("images"))
             )
         };
         let mut par = Vec::<Value>::new();
@@ -54,7 +54,7 @@ impl Database {
                 par.push(Value::Integer(cid));
             } else if let Some(sort_value) = cursor_sort {
                 let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
+                let sort_expr = sort.sort_expr(Some("images"));
                 sql.push_str(&format!(
                     " AND ({} {} ? OR ({} = ? AND id {} ?))",
                     sort_expr, op, sort_expr, op
@@ -67,7 +67,10 @@ impl Database {
                 par.push(Value::Integer(cid));
             }
         }
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
+        sql.push_str(&format!(
+            " ORDER BY {} LIMIT ?",
+            sort.order_clause(Some("images"))
+        ));
         par.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -102,9 +105,15 @@ impl Database {
     }
 
     /// Cursor-based search: tries porter first, falls back to trigram.
+    /// The trigram fallback only runs on the first page: firing it on an
+    /// exhausted later page would silently append substring matches from a
+    /// different query semantics.
     pub fn search_cursor(&self, params: SearchCursorParams<'_>) -> SqlResult<CursorPage> {
         let porter = self.search_cursor_porter(params)?;
-        if !porter.items.is_empty() || query_has_negation(params.query) {
+        if !porter.items.is_empty()
+            || query_has_negation(params.query)
+            || params.options.cursor.is_some()
+        {
             return Ok(porter);
         }
         self.search_cursor_trigram(params)
@@ -167,7 +176,7 @@ impl Database {
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images_live AS images{}{}",
-                sort.sort_expr(),
+                sort.sort_expr(Some("images")),
                 fts_join,
                 fts_where
             )
@@ -187,7 +196,7 @@ impl Database {
                 params_vec.push(Value::Integer(cid));
             } else if let Some(sort_value) = cursor_sort {
                 let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
+                let sort_expr = sort.sort_expr(Some("images"));
                 sql.push_str(&format!(
                     " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
                     sort_expr, op, sort_expr, op
@@ -201,7 +210,10 @@ impl Database {
             }
         }
 
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
+        sql.push_str(&format!(
+            " ORDER BY {} LIMIT ?",
+            sort.order_clause(Some("images"))
+        ));
         params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -290,7 +302,7 @@ impl Database {
                  FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
-                sort.sort_expr()
+                sort.sort_expr(Some("images"))
             )
         };
         let mut params_vec = vec![Value::Text(match_expr)];
@@ -308,7 +320,7 @@ impl Database {
                 params_vec.push(Value::Integer(cid));
             } else if let Some(sort_value) = cursor_sort {
                 let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
+                let sort_expr = sort.sort_expr(Some("images"));
                 sql.push_str(&format!(
                     " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
                     sort_expr, op, sort_expr, op
@@ -321,7 +333,10 @@ impl Database {
                 params_vec.push(Value::Integer(cid));
             }
         }
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
+        sql.push_str(&format!(
+            " ORDER BY {} LIMIT ?",
+            sort.order_clause(Some("images"))
+        ));
         params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -358,9 +373,14 @@ impl Database {
     }
 
     /// Cursor-based filtering with tag include/exclude sets.
+    /// Trigram fallback fires on the first page only, never on an exhausted cursor.
     pub fn filter_images_cursor(&self, params: FilterCursorParams<'_>) -> SqlResult<CursorPage> {
         let porter = self.filter_images_cursor_porter(params)?;
         if !porter.items.is_empty() {
+            return Ok(porter);
+        }
+
+        if params.options.cursor.is_some() {
             return Ok(porter);
         }
 
@@ -427,7 +447,7 @@ impl Database {
                 "SELECT images.id, images.filepath, images.filename, images.directory,
                         images.seed, images.width, images.height, images.model_name, images.is_favorite, images.is_locked, images.file_mtime, {} AS sort_value
                  FROM images_live AS images{}",
-                sort.sort_expr(),
+                sort.sort_expr(Some("images")),
                 fts_join
             )
         };
@@ -513,7 +533,7 @@ impl Database {
                 params_vec.push(Value::Integer(cid));
             } else if let Some(sort_value) = cursor_sort {
                 let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
+                let sort_expr = sort.sort_expr(Some("images"));
                 sql.push_str(&format!(
                     " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
                     sort_expr, op, sort_expr, op
@@ -527,7 +547,10 @@ impl Database {
             }
         }
 
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
+        sql.push_str(&format!(
+            " ORDER BY {} LIMIT ?",
+            sort.order_clause(Some("images"))
+        ));
         params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -616,7 +639,7 @@ impl Database {
                  FROM images_live AS images
                  JOIN images_fts_tri ON images.id = images_fts_tri.rowid
                  WHERE images_fts_tri MATCH ?",
-                sort.sort_expr()
+                sort.sort_expr(Some("images"))
             )
         };
         let mut params_vec = vec![Value::Text(format!(
@@ -639,7 +662,7 @@ impl Database {
                 params_vec.push(Value::Integer(cid));
             } else if let Some(sort_value) = cursor_sort {
                 let op = sort.cursor_op();
-                let sort_expr = sort.sort_expr();
+                let sort_expr = sort.sort_expr(Some("images"));
                 sql.push_str(&format!(
                     " AND ({} {} ? OR ({} = ? AND images.id {} ?))",
                     sort_expr, op, sort_expr, op
@@ -699,7 +722,10 @@ impl Database {
             params_vec.push(Value::Text(fts_phrase));
         }
 
-        sql.push_str(&format!(" ORDER BY {} LIMIT ?", sort.order_clause()));
+        sql.push_str(&format!(
+            " ORDER BY {} LIMIT ?",
+            sort.order_clause(Some("images"))
+        ));
         params_vec.push(Value::Integer(limit.clamp(1, 500) as i64));
 
         let mut stmt = conn.prepare(&sql)?;

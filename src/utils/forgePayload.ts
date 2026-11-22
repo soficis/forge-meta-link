@@ -14,6 +14,8 @@ export interface GenerationParams {
     model_name: string | null;
     generation_type: string | null;
     extra_params: Record<string, string>;
+    /** All PNG text chunks (tEXt/zTXt/iTXt); empty when the record carries none. Never inferred. */
+    text_chunks: Record<string, string>;
     raw_metadata: string;
 }
 
@@ -51,6 +53,41 @@ function parseI64(value: string | null | undefined): number | undefined {
     return Number.isSafeInteger(n) ? n : undefined;
 }
 
+// Mirrors Rust `build_requeue_payload` (forge_api.rs:775-786): either Clip skip key is accepted,
+// but only a whole number becomes the numeric Forge option `CLIP_stop_at_last_layers`.
+function parseClipSkip(extraParams: Record<string, string>): number | undefined {
+    const raw = (extraParams["Clip skip"] ?? extraParams["clip_skip"])?.trim();
+    if (!raw) return undefined;
+    const value = Number(raw);
+    return Number.isInteger(value) ? value : undefined;
+}
+
+export function normalizeScheduler(value: string): string {
+    const lowered = value.trim().toLowerCase();
+    switch (lowered) {
+        case "karras":
+            return "karras";
+        case "exponential":
+            return "exponential";
+        case "sgm uniform":
+            return "sgm_uniform";
+        case "simple":
+            return "simple";
+        case "beta":
+            return "beta";
+        case "linear":
+            return "linear";
+        case "ddim uniform":
+            return "ddim_uniform";
+        case "normal":
+            return "normal";
+        case "uniform":
+            return "uniform";
+        default:
+            return lowered.split(/\s+/).filter(Boolean).join("_");
+    }
+}
+
 export function buildForgePayload(
     params: GenerationParams,
     options?: {
@@ -61,12 +98,17 @@ export function buildForgePayload(
 ): ForgeTxt2ImgPayload {
     const includeSeed = options?.includeSeed ?? true;
     const samplerName = parseOptionalText(params.sampler);
-    const scheduler = parseOptionalText(params.schedule_type);
+    const schedulerRaw = parseOptionalText(params.schedule_type);
+    const scheduler = schedulerRaw === undefined ? undefined : normalizeScheduler(schedulerRaw);
     const modelCheckpoint = parseOptionalText(params.model_name);
 
-    const overrideSettings: Record<string, unknown> | undefined = modelCheckpoint
-        ? { sd_model_checkpoint: modelCheckpoint }
-        : undefined;
+    // Only valid Forge options belong in override_settings (sd_model_checkpoint and Clip skip),
+    // matching the Rust requeue payload. Sampler/scheduler/cfg/seed stay top-level fields.
+    const overrides: Record<string, unknown> = {};
+    if (modelCheckpoint) overrides["sd_model_checkpoint"] = modelCheckpoint;
+    const clipSkip = parseClipSkip(params.extra_params);
+    if (clipSkip !== undefined) overrides["CLIP_stop_at_last_layers"] = clipSkip;
+    const overrideSettings = Object.keys(overrides).length > 0 ? overrides : undefined;
 
     // LoRAs are applied by Forge from the <lora:name:weight> tags in the prompt. A "LoRA"
     // always-on script does not exist and makes Forge answer HTTP 422.
@@ -102,36 +144,17 @@ export function buildForgePayload(
     };
 }
 
+/**
+ * Requeue mirrors Rust `build_requeue_payload` (forge_api.rs:757-793): override_settings holds
+ * only `sd_model_checkpoint` and integer Clip skip. Sampler, scheduler, cfg and seed are
+ * top-level payload fields — never injected into override_settings. `buildForgePayload` already
+ * builds that shape and gates the top-level seed on includeSeed, so the two paths stay identical.
+ */
 export function buildRequeuePayload(
     params: GenerationParams,
     includeSeed = true
 ): ForgeTxt2ImgPayload {
-    const base = buildForgePayload(params, { includeSeed });
-    const overrides: Record<string, unknown> = { ...(base.override_settings ?? {}) };
-
-    const sampler = parseOptionalText(params.sampler);
-    const scheduler = parseOptionalText(params.schedule_type);
-    const cfg = parseF32(params.cfg_scale);
-    const seed = parseI64(params.seed);
-    const model = parseOptionalText(params.model_name);
-
-    if (model) overrides["sd_model_checkpoint"] = model;
-    if (sampler) {
-        overrides["sd_sampler"] = sampler;
-        overrides["sampler_name"] = sampler;
-    }
-    if (scheduler) overrides["sd_scheduler"] = scheduler;
-    if (cfg !== undefined) overrides["cfg_scale"] = cfg;
-    if (includeSeed && seed !== undefined) overrides["seed"] = seed;
-    if (!includeSeed) delete overrides["seed"];
-
-    const next: ForgeTxt2ImgPayload = {
-        ...base,
-        override_settings: Object.keys(overrides).length > 0 ? overrides : undefined,
-    };
-
-
-    return next;
+    return buildForgePayload(params, { includeSeed });
 }
 
 export function payloadToJson(payload: ForgeTxt2ImgPayload): string {

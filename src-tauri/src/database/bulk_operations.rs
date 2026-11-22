@@ -41,8 +41,8 @@ impl Database {
                     "INSERT INTO images
                         (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
                          schedule_type, cfg_scale, seed, seed_int, width, height, model_hash, model_name,
-                         generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                         generation_type, raw_metadata, extra_params, text_chunks, file_mtime, file_size, quick_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                      ON CONFLICT(filepath) DO UPDATE SET
                          filename=excluded.filename,
                          directory=excluded.directory,
@@ -61,6 +61,7 @@ impl Database {
                          generation_type=excluded.generation_type,
                          raw_metadata=excluded.raw_metadata,
                          extra_params=excluded.extra_params,
+                         text_chunks=excluded.text_chunks,
                          file_mtime=excluded.file_mtime,
                          file_size=excluded.file_size,
                          quick_hash=excluded.quick_hash,
@@ -89,6 +90,8 @@ impl Database {
                     let record = &item.record;
                     let extra =
                         serde_json::to_string(&record.params.extra_params).unwrap_or_default();
+                    let chunks_json =
+                        serde_json::to_string(&record.params.text_chunks).unwrap_or_default();
                     let generation_type = record
                         .params
                         .generation_type
@@ -119,6 +122,7 @@ impl Database {
                             generation_type,
                             record.params.raw_metadata,
                             extra,
+                            chunks_json,
                             record.file_mtime,
                             record.file_size,
                             record.quick_hash,
@@ -193,6 +197,7 @@ impl Database {
     ) -> SqlResult<i64> {
         let conn = self.pool.get().map_err(pool_error)?;
         let extra = serde_json::to_string(&params.extra_params).unwrap_or_default();
+        let chunks_json = serde_json::to_string(&params.text_chunks).unwrap_or_default();
         let generation_type = params
             .generation_type
             .clone()
@@ -204,8 +209,8 @@ impl Database {
             "INSERT INTO images
                 (filepath, filename, directory, prompt, negative_prompt, steps, sampler,
                  schedule_type, cfg_scale, seed, seed_int, width, height, model_hash, model_name,
-                 generation_type, raw_metadata, extra_params, file_mtime, file_size, quick_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                 generation_type, raw_metadata, extra_params, text_chunks, file_mtime, file_size, quick_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(filepath) DO UPDATE SET
                  filename=excluded.filename,
                  directory=excluded.directory,
@@ -224,6 +229,7 @@ impl Database {
                  generation_type=excluded.generation_type,
                  raw_metadata=excluded.raw_metadata,
                  extra_params=excluded.extra_params,
+                 text_chunks=excluded.text_chunks,
                  file_mtime=excluded.file_mtime,
                  file_size=excluded.file_size,
                  quick_hash=excluded.quick_hash,
@@ -249,6 +255,7 @@ impl Database {
                 generation_type,
                 params.raw_metadata,
                 extra,
+                chunks_json,
                 file_mtime,
                 Option::<i64>::None,
                 Option::<String>::None,
@@ -296,8 +303,20 @@ impl Database {
     /// Culls images using either Trash mode (culled_at tombstone) or Permanent mode
     /// (ghost recipe + blank text + ghost://<id> filepath to evict FTS while preserving lineage).
     pub fn cull_images(&self, ids: &[i64], mode: CullMode) -> SqlResult<usize> {
+        self.cull_images_with_blocked(ids, mode)
+            .map(|(culled, _)| culled)
+    }
+
+    /// Same as [`Self::cull_images`] but also reports ids that were blocked by
+    /// deletion protection (`is_locked`). Locked rows are never modified and
+    /// their tags are left untouched.
+    pub fn cull_images_with_blocked(
+        &self,
+        ids: &[i64],
+        mode: CullMode,
+    ) -> SqlResult<(usize, Vec<i64>)> {
         if ids.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let mut conn = self.pool.get().map_err(pool_error)?;
@@ -306,33 +325,86 @@ impl Database {
         let placeholders = vec!["?"; ids.len()].join(", ");
         let params_ids: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
 
-        // 1. Remove image_tags for the culled ids
-        tx.execute(
-            &format!(
-                "DELETE FROM image_tags WHERE image_id IN ({})",
-                placeholders
-            ),
-            params_from_iter(params_ids.clone()),
-        )?;
+        // Resolve currently-locked ids first so their tags are never touched.
+        let mut blocked: Vec<i64> = Vec::new();
+        {
+            let sql = format!(
+                "SELECT id FROM images WHERE id IN ({placeholders}) AND COALESCE(is_locked, 0) != 0"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(params_ids.clone()), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for row in rows {
+                blocked.push(row?);
+            }
+        }
+        let blocked_set: std::collections::HashSet<i64> = blocked.iter().copied().collect();
+        let allowed: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !blocked_set.contains(id))
+            .collect();
 
-        // 2. Prune orphaned tags
-        tx.execute(
-            "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)",
-            [],
-        )?;
+        if allowed.is_empty() {
+            tx.commit()?;
+            blocked.sort_unstable();
+            return Ok((0, blocked));
+        }
 
-        // 3. Apply culling per mode; `culled` counts rows actually changed.
-        let culled = match mode {
+        // Re-check the lock per row before deleting tags: a lock that landed
+        // after the snapshot above must keep its tags and be reported as
+        // blocked instead of culled.
+        let mut still_allowed: Vec<i64> = Vec::with_capacity(allowed.len());
+        let mut extra_blocked: Vec<i64> = Vec::new();
+        {
+            let mut lock_stmt =
+                tx.prepare("SELECT COALESCE(is_locked, 0) FROM images WHERE id = ?1")?;
+            for id in &allowed {
+                let locked: i64 = lock_stmt
+                    .query_row(params![id], |row| row.get(0))
+                    .unwrap_or(0);
+                if locked != 0 {
+                    extra_blocked.push(*id);
+                } else {
+                    still_allowed.push(*id);
+                }
+            }
+        }
+
+        if still_allowed.is_empty() {
+            tx.commit()?;
+            blocked.extend(extra_blocked);
+            blocked.sort_unstable();
+            return Ok((0, blocked));
+        }
+
+        let allowed_placeholders = vec!["?"; still_allowed.len()].join(", ");
+        let allowed_params: Vec<Value> =
+            still_allowed.iter().map(|id| Value::Integer(*id)).collect();
+
+        // 1. Apply culling per mode with a final lock guard; collect only
+        // the ids actually culled. Tags are deleted afterwards for those
+        // ids only so a lock committed after the re-check keeps its tags.
+        let (culled, culled_ids): (usize, Vec<i64>) = match mode {
             CullMode::Trash => {
                 let sql = format!(
-                    "UPDATE images SET culled_at = strftime('%s','now') WHERE id IN ({})",
-                    placeholders
+                    "UPDATE images SET culled_at = strftime('%s','now') WHERE id IN ({}) AND COALESCE(is_locked, 0) = 0 RETURNING id",
+                    allowed_placeholders
                 );
-                tx.execute(&sql, params_from_iter(params_ids))?
+                let mut stmt = tx.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(params_from_iter(allowed_params), |row| row.get::<_, i64>(0))?;
+                let mut culled_ids = Vec::new();
+                for row in rows {
+                    culled_ids.push(row?);
+                }
+                let n = culled_ids.len();
+                (n, culled_ids)
             }
             CullMode::Permanent => {
                 let mut select_stmt = tx.prepare(
-                    "SELECT filepath, seed, cfg_scale, steps, sampler, schedule_type, model_name
+                    "SELECT filepath, seed, cfg_scale, steps, sampler, schedule_type, model_name, COALESCE(is_locked, 0)
                      FROM images WHERE id = ?1",
                 )?;
                 let mut update_stmt = tx.prepare(
@@ -349,7 +421,7 @@ impl Database {
                         directory = '',
                         quick_hash = NULL,
                         filepath = ?2
-                     WHERE id = ?3",
+                     WHERE id = ?3 AND COALESCE(is_locked, 0) = 0",
                 )?;
                 let mut del_lineage = tx.prepare(
                     "DELETE FROM lineage WHERE child_filepath = ?1 OR parent_filepath = ?1",
@@ -359,7 +431,8 @@ impl Database {
                 )?;
 
                 let mut culled = 0usize;
-                for id in ids {
+                let mut culled_ids = Vec::new();
+                for id in &still_allowed {
                     let row_res = select_stmt.query_row(params![id], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -369,6 +442,7 @@ impl Database {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, i64>(7)?,
                         ))
                     });
 
@@ -379,7 +453,13 @@ impl Database {
                         Err(rusqlite::Error::QueryReturnedNoRows) => None,
                         Err(e) => return Err(e),
                     };
-                    if let Some((old_fp, seed, cfg, steps, sampler, scheduler, model)) = found {
+                    if let Some((old_fp, seed, cfg, steps, sampler, scheduler, model, locked)) =
+                        found
+                    {
+                        if locked != 0 {
+                            extra_blocked.push(*id);
+                            continue;
+                        }
                         del_lineage.execute(params![old_fp])?;
                         del_lineage_overrides.execute(params![old_fp])?;
 
@@ -392,16 +472,53 @@ impl Database {
                             "model": model,
                         });
                         let ghost_path = format!("ghost://{}", id);
-                        update_stmt.execute(params![recipe.to_string(), ghost_path, id])?;
-                        culled += 1;
+                        let changed =
+                            update_stmt.execute(params![recipe.to_string(), ghost_path, id])?;
+                        if changed > 0 {
+                            culled += 1;
+                            culled_ids.push(*id);
+                        } else {
+                            extra_blocked.push(*id);
+                        }
                     }
                 }
-                culled
+                (culled, culled_ids)
             }
         };
 
+        // 2. Remove image_tags only for rows actually culled, then prune orphans.
+        if !culled_ids.is_empty() {
+            let culled_placeholders = vec!["?"; culled_ids.len()].join(", ");
+            let culled_params: Vec<Value> =
+                culled_ids.iter().map(|id| Value::Integer(*id)).collect();
+            tx.execute(
+                &format!(
+                    "DELETE FROM image_tags WHERE image_id IN ({})",
+                    culled_placeholders
+                ),
+                params_from_iter(culled_params),
+            )?;
+            tx.execute(
+                "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)",
+                [],
+            )?;
+        }
+
+        // 3. Every still_allowed id that was not actually culled was blocked
+        // by the final guard; report it exactly once.
+        {
+            let culled_set: std::collections::HashSet<i64> = culled_ids.iter().copied().collect();
+            for id in &still_allowed {
+                if !culled_set.contains(id) && !extra_blocked.contains(id) {
+                    extra_blocked.push(*id);
+                }
+            }
+        }
+
         tx.commit()?;
-        Ok(culled)
+        blocked.extend(extra_blocked);
+        blocked.sort_unstable();
+        Ok((culled, blocked))
     }
 
     // ────────────────────────────── Reads ──────────────────────────────
@@ -564,24 +681,34 @@ impl Database {
         let tx = conn.transaction()?;
         tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
 
-        let old_filepath: Option<String> = tx
+        let row: Option<(String, i64)> = tx
             .query_row(
-                "SELECT filepath FROM images WHERE id = ?1",
+                "SELECT filepath, COALESCE(is_locked, 0) FROM images WHERE id = ?1",
                 params![image_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
 
-        let Some(old_filepath) = old_filepath else {
+        let Some((old_filepath, locked)) = row else {
             return Ok(false);
         };
+
+        if locked != 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
 
         let updated = tx.execute(
             "UPDATE images
              SET filepath = ?1, filename = ?2, directory = ?3
-             WHERE id = ?4",
+             WHERE id = ?4 AND COALESCE(is_locked, 0) = 0",
             params![filepath, filename, directory, image_id],
         )?;
+
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
 
         if old_filepath != filepath {
             tx.execute(
@@ -636,4 +763,116 @@ fn demote_stale_culled_row(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cull_lock_tests {
+    use super::*;
+    use crate::StorageProfile;
+
+    fn temp_db(tag: &str) -> Database {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "forge_culllock_{tag}_{}_{nanos}.db",
+            std::process::id()
+        ));
+        Database::new(&path, StorageProfile::Hdd).expect("temp db")
+    }
+
+    fn insert_image(db: &Database, filepath: &str, locked: bool) -> i64 {
+        let filename = filepath.rsplit('/').next().unwrap_or(filepath);
+        let directory = filepath.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.execute(
+            "INSERT INTO images(filepath, filename, directory, prompt, quick_hash, file_mtime, is_locked)
+             VALUES (?1, ?2, ?3, 'p', NULL, 100, ?4)",
+            params![filepath, filename, directory, i64::from(locked)],
+        )
+        .expect("insert");
+        conn.last_insert_rowid()
+    }
+
+    fn tag_image(db: &Database, image_id: i64, tag: &str) {
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.execute(
+            "INSERT INTO tags(tag) VALUES (?1) ON CONFLICT(tag) DO NOTHING",
+            params![tag],
+        )
+        .expect("upsert tag");
+        let tag_id: i64 = conn
+            .query_row("SELECT id FROM tags WHERE tag = ?1", params![tag], |row| {
+                row.get(0)
+            })
+            .expect("tag id");
+        conn.execute(
+            "INSERT OR IGNORE INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
+            params![image_id, tag_id],
+        )
+        .expect("link tag");
+    }
+
+    fn image_tag_count(db: &Database, image_id: i64) -> i64 {
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.query_row(
+            "SELECT COUNT(*) FROM image_tags WHERE image_id = ?1",
+            params![image_id],
+            |row| row.get(0),
+        )
+        .expect("count tags")
+    }
+
+    fn culled_at(db: &Database, image_id: i64) -> Option<i64> {
+        let conn = db.pool_get_for_test().expect("conn");
+        conn.query_row(
+            "SELECT culled_at FROM images WHERE id = ?1",
+            params![image_id],
+            |row| row.get(0),
+        )
+        .expect("culled_at")
+    }
+
+    #[test]
+    fn trash_cull_reports_locked_rows_blocked_and_keeps_their_tags() {
+        let db = temp_db("mixed");
+        let open_id = insert_image(&db, "/t/open.png", false);
+        let locked_id = insert_image(&db, "/t/locked.png", true);
+        tag_image(&db, open_id, "keepme");
+        tag_image(&db, locked_id, "lockedtag");
+
+        let (culled, blocked) = db
+            .cull_images_with_blocked(&[open_id, locked_id], CullMode::Trash)
+            .expect("cull");
+
+        assert_eq!(culled, 1, "only the unlocked row may be culled");
+        assert_eq!(blocked, vec![locked_id]);
+        assert_eq!(
+            image_tag_count(&db, locked_id),
+            1,
+            "a row blocked by its lock must keep its tags"
+        );
+        assert_eq!(image_tag_count(&db, open_id), 0);
+        assert!(culled_at(&db, locked_id).is_none());
+        assert!(culled_at(&db, open_id).is_some());
+    }
+
+    #[test]
+    fn trash_cull_all_locked_reports_all_blocked_without_touching_tags() {
+        let db = temp_db("alllocked");
+        let a = insert_image(&db, "/t/a.png", true);
+        let b = insert_image(&db, "/t/b.png", true);
+        tag_image(&db, a, "taga");
+        tag_image(&db, b, "tagb");
+
+        let (culled, blocked) = db
+            .cull_images_with_blocked(&[a, b], CullMode::Trash)
+            .expect("cull");
+
+        assert_eq!(culled, 0);
+        assert_eq!(blocked, vec![a.min(b), a.max(b)]);
+        assert_eq!(image_tag_count(&db, a), 1);
+        assert_eq!(image_tag_count(&db, b), 1);
+    }
 }

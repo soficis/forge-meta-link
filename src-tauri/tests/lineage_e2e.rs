@@ -1,6 +1,6 @@
 use forge_meta_link_lib::{
     database::Database,
-    forge_api::{build_payload_from_generation_params, build_requeue_payload},
+    forge_api::{build_payload_from_generation_params, build_requeue_payload, normalize_scheduler},
     parser::GenerationParams,
     StorageProfile,
 };
@@ -67,6 +67,7 @@ fn chain_params(
         model_name: Some(model_name.to_string()),
         generation_type: Some(generation_type.to_string()),
         extra_params: extra,
+        text_chunks: HashMap::new(),
         raw_metadata: raw.clone(),
     }
 }
@@ -605,7 +606,13 @@ fn lineage_e2e_chain_compare_requeue_loop() {
         println!("[lineage_e2e] payload locked fields diff 0 for {}: sampler={} schedule={} cfg={} seed={} model={} loras={:?}", label, expected_sampler, expected_sched, expected_cfg, expected_seed, model_name, prompt_loras);
         // Also verify top-level sampler/scheduler/cfg/seed match overrides (payload JSON exact)
         assert_eq!(payload.sampler_name.as_deref(), Some(expected_sampler));
-        assert_eq!(payload.scheduler.as_deref(), Some(expected_sched));
+        // The persisted record keeps the human label (e.g. "Karras"); the wire payload uses
+        // the normalized Forge API key (e.g. "karras"). Assert against that exact mapping.
+        let expected_api_scheduler = normalize_scheduler(expected_sched);
+        assert_eq!(
+            payload.scheduler.as_deref(),
+            Some(expected_api_scheduler.as_str())
+        );
         assert_eq!(payload.cfg_scale, Some(expected_cfg as f32));
         assert_eq!(payload.seed, Some(expected_seed));
         // override_settings must also contain sd_model_checkpoint exactly (no extra whitespace)

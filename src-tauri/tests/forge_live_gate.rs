@@ -265,6 +265,7 @@ fn requeue_params(rec: &ImageRecord) -> GenerationParams {
         model_name: rec.model_name.clone(),
         generation_type: None,
         extra_params: stored.extra_params,
+        text_chunks: stored.text_chunks,
         raw_metadata: rec.raw_metadata.clone(),
     }
 }

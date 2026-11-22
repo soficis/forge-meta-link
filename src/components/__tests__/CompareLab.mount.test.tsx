@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CompareLab } from "../CompareLab";
 import { useCompareLabStore } from "../../store/compareLabStore";
-import type { GalleryImageRecord } from "../../types/metadata";
+import type { GalleryImageRecord, ImageRecord } from "../../types/metadata";
 
 function gallery(id: number, seed: string | null = "12345"): GalleryImageRecord {
   return {
@@ -26,7 +26,25 @@ beforeAll(() => {
     value: {
       convertFileSrc: (filePath: string) =>
         `asset://localhost/${encodeURIComponent(filePath)}`,
-      invoke: () => Promise.reject(new Error("invoke unavailable in tests")),
+      invoke: (command: string, args: { id?: number } = {}) => {
+        if (command === "get_image_detail" && typeof args.id === "number") {
+          const record: ImageRecord = {
+            ...gallery(args.id),
+            prompt: "a lighthouse",
+            negative_prompt: "blurry",
+            steps: "20",
+            sampler: "Euler a",
+            cfg_scale: "7",
+            schedule_type: "Exponential",
+            extra_params: {},
+            text_chunks: null,
+            model_hash: "abc",
+            raw_metadata: "a lighthouse\nSteps: 20, Sampler: Euler a, Schedule type: Exponential, CFG scale: 7",
+          };
+          return Promise.resolve(record);
+        }
+        return Promise.reject(new Error("invoke unavailable in tests"));
+      },
       transformCallback: () => 0,
     },
   });
@@ -54,7 +72,7 @@ describe("CompareLab mount smoke", () => {
     expect(screen.queryByTestId("compare-lab")).toBeNull();
   });
 
-  it("handles winner selection, opens mutation popover, and tracks sweep combinatorics", () => {
+  it("handles winner selection, opens mutation popover, and tracks sweep combinatorics", async () => {
     useCompareLabStore.setState({ pins: [gallery(1), gallery(2)] });
     render(<CompareLab />);
 
@@ -89,6 +107,9 @@ describe("CompareLab mount smoke", () => {
     // Select Steps -5, +5 (2 options) => 3 * 2 * 2 = 12 variants (> 8, triggers warning)
     fireEvent.click(screen.getByTestId("checkbox-steps-minus-5"));
     fireEvent.click(screen.getByTestId("checkbox-steps-plus-5"));
+
+    // The winner's ImageRecord is fetched asynchronously; Send stays disabled until it arrives.
+    await waitFor(() => expect((screen.getByTestId("sweep-send-btn") as HTMLButtonElement).disabled).toBe(false));
 
     // Sweep size badge should show 12 variants
     const badge = screen.getByTestId("sweep-count-badge");

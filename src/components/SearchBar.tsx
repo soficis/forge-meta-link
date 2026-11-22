@@ -40,7 +40,7 @@ const SORT_OPTIONS: { value: SortOption; label: string }[] = [
     { value: "oldest", label: "Oldest" },
     { value: "name_asc", label: "Name A-Z" },
     { value: "name_desc", label: "Name Z-A" },
-    { value: "model", label: "Model" },
+    { value: "model", label: "Checkpoint" },
     { value: "generation_type", label: "Gen Type" },
 ];
 
@@ -138,7 +138,7 @@ export function SearchBar({
                     <input
                         ref={inputRef}
                         type="text"
-                        placeholder="Search prompts, models, seeds… (Ctrl+F)"
+                        placeholder="Search prompts, checkpoints, seeds… (Ctrl+F)"
                         aria-label="Search images"
                         value={value}
                         onChange={(e) => setValue(e.target.value)}
@@ -249,13 +249,13 @@ export function SearchBar({
                         </label>
 
                         <label className="search-filter-field">
-                            <span>Model</span>
+                            <span>Checkpoint</span>
                             <select
                                 className="sort-select"
                                 value={modelFilter}
                                 onChange={(e) => onModelFilterChange(e.target.value)}
                             >
-                                <option value="">All models</option>
+                                <option value="">All checkpoints</option>
                                 {modelOptions.map((model) => (
                                     <option key={model} value={model}>
                                         {model}

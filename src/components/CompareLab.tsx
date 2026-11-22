@@ -23,6 +23,8 @@ import { useForgeSettings } from "../hooks/useForgeSettings";
 import type { GalleryImageRecord, ImageRecord } from "../types/metadata";
 import { getImageDetail, getLineageCursor, getSeedWalk } from "../services/commands";
 import type { LineageCursor } from "../types/metadata";
+import type { Recipe } from "../types/recipe";
+import { RecipeClipboardPanel } from "./RecipeClipboardPanel";
 import { BoltIcon, CrownIcon, TrophyIcon } from "./icons";
 import "./CompareLab.css";
 
@@ -264,8 +266,8 @@ export interface CompareLabProps {
 
 export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareLabProps) {
     const pins = useCompareLabStore((s) => s.pins);
-    const reorder = useCompareLabStore((s) => s.reorder);
     const clear = useCompareLabStore((s) => s.clear);
+    const pin = useCompareLabStore((s) => s.pin);
     const unpin = useCompareLabStore((s) => s.unpin);
     const winnerId = useCompareLabStore((s) => s.winnerId);
     const setWinner = useCompareLabStore((s) => s.setWinner);
@@ -402,13 +404,10 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
             if (oldIndex === -1 || newIndex === -1) return;
             // Use local reorder via arrayMove for correctness, sync to store
             const reordered = arrayMove(pins, oldIndex, newIndex);
-            // Apply via store reorder OR setPins
-            // Prefer direct set for moved array
+            // Apply the locally reordered array directly to the store.
             useCompareLabStore.setState({ pins: reordered });
-            // Also call reorder for consistency (no-op if already moved)
-            void reorder;
         },
-        [pins, reorder],
+        [pins],
     );
 
     const handleRemove = useCallback(
@@ -416,6 +415,19 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
             unpin(id);
         },
         [unpin],
+    );
+
+    // Pasted recipes are not image records. Only pin when the recipe resolves to a detail this
+    // component already has — never fabricate a GalleryImageRecord to fill a slot.
+    const handlePinPastedRecipe = useCallback(
+        (recipe: Recipe): boolean => {
+            const id = recipe.source?.id;
+            if (typeof id !== "number") return false;
+            const known = detailsMap.get(id) ?? pins.find((candidate) => candidate.id === id);
+            if (!known) return false;
+            return pin(known);
+        },
+        [detailsMap, pins, pin],
     );
 
     const ready = isCompareReady(pins);
@@ -498,6 +510,18 @@ export function CompareLab({ hero = true, detailsMap: detailsMapProp }: CompareL
                     </button>
                 </div>
             </div>
+
+            {/* Winner panel — offline recipe copy/paste (no Forge connection required) */}
+            {winner && (
+                <div className="compare-lab-winner-panel" data-testid="winner-recipe-panel">
+                    <RecipeClipboardPanel
+                        winner={winner}
+                        winnerDetails={detailsMap.get(winner.id) ?? null}
+                        pins={pins}
+                        onPinPastedRecipe={handlePinPastedRecipe}
+                    />
+                </div>
+            )}
 
             {/* Pin strip with drag reorder */}
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>

@@ -19,8 +19,36 @@ pub struct GenerationParams {
     pub generation_type: Option<String>,
     /// All remaining key-value parameters not explicitly mapped
     pub extra_params: HashMap<String, String>,
+    /// Every PNG text chunk by keyword (persisted as JSON; corrupt reads as None/empty)
+    #[serde(default)]
+    pub text_chunks: HashMap<String, String>,
     /// The raw, unparsed metadata string (as backup)
     pub raw_metadata: String,
+}
+
+impl GenerationParams {
+    /// Rebuilds source params from a stored [`crate::database::ImageRecord`] without
+    /// lossy defaults: every scalar is cloned, maps are cloned (empty when absent),
+    /// and the generation type is re-inferred from the stored raw metadata.
+    pub fn from_image_record(record: &crate::database::ImageRecord) -> Self {
+        Self {
+            prompt: record.prompt.clone(),
+            negative_prompt: record.negative_prompt.clone(),
+            steps: record.steps.clone(),
+            sampler: record.sampler.clone(),
+            schedule_type: record.schedule_type.clone(),
+            cfg_scale: record.cfg_scale.clone(),
+            seed: record.seed.clone(),
+            width: record.width,
+            height: record.height,
+            model_hash: record.model_hash.clone(),
+            model_name: record.model_name.clone(),
+            generation_type: Some(infer_generation_type(&record.raw_metadata)),
+            extra_params: record.extra_params.clone().unwrap_or_default(),
+            text_chunks: record.text_chunks.clone().unwrap_or_default(),
+            raw_metadata: record.raw_metadata.clone(),
+        }
+    }
 }
 
 /// Extracts normalized tags from the positive prompt.
@@ -937,5 +965,53 @@ Steps: 20, Sampler: Euler a, Lora hashes: "foo:111, bar:222", ADetailer prompt: 
         assert_eq!(params.schedule_type.as_deref(), Some("karras"));
         assert_eq!(params.seed.as_deref(), Some("987654"));
         assert_eq!(params.model_name.as_deref(), Some("flux1-dev.safetensors"));
+    }
+
+    #[test]
+    fn from_image_record_preserves_all_fields_without_lossy_defaults() {
+        let mut extra = HashMap::new();
+        extra.insert("Module 1".to_string(), "vae.safetensors".to_string());
+        extra.insert("Custom".to_string(), "x".to_string());
+        let mut chunks = HashMap::new();
+        chunks.insert("parameters".to_string(), "a".to_string());
+        chunks.insert("comment".to_string(), "b".to_string());
+        let record = crate::database::ImageRecord {
+            id: 1,
+            filepath: "/a/b.png".into(),
+            filename: "b.png".into(),
+            directory: "/a".into(),
+            prompt: "p".into(),
+            negative_prompt: "n".into(),
+            steps: Some("20".into()),
+            sampler: Some("Euler".into()),
+            cfg_scale: Some("7".into()),
+            seed: Some("5".into()),
+            width: Some(512),
+            height: Some(768),
+            model_hash: Some("h".into()),
+            model_name: Some("m.safetensors".into()),
+            raw_metadata: "p\nSteps: 20".into(),
+            is_favorite: false,
+            is_locked: false,
+            schedule_type: Some("karras".into()),
+            extra_params: Some(extra.clone()),
+            text_chunks: Some(chunks.clone()),
+        };
+        let params = GenerationParams::from_image_record(&record);
+        assert_eq!(params.prompt, "p");
+        assert_eq!(params.negative_prompt, "n");
+        assert_eq!(params.steps.as_deref(), Some("20"));
+        assert_eq!(params.sampler.as_deref(), Some("Euler"));
+        assert_eq!(params.schedule_type.as_deref(), Some("karras"));
+        assert_eq!(params.cfg_scale.as_deref(), Some("7"));
+        assert_eq!(params.seed.as_deref(), Some("5"));
+        assert_eq!(params.width, Some(512));
+        assert_eq!(params.height, Some(768));
+        assert_eq!(params.model_hash.as_deref(), Some("h"));
+        assert_eq!(params.model_name.as_deref(), Some("m.safetensors"));
+        assert_eq!(params.extra_params, extra);
+        assert_eq!(params.text_chunks, chunks);
+        assert_eq!(params.raw_metadata, "p\nSteps: 20");
+        assert_eq!(params.generation_type.as_deref(), Some("txt2img"));
     }
 }
